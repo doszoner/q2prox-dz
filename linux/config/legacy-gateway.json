@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "--bind",
+    "{internal_endpoint}",
+    "--signal",
+    "wss://net.js-dos.com:444",
+    "--ice-file",
+    "{ice_memfd}",
+    "--alias",
+    "{alias}",
+    "--max-datagram",
+    "1400"
+  ],
+  "probeTimeoutMs": 45000,
+  "probeIntervalMs": 500,
+  "roomCloseProbeIdleMs": 15000,
+  "roomCloseFailures": 3,
+  "maxDatagram": 1400
+}

@@ -1,0 +1,197 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Q2 Dos.Zone transport</title>
+<script type="module">
+import WebRTCNet from "./webrtcnet.mjs";
+import { ManagedReadinessProbe } from "./managed-readiness-probe.mjs";
+import {
+  bytesToMessage,
+  classifyIncomingDatagram,
+  createCadenceCounter,
+  exactAliasQuery,
+  maxDatagram,
+  messageToBytes,
+  parseStartMessage,
+  reliableSendMode,
+} from "./transport_protocol.mjs";
+
+let started = false;
+let stopped = false;
+let module;
+let remotePeer = 0;
+let send;
+let receive;
+let wait;
+let buffer;
+let fromPeer;
+let probe;
+let probeStarted = false;
+let startupStage = "parse_config";
+const queryMatches = [];
+const cadence = createCadenceCounter();
+
+function post(message) {
+  globalThis.chrome.webview.postMessage(message);
+}
+
+function fail(reason) {
+  if (stopped) return;
+  stopped = true;
+  post({ type: "state", value: "failed", reason });
+}
+
+function stableError(error, fallback) {
+  const value = error instanceof Error ? error.message : "";
+  return /^[a-z0-9_-]{1,64}$/.test(value) ? value : fallback;
+}
+
+async function start(message) {
+  if (started) throw new Error("duplicate_start");
+  started = true;
+  const config = parseStartMessage(message);
+  startupStage = "load_runtime";
+  const query = exactAliasQuery(config.alias);
+  window.netConfig = {
+    debug: false,
+    ordered: config.ordered,
+    iceServers: config.iceServers,
+  };
+
+  let queryFinished = false;
+  module = await WebRTCNet({
+    print: () => {},
+    printErr: () => fail("runtime_error"),
+    aliasQueryAdd: (seenQuery, alias, peer) => {
+      if (seenQuery === query) queryMatches.push({ alias, peer: peer >>> 0 });
+    },
+    onAliasQueryEnd: (seenQuery) => {
+      if (seenQuery === query) queryFinished = true;
+    },
+  });
+
+  startupStage = "bind_runtime";
+  const connectTo = module.cwrap("connectTo", "number", ["string", "string", "string"]);
+  wait = module.cwrap("wait", null, ["number"]);
+  const myId = module.cwrap("myId", "number", []);
+  const queryAliases = module.cwrap("queryAliases", null, ["string"]);
+  send = module.cwrap("sendto", "number", ["number", "number", "number", "number"]);
+  receive = module.cwrap("recvfrom", "number", ["number", "number", "number"]);
+  buffer = module._malloc(maxDatagram);
+  fromPeer = module._malloc(4);
+  probe = new ManagedReadinessProbe({
+    send: (datagram) => {
+      module.HEAPU8.set(datagram, buffer);
+      cadence.probeSend();
+      return send(buffer, datagram.length, remotePeer, reliableSendMode) === datagram.length;
+    },
+    onReady: () => post({ type: "state", value: "transport-ready", peer: remotePeer }),
+    onRoomClosed: (reason) => {
+      if (stopped) return;
+      stopped = true;
+      post({ type: "state", value: "room-closed", reason });
+    },
+  });
+
+  startupStage = "connect_signaling";
+  if (!connectTo("wss://net.js-dos.com:444", "quake2", "quake2-secret")) {
+    throw new Error("connect_failed");
+  }
+  startupStage = "complete";
+
+  let queried = false;
+  let pollStage = "wait";
+  const cadenceTimer = setInterval(() => {
+    if (stopped) {
+      clearInterval(cadenceTimer);
+      return;
+    }
+    post(cadence.snapshot());
+  }, 1000);
+  const timer = setInterval(() => {
+    if (stopped) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      cadence.timerTick();
+      pollStage = "wait";
+      cadence.waitCall();
+      wait(0);
+      if (remotePeer === 0) cadence.aliasPoll();
+      if (!queried && myId() !== 0) {
+        pollStage = "query_alias";
+        queried = true;
+        queryAliases(query);
+      }
+      if (queryFinished && remotePeer === 0) {
+        pollStage = "resolve_alias";
+        if (queryMatches.length !== 1 || queryMatches[0].alias !== config.alias ||
+            queryMatches[0].peer === 0) {
+          throw new Error("alias_not_unique");
+        }
+        remotePeer = queryMatches[0].peer;
+      }
+      if (remotePeer !== 0 && !probeStarted) {
+        pollStage = "start_probe";
+        probeStarted = true;
+        probe.channelOpened();
+      }
+      if (remotePeer === 0) return;
+
+      pollStage = "receive";
+      for (;;) {
+        module.HEAP32[fromPeer >> 2] = 0;
+        const length = receive(buffer, maxDatagram, fromPeer);
+        if (length === 0) break;
+        const disposition = classifyIncomingDatagram(length);
+        if (disposition === "invalid" ||
+            (module.HEAP32[fromPeer >> 2] >>> 0) !== remotePeer) {
+          throw new Error("invalid_incoming_datagram");
+        }
+        if (disposition === "oversized") {
+          post({ type: "drop", reason: "oversized_transport" });
+          continue;
+        }
+        const datagram = module.HEAPU8.slice(buffer, buffer + length);
+        if (probe.packetReceived(datagram)) {
+          cadence.probeAck();
+        } else {
+          cadence.dcToNative(length);
+          post(bytesToMessage(datagram));
+        }
+      }
+    } catch (error) {
+      fail(stableError(error, `transport_${pollStage}_failed`));
+    }
+  }, 5);
+}
+
+globalThis.chrome.webview.addEventListener("message", (event) => {
+  try {
+    if (event.data?.type === "stop") {
+      stopped = true;
+      probe?.stop();
+      post({ type: "state", value: "stopped", reason: "" });
+      module?.cwrap("shutdown", null, [])();
+      return;
+    }
+    if (!started) {
+      void start(event.data).catch((error) =>
+        fail(stableError(error, `startup_${startupStage}_failed`)));
+      return;
+    }
+    if (!started || stopped || remotePeer === 0) throw new Error("transport_not_ready");
+    const datagram = messageToBytes(event.data);
+    module.HEAPU8.set(datagram, buffer);
+    if (send(buffer, datagram.length, remotePeer, reliableSendMode) === datagram.length) {
+      cadence.nativeToDc(datagram.length);
+    } else {
+      post({ type: "drop", reason: "transport_not_ready" });
+    }
+  } catch (error) {
+    fail(stableError(error, "invalid_message"));
+  }
+});
+
+post({ type: "state", value: "page-ready", reason: "" });
+</script>

@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "webrtcNet": {
+    "source": "https://github.com/doszoner/WebRTC-NET.git",
+    "commit": "1b8c145b8fb00e8a1599ec311118cd38aad44e7a",
+    "submodules": {
+      "3rdparty/boringssl": "b34976cae99f8d1b864dbab31e20fc00d06acb09",
+      "3rdparty/flatbuffers": "fb9afbafc7dfe226b9db54d4923bfb8839635274",
+      "3rdparty/libwebsockets": "5ff9503f995fa692980d666de3984e000d610166",
+      "3rdparty/webrtc-native-build": "d146ad1b017245cf1331a647c887259cbc6b8607"
+    },
+    "licenseSources": [
+      "LICENSE.md",
+      "NOTICES.md",
+      "3rdparty/webrtc-native-build/LICENSE",
+      "3rdparty/webrtc/license.txt"
+    ],
+    "linux": {
+      "humblenet.h": "faf981e10425e4c7f2c85d98d55a8c5104f52016fa4de8f2d6f9deea40495844",
+      "humblenet_p2p.h": "cedd19cc48e7503f6e0f03f16d13686670b6dbdf5c78670c923acde77f224bb2",
+      "libhumblenet.so": "60215739b82c61865717622f291e6d4d77e93e4e23122c008cdd0aae2e053b02",
+      "libwebrtc.so": "ac3548454e189300c29ef9c9d1f5f8ea726438dc2cfa83a2c065a452c3ca8745",
+      "webrtcnet.mjs": "c4c3eccc9753563e2a77d5b8e121568561fa1011164542c6662356db58b1b2a1",
+      "webrtcnet.wasm": "0374c3c43d24e013ae0ef874eccbd17b0463d78ad8dbc385cb9853129c269118"
+    },
+    "windows": {
+      "webrtcnet.mjs": "c4c3eccc9753563e2a77d5b8e121568561fa1011164542c6662356db58b1b2a1",
+      "webrtcnet.wasm": "0374c3c43d24e013ae0ef874eccbd17b0463d78ad8dbc385cb9853129c269118"
+    }
+  },
+  "webView2": {
+    "package": "Microsoft.Web.WebView2",
+    "version": "1.0.4129.50",
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.4129.50/microsoft.web.webview2.1.0.4129.50.nupkg",
+    "packageSha256": "d3934f482d484b89fb4825df720c710664e1143a1e90f7b3a60794ef33f473d2",
+    "loaderX64Sha256": "a9a09232c25805323d4cfb3fc8f545a190a9c8a99c93262ea99d0b88df99ec90",
+    "licenseSources": [
+      "windows/product/licenses/WebView2-LICENSE.txt",
+      "windows/product/licenses/WebView2-NOTICE.txt"
+    ]
+  }
+}

@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""Small Linux room selector for the managed Q2PRO-X Dos.Zone session."""
+
+import gzip
+import socket
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import ipaddress
+import urllib.error
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+
+ROOM_ENDPOINT = "https://cloud.dos.zone/room/get"
+LOOKUP_ENDPOINT = "https://net.dos.zone/lookup"
+RTC_ENDPOINT = "https://cloud.dos.zone/rtc/servers"
+SIGNALING_URL = "wss://net.js-dos.com:444"
+OFFICIAL_URL = "https://q2pro-x.com/"
+GAME = "3zb2"
+FETCH_TIMEOUT = 15
+MAX_BODY = 2 * 1024 * 1024
+ROOM_CLOSED_EXIT = 73
+_AUTO = object()
+MAX_TOKEN = 255
+MAX_OWNER = 250
+MAX_JSON_SAFE_INTEGER = 9007199254740991
+MAX_MAP = 128
+MAX_PLAYERS = 64
+MAX_ICE_SERVERS = 16
+MAX_ICE_URL = 2048
+MAX_ICE_FIELD = 1024
+SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._-]+\Z")
+HOSTNAME = re.compile(
+    r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+
+
+class LaunchError(RuntimeError):
+    pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _fp, _code, _msg, _headers, _new_url):
+        raise LaunchError("Dos.Zone endpoint returned an unexpected redirect")
+
+
+def _open_url(request, timeout):
+    opener = urllib.request.build_opener(_NoRedirect)
+    return opener.open(request, timeout=timeout)
+
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise LaunchError("Dos.Zone response timed out")
+    return remaining
+
+
+def _set_response_timeout(response, remaining):
+    timeout = max(remaining, 0.001)
+    candidates = [getattr(response, "fp", None), getattr(response, "raw", None)]
+    for candidate in candidates:
+        raw = getattr(candidate, "raw", None) or candidate
+        sock = getattr(raw, "_sock", None)
+        setter = getattr(sock, "settimeout", None)
+        if setter:
+            setter(timeout)
+            return
+
+
+def _read_chunk(response, size, deadline):
+    remaining = _remaining(deadline)
+    _set_response_timeout(response, remaining)
+    try:
+        chunk = response.read(size)
+    except (socket.timeout, TimeoutError) as exc:
+        raise LaunchError("Dos.Zone response timed out") from exc
+    _remaining(deadline)
+    return chunk
+
+
+class _DeadlineReader:
+    def __init__(self, response, deadline, maximum=MAX_BODY):
+        self.response = response
+        self.deadline = deadline
+        self.bytes_read = 0
+        self.maximum = maximum
+
+    def read(self, size=-1):
+        if size == 0:
+            return b""
+        requested = 65536 if size is None or size < 0 else size
+        remaining = self.maximum - self.bytes_read
+        if remaining < 0:
+            raise LaunchError("Dos.Zone response is too large before decompression")
+        # Read one byte beyond the exact bound so a response ending exactly at
+        # MAX_BODY can still prove EOF; reject as soon as a 2MiB+1 byte arrives.
+        requested = min(requested, remaining + 1)
+        chunk = _read_chunk(self.response, requested, self.deadline)
+        self.bytes_read += len(chunk)
+        if self.bytes_read > self.maximum:
+            raise LaunchError("Dos.Zone response is too large before decompression")
+        return chunk
+
+
+def _read_bounded(response, deadline):
+    raw_encoding = response.headers.get("Content-Encoding")
+    encoding = "" if raw_encoding is None else str(raw_encoding)
+    if encoding == "":
+        is_gzip = False
+    elif encoding.casefold() == "gzip":
+        is_gzip = True
+    else:
+        raise LaunchError("Dos.Zone endpoint returned an unsupported content encoding")
+    if not is_gzip:
+        body = bytearray()
+        while True:
+            chunk = _read_chunk(response, 65536, deadline)
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > MAX_BODY:
+                raise LaunchError("Dos.Zone response is too large")
+        return bytes(body)
+
+    body = bytearray()
+    try:
+        with gzip.GzipFile(fileobj=_DeadlineReader(response, deadline)) as stream:
+            while True:
+                _remaining(deadline)
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > MAX_BODY:
+                    raise LaunchError("Dos.Zone response is too large after decompression")
+    except LaunchError:
+        raise
+    except (OSError, EOFError) as exc:
+        raise LaunchError("Dos.Zone returned invalid gzip data") from exc
+    return bytes(body)
+
+
+def fetch_json(url, opener=None, timeout=FETCH_TIMEOUT):
+    """Fetch one allow-listed HTTPS endpoint, with bounded gzip/JSON input."""
+    if url not in {ROOM_ENDPOINT, LOOKUP_ENDPOINT, RTC_ENDPOINT}:
+        raise LaunchError("unapproved Dos.Zone endpoint")
+    opener = opener or _open_url
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "User-Agent": "q2pro-x-doszone/1.0",
+        },
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        with opener(request, _remaining(deadline)) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                getcode = getattr(response, "getcode", None)
+                status = getcode() if callable(getcode) else None
+            if status is not None and not 200 <= int(status) < 300:
+                raise LaunchError("Dos.Zone endpoint returned a non-success status")
+            body = _read_bounded(response, deadline)
+    except LaunchError:
+        raise
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        raise LaunchError(f"cannot fetch {url}: {exc}") from exc
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LaunchError(f"invalid JSON from {url}") from exc
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _safe_token(value, maximum=MAX_TOKEN):
+    return isinstance(value, str) and 1 <= len(value) <= maximum and SAFE_TOKEN.fullmatch(value) is not None
+
+
+def _text(value, maximum=MAX_TOKEN):
+    return isinstance(value, str) and 1 <= len(value) <= maximum and not any(char.isspace() and char != " " for char in value)
+
+
+def _hostname(value):
+    return isinstance(value, str) and HOSTNAME.fullmatch(value) is not None
+
+
+def _ice_url(value):
+    if not isinstance(value, str) or not 7 <= len(value) <= MAX_ICE_URL or re.search(r"\s|@", value):
+        return False
+    match = re.fullmatch(r"(?i)(stun|stuns|turn|turns):(.+)", value)
+    if not match:
+        return False
+    target = match.group(2).split("?", 1)[0]
+    if not target:
+        return False
+    if target.startswith("["):
+        closing = target.find("]")
+        if closing < 0:
+            return False
+        host = target[1:closing]
+        port = target[closing + 1:]
+        if port and not re.fullmatch(r":\d{1,5}", port):
+            return False
+    else:
+        if target.count(":") > 1:
+            return False
+        host, separator, port = target.partition(":")
+        if separator and not re.fullmatch(r"\d{1,5}", port):
+            return False
+    try:
+        address_ok = bool(ipaddress.ip_address(host))
+    except ValueError:
+        address_ok = _hostname(host)
+    if not address_ok:
+        return False
+    if port and not 1 <= int(port.lstrip(":")) <= 65535:
+        return False
+    return True
+
+
+def _ice_server(value):
+    if not isinstance(value, dict):
+        return False
+    if "ordered" in value and value["ordered"] is not False:
+        return False
+    urls = value.get("urls")
+    urls = urls if isinstance(urls, list) else [urls]
+    if not 1 <= len(urls) <= MAX_ICE_SERVERS or not all(_ice_url(url) for url in urls):
+        return False
+    for name in ("username", "credential"):
+        if name in value and (not isinstance(value[name], str) or len(value[name]) > MAX_ICE_FIELD):
+            return False
+    return True
+
+
+def _rtc_row(value):
+    return (
+        isinstance(value, dict)
+        and ("ordered" not in value or value["ordered"] is False)
+        and _hostname(value.get("domain"))
+        and isinstance(value.get("iceservers"), list)
+        and 1 <= len(value["iceservers"]) <= MAX_ICE_SERVERS
+        and all(_ice_server(server) for server in value["iceservers"])
+    )
+
+
+def validate_rtc_payload(payload):
+    return isinstance(payload, list) and 1 <= len(payload) and all(_rtc_row(row) for row in payload)
+
+
+def validate_alias_payload(payload):
+    return isinstance(payload, dict) and isinstance(payload.get("aliases"), list) and all(
+        _safe_token(alias) for alias in payload["aliases"]
+    )
+
+
+def _strict_room(row):
+    if not isinstance(row, dict):
+        return False
+    settings = row.get("createSettings")
+    if not isinstance(settings, dict) or settings.get("prefix") != "q2":
+        return False
+    if any(field in settings and settings[field] != GAME for field in ("game", "profile")):
+        return False
+    if "ordered" in settings and settings["ordered"] is not False:
+        return False
+    if not _safe_token(row.get("room")):
+        return False
+    owner = row.get("owner")
+    if isinstance(owner, bool) or not isinstance(owner, (str, int)):
+        return False
+    if isinstance(owner, str):
+        if not _safe_token(owner, MAX_OWNER):
+            return False
+    elif not 0 <= owner <= MAX_JSON_SAFE_INTEGER:
+        return False
+    if not isinstance(row.get("roomReady"), bool) or not _hostname(row.get("rtcServer")):
+        return False
+    if not _text(settings.get("name")):
+        return False
+    map_name = settings.get("map")
+    if not isinstance(map_name, str) or not 1 <= len(map_name) <= MAX_MAP or not SAFE_TOKEN.fullmatch(map_name):
+        return False
+    maximum = settings.get("maxPlayers")
+    players = row.get("players")
+    return (
+        _is_int(maximum)
+        and 1 <= maximum <= MAX_PLAYERS
+        and _is_int(players)
+        and 0 <= players <= maximum
+    )
+
+
+def validate_room_payload(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("rooms"), list):
+        return False
+    q2_count = 0
+    seen_rooms = set()
+    for row in payload["rooms"]:
+        if not isinstance(row, dict):
+            continue
+        settings = row.get("createSettings")
+        if not isinstance(settings, dict) or settings.get("prefix") != "q2":
+            continue
+        q2_count += 1
+        if not _strict_room(row):
+            return False
+        if row["room"] in seen_rooms:
+            return False
+        seen_rooms.add(row["room"])
+    return q2_count > 0
+
+
+def joinable_rooms(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("rooms"), list):
+        raise LaunchError("room catalog has an invalid schema")
+    valid_rows = [row for row in payload["rooms"] if _strict_room(row)]
+    seen_rooms = set()
+    for row in valid_rows:
+        if row["room"] in seen_rooms:
+            raise LaunchError("room catalog has duplicate room ids")
+        seen_rooms.add(row["room"])
+    rows = [
+        row for row in valid_rows
+        if row["roomReady"] and row["players"] < row["createSettings"]["maxPlayers"]
+    ]
+    return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
+
+
+def registered_rooms(rows, lookup):
+    if not validate_alias_payload(lookup):
+        raise LaunchError("alias lookup has an invalid schema")
+    registered = set(lookup["aliases"])
+    return [row for row in rows if f"q2.{row['owner']}" in registered]
+
+
+def choose_room(rows, zenity=_AUTO, input_fn=input, output=sys.stderr, runner=subprocess.run):
+    if not rows:
+        return None
+    if zenity is _AUTO:
+        zenity = shutil.which("zenity") if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else None
+    if zenity:
+        args = [
+            zenity,
+            "--list",
+            "--title=Q2PRO-X — Dos.Zone rooms",
+            "--text=Choose a public Quake II room",
+            "--print-column=1",
+            "--column=Room ID",
+            "--column=Name",
+            "--column=Players",
+        ]
+        for row in rows:
+            settings = row["createSettings"]
+            args.extend([
+                row["room"],
+                settings["name"],
+                f"{row['players']}/{settings['maxPlayers']}",
+            ])
+        result = runner(args, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return None
+        room_id = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+        return next((row for row in rows if row["room"] == room_id), None)
+
+    output.write("Available Dos.Zone Quake II rooms:\n")
+    for index, row in enumerate(rows, 1):
+        settings = row["createSettings"]
+        output.write(f"  {index}. {settings['name']} [{settings['map']}] "
+                     f"{row['players']}/{settings['maxPlayers']}\n")
+    output.flush()
+    try:
+        choice = int(input_fn("Join room (number, or blank to cancel): ").strip())
+    except (ValueError, EOFError):
+        return None
+    return rows[choice - 1] if 1 <= choice <= len(rows) else None
+
+
+def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subprocess.run):
+    if zenity is _AUTO:
+        zenity = shutil.which("zenity")
+    if zenity and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        runner([zenity, f"--{level}", "--title=Q2PRO-X — Dos.Zone", f"--text={message}"], check=False)
+    else:
+        output.write(message + "\n")
+
+
+def revalidate_room(payload, room_id):
+    """Return the selected room only if it is still a joinable Q2 row."""
+    rows = joinable_rooms(payload)
+    matches = [row for row in rows if row["room"] == room_id]
+    return matches[0] if len(matches) == 1 else None
+
+
+def make_room_config(selected, lookup, rtc_rows):
+    if not _strict_room(selected) or selected.get("roomReady") is not True or selected["players"] >= selected["createSettings"]["maxPlayers"]:
+        raise LaunchError("The selected room is no longer available")
+    owner = str(selected.get("owner", ""))
+    alias = f"q2.{owner}"
+    if not re.fullmatch(r"q2\.[A-Za-z0-9._-]{1,250}", alias) or len(alias) > MAX_TOKEN:
+        raise LaunchError("selected room has no safe Q2 alias")
+    if not validate_alias_payload(lookup) or alias not in lookup["aliases"]:
+        raise LaunchError("selected room alias is no longer registered")
+    if not validate_rtc_payload(rtc_rows):
+        raise LaunchError("RTC configuration has an invalid schema")
+    domain = selected["rtcServer"]
+    matches = [row for row in rtc_rows if row["domain"] == domain]
+    if len(matches) != 1:
+        raise LaunchError("fresh RTC configuration is unavailable")
+    rtc = matches[0]
+    return {
+        "version": 1,
+        "roomId": selected["room"],
+        "alias": alias,
+        "signalingUrl": SIGNALING_URL,
+        "ordered": False,
+        "iceServers": rtc["iceservers"],
+        "map": selected["createSettings"]["map"],
+        "game": GAME,
+    }
+
+
+def _config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "q2pro-x-doszone"
+
+
+def load_q2_path():
+    path_file = _config_dir() / "q2-path"
+    try:
+        value = path_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    path = Path(value).expanduser()
+    return path.absolute() if path.is_file() else None
+
+
+def save_q2_path(path):
+    path = Path(path).expanduser().absolute()
+    if not path.is_file():
+        raise LaunchError("selected Q2PRO-X.exe does not exist")
+    directory = _config_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, prefix="q2-path.", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            os.chmod(stream.fileno(), 0o600)
+            stream.write(str(path) + "\n")
+        os.replace(temporary, directory / "q2-path")
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+
+
+def _known_q2_paths():
+    home = Path.home()
+    candidates = [
+        os.environ.get("Q2PROX_EXE"),
+        os.environ.get("Q2DZ_Q2_EXE"),
+        home / "Games" / "Quake2-PlayGround-2026" / "Q2PRO-X.exe",
+        home / "Games" / "Q2PRO-X" / "Q2PRO-X.exe",
+        home / "Games" / "Quake II" / "Q2PRO-X.exe",
+        home / ".wine" / "drive_c" / "Program Files" / "Q2PRO-X" / "Q2PRO-X.exe",
+    ]
+    games = home / "Games"
+    if games.is_dir():
+        candidates.extend(games.glob("*/Q2PRO-X.exe"))
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        key = str(path.absolute())
+        if key not in seen:
+            seen.add(key)
+            yield path
+
+
+def discover_q2():
+    stored = load_q2_path()
+    candidates = ([stored] if stored else []) + list(_known_q2_paths())
+    for candidate in candidates:
+        if candidate and candidate.is_file() and candidate.name.casefold() == "q2pro-x.exe":
+            return candidate.absolute()
+    return None
+
+
+def select_q2_path(zenity=_AUTO, input_fn=input, output=sys.stderr, runner=subprocess.run):
+    if zenity is _AUTO:
+        zenity = shutil.which("zenity") if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else None
+    selected = None
+    if zenity:
+        action = runner(
+            [zenity, "--question", "--title=Q2PRO-X is required",
+             "--text=Select an existing Q2PRO-X.exe or open the official download page.",
+             "--ok-label=Select Q2PRO-X.exe", "--cancel-label=Cancel",
+             "--extra-button=Open download page"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if action.stdout.strip() == "Open download page":
+            webbrowser.open(OFFICIAL_URL)
+            output.write(f"Install Q2PRO-X first: {OFFICIAL_URL}\n")
+            return None
+        if action.returncode != 0:
+            return None
+        result = runner(
+            [zenity, "--file-selection", "--title=Select your installed Q2PRO-X.exe",
+             "--file-filter=Q2PRO-X.exe"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            selected = result.stdout.strip()
+    else:
+        output.write("Q2PRO-X.exe is required: [s]elect, [o]pen download page, [c]ancel.\n")
+        try:
+            action = input_fn("Choice [s/o/c]: ").strip().casefold()
+        except EOFError:
+            action = "c"
+        if action == "o":
+            webbrowser.open(OFFICIAL_URL)
+            output.write(f"Install Q2PRO-X first: {OFFICIAL_URL}\n")
+            return None
+        if action != "s":
+            return None
+        try:
+            selected = input_fn("Path to your installed Q2PRO-X.exe: ").strip()
+        except EOFError:
+            selected = ""
+    if selected:
+        path = Path(selected).expanduser()
+        if path.is_file() and path.name.casefold() == "q2pro-x.exe":
+            save_q2_path(path)
+            return path.absolute()
+        output.write("That is not a readable Q2PRO-X.exe.\n")
+    output.write(f"Install Q2PRO-X first: {OFFICIAL_URL}\n")
+    return None
+
+
+def _installed_paths():
+    root = Path(__file__).resolve().parent
+    return {
+        "session": Path(os.environ.get("Q2DZ_SESSION_BIN", root / "q2dz-session")),
+        "managed": Path(os.environ.get("Q2DZ_MANAGED_GATEWAY", root / "q2dz-managed-gateway")),
+        "legacy": Path(os.environ.get("Q2DZ_LEGACY_GATEWAY", root / "q2dz-webrtc-gateway")),
+        "adapter": Path(os.environ.get("Q2DZ_ADAPTER_CONFIG", root.parent / "config" / "legacy-gateway.json")),
+        "content": Path(os.environ.get("Q2DZ_CONTENT_CHECK", root / "q2dz-content-check")),
+    }
+
+
+def content_ready(q2_path, map_name, content_checker=None, runner=subprocess.run):
+    paths = _installed_paths()
+    checker = Path(content_checker or paths["content"])
+    result = runner(
+        [str(checker), "--q2-root", str(Path(q2_path).parent), "--game", GAME, "--map", map_name],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def run_session(config, q2_path, map_name, *, session, managed, legacy, adapter, runner=subprocess.run):
+    args = [
+        str(session),
+        "--gateway", str(managed),
+        "--legacy-gateway", str(legacy),
+        "--adapter", str(adapter),
+        "--q2", str(q2_path),
+        "--game", GAME,
+        "--map", map_name,
+        "--require-content",
+    ]
+    payload = json.dumps(config, separators=(",", ":"))
+    try:
+        result = runner(args, input=payload, text=True, check=False)
+        return result.returncode
+    finally:
+        payload = ""
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv == ["--help"]:
+        print("Usage: q2dz-launch [--select-q2]\nChoose a public Dos.Zone Quake II room and launch Q2PRO-X through Wine.")
+        return 0
+    if argv == ["--select-q2"]:
+        return 0 if select_q2_path() else 3
+    if argv:
+        print(f"unknown option: {argv[0]}", file=sys.stderr)
+        return 64
+    try:
+        q2_path = discover_q2() or select_q2_path()
+        if not q2_path:
+            return 3
+        catalog = fetch_json(ROOM_ENDPOINT)
+        rooms = registered_rooms(joinable_rooms(catalog), fetch_json(LOOKUP_ENDPOINT))
+        if not rooms:
+            notify("There are no joinable Quake II rooms right now.", "info")
+            return 0
+        selected = choose_room(rooms)
+        if not selected:
+            return 0
+        fresh = revalidate_room(fetch_json(ROOM_ENDPOINT), selected["room"])
+        if not fresh:
+            raise LaunchError("The selected room is no longer available")
+        map_name = fresh["createSettings"]["map"]
+        if not content_ready(q2_path, map_name):
+            notify(f"Map '{map_name}' is missing from this Q2PRO-X installation.")
+            return 3
+        config = make_room_config(
+            fresh,
+            fetch_json(LOOKUP_ENDPOINT),
+            fetch_json(RTC_ENDPOINT),
+        )
+        paths = _installed_paths()
+        result = run_session(
+            config,
+            q2_path,
+            map_name,
+            session=paths["session"],
+            managed=paths["managed"],
+            legacy=paths["legacy"],
+            adapter=paths["adapter"],
+        )
+        if result == ROOM_CLOSED_EXIT:
+            notify("The Dos.Zone room was closed.", "info")
+        elif result != 0:
+            notify(f"Dos.Zone session ended unexpectedly (code {result}).")
+        return result
+    except LaunchError as exc:
+        notify(f"Dos.Zone join unavailable: {exc}")
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

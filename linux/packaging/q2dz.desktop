@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+X-Q2DZ-Owned=true
+Name=Q2PRO-X — Dos.Zone
+Comment=Join an existing Dos.Zone Quake II room through the local managed gateway
+Exec=q2dz-launch
+Terminal=false
+Categories=Game;ActionGame;
+StartupNotify=false
