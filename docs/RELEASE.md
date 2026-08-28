@@ -4,9 +4,10 @@
 описывают обязательный путь, но сами по себе не заявляют PASS.
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
-последующие field findings. Текущий `1.0.0-rc8` получает PASS только из
-[`1.0.0-rc8`](verification/1.0.0-rc8.md), где зафиксированы exact live gates и
-source/artifact hashes.
+последующие field findings. `1.0.0-rc8` получает PASS только из
+[`1.0.0-rc8`](verification/1.0.0-rc8.md). Текущий `1.0.0-rc9` получает PASS
+только из [`1.0.0-rc9`](verification/1.0.0-rc9.md), где должны быть
+зафиксированы exact hub live gates и source/artifact hashes.
 
 Пользователю следует публиковать только три canonical архива и соседние
 `.sha256`:
@@ -31,7 +32,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc8
+  -OutputDir .\dist\windows-1.0.0-rc9
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -74,6 +75,8 @@ source is the public repository
 - Q2PRO-X должен войти в реальную комнату; движение/стрельба должны быть видны
   владельцу;
 - закрытие комнаты и аварийное завершение не должны оставить orphan-процессы;
+- в hub-режиме закрытие одной комнаты не должно завершить Q2PRO-X или другой
+  gateway; после этого должен пройти вход во вторую комнату;
 - archive/args/env/logs не должны содержать room credentials;
 - должны быть опубликованы SHA-256 и все third-party licenses/notices.
 

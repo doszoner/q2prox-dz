@@ -1,5 +1,5 @@
 #include "q2dz/child_protocol.hpp"
-#include "q2dz/session_state.hpp"
+#include "q2dz/session_safety.hpp"
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -88,37 +88,24 @@ void framer_tests() {
     CHECK(by_bytes.queued_byte_count()==0);
 }
 
-void state_tests() {
-    using E=q2dz::SessionEvent; using S=q2dz::SessionState;
-    q2dz::SessionStateMachine m;
-    CHECK(m.apply(E::begin).current==S::starting_gateway);
-    CHECK(m.apply(E::gateway_started).current==S::waiting_transport);
-    CHECK(m.apply(E::transport_ready).current==S::starting_q2);
-    CHECK(m.apply(E::q2_started).current==S::active);
-    auto c=m.apply(E::q2_exited);
-    CHECK(c.current==S::closing);
-    CHECK(c.cause==q2dz::ShutdownCause::q2_exit);
-    CHECK(m.apply(E::cleanup_complete).current==S::closed);
-
-    q2dz::SessionStateMachine n;
-    CHECK(!n.apply(E::transport_ready).accepted);
-    CHECK(n.state()==S::idle);
-    CHECK(n.apply(E::begin).accepted);
-    CHECK(n.apply(E::fatal_error).current==S::closing);
-    CHECK(n.apply(E::cleanup_failed).current==S::failed);
-
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::q2_exit)==0);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::owner_stop)==0);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::room_close)==10);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::gateway_exit)==11);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::timeout)==12);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::fatal_error)==13);
-    CHECK(q2dz::exit_code_for(q2dz::ShutdownCause::cleanup_error)==14);
+void session_safety_tests() {
+    const auto root=std::filesystem::path("/tmp/q2dz-sessions");
+    CHECK(q2dz::is_direct_session_child(root,root/"session-abc"));
+    CHECK(!q2dz::is_direct_session_child(root,root));
+    CHECK(!q2dz::is_direct_session_child(root,root/"nested"/"session-abc"));
+    CHECK(!q2dz::is_direct_session_child(root,root/".."/"q2dz-sessions"/"session-abc"));
+    CHECK(q2dz::is_expected_session_name(root/"session-abc"));
+    CHECK(!q2dz::is_expected_session_name(root/"session"));
+    CHECK(!q2dz::is_expected_session_name(root/"session_abc"));
+    CHECK(q2dz::is_exact_session_marker("q2dz-session-v1\n"));
+    CHECK(!q2dz::is_exact_session_marker("q2dz-session-v1"));
+    CHECK(!q2dz::is_exact_session_marker("q2dz-session-v1\nextra"));
 }
+
 }
 
 int main() {
-    protocol_tests(); framer_tests(); state_tests();
+    protocol_tests(); framer_tests(); session_safety_tests();
     if (failures) { std::cerr << failures << " test(s) failed\n"; return EXIT_FAILURE; }
     std::cout << "q2dz-core-tests: PASS\n";
     return EXIT_SUCCESS;

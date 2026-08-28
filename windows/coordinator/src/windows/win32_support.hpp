@@ -48,6 +48,7 @@ void write_all(HANDLE h, const unsigned char* data, std::size_t size);
 void secure_clear(std::vector<unsigned char>& data) noexcept;
 [[nodiscard]] std::filesystem::path create_session_directory(const std::filesystem::path& root, Handle& lock);
 [[nodiscard]] bool remove_tree_with_retry(const std::filesystem::path& path, DWORD total_ms);
+[[nodiscard]] bool validate_session_for_cleanup(const std::filesystem::path& root, const std::filesystem::path& session);
 void cleanup_stale_sessions(const std::filesystem::path& root);
 } // namespace q2dz::win
 #endif

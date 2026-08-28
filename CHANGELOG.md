@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc9] - 2026-08-29
+
+### Added
+
+- Выбор комнат перенесён во встроенный браузер Q2PRO-X: до двух комнат Dos.Zone
+  доступны в штатной вкладке `Custom`, отдельного окна выбора нет, а игру не
+  нужно перезапускать для перехода между комнатами.
+
+### Removed
+
+- Удалён прежний single-room путь текущего launcher/coordinator; архив rc8
+  остаётся проверенным откатом.
+
+### Changed
+
+- Число из каталога не выдаётся за число игроков; реальные игроки, их имена,
+  карта и ping берутся встроенным браузером из обычного Quake II status.
+- Поддерживаемый проверяемый профиль обновлён до Q2PRO-X 1.5 by ly от
+  2026-08-25.
+- Закрытие или падение одной комнаты в hub-режиме завершает только её gateway;
+  Q2PRO-X и остальные комнаты остаются доступны.
+
 ## [1.0.0-rc8] - 2026-08-24
 
 ### Fixed
@@ -31,5 +53,6 @@
 - Добавлены bounded transport cadence и datagram counters без содержимого
   пакетов и credential values.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc8...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...HEAD
+[1.0.0-rc9]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc8...v1.0.0-rc9
 [1.0.0-rc8]: https://github.com/doszoner/q2prox-dz/releases/tag/v1.0.0-rc8

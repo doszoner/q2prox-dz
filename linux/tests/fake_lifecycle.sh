@@ -17,9 +17,35 @@ cat > "$ADAPTER" <<JSON
 }
 JSON
 ROOM='{"alias":"q2.test","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"","game":"baseq2"}'
+ROOM_A='{"alias":"q2.room-a","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"","game":"baseq2"}'
+ROOM_B='{"alias":"q2.room-b","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"","game":"baseq2"}'
 export Q2DZ_SYNTHETIC_CREDENTIAL='must-not-reach-child'
 run_session() {
-  printf '%s' "$ROOM" | "$SESSION" \
+  "$SESSION" \
+    --gateway "$MANAGED" \
+    --legacy-gateway "$HERE/fake_legacy.py" \
+    --adapter "$ADAPTER" \
+    --q2 "$HERE/fake_q2.py" \
+    --wine "$HERE/fake_wine.sh" \
+    --game 3zb2 \
+    --runtime-base "$TMP/runtime" \
+    --ready-timeout-ms 4000 \
+    --shutdown-grace-ms 500 < <(printf '%s' "$ROOM")
+}
+run_hub() {
+  exec "$SESSION" \
+    --gateway "$MANAGED" \
+    --legacy-gateway "$HERE/fake_legacy.py" \
+    --adapter "$ADAPTER" \
+    --q2 "$HERE/fake_q2.py" \
+    --wine "$HERE/fake_wine.sh" \
+    --game 3zb2 \
+    --runtime-base "$TMP/runtime" \
+    --ready-timeout-ms 4000 \
+    --shutdown-grace-ms 500 < <(printf '%s\n%s\n' "$ROOM_A" "$ROOM_B")
+}
+run_hub_input() {
+  "$SESSION" \
     --gateway "$MANAGED" \
     --legacy-gateway "$HERE/fake_legacy.py" \
     --adapter "$ADAPTER" \
@@ -30,15 +56,69 @@ run_session() {
     --ready-timeout-ms 4000 \
     --shutdown-grace-ms 500
 }
-# L1: normal Q2 exit owns and cleans the complete session.
+managed_children() {
+  pgrep -P "$1" -f "$MANAGED" || true
+}
+wait_for_managed_children() {
+  local owner=$1
+  local expected=$2
+  local -n result=$3
+  result=()
+  for _ in $(seq 1 100); do
+    mapfile -t result < <(managed_children "$owner")
+    if [ "${#result[@]}" -eq "$expected" ]; then return 0; fi
+    sleep 0.05
+  done
+  return 1
+}
+# Hub input is newline-delimited, bounded, and rejected before any child starts.
+check_invalid_hub_input() {
+  set +e
+  invalid_hub_output=$(run_hub_input <<<"$1" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq 65 ]
+  grep -Fq 'hub input' <<<"$invalid_hub_output"
+}
+check_invalid_hub_input ''
+check_invalid_hub_input '[]'
+check_invalid_hub_input "$(printf '%s\n%s\n%s' "$ROOM_A" "$ROOM_B" "$ROOM")"
+oversized_hub_line=$(python3 - <<'PY'
+print('{"alias":"q2.' + ('x' * 262144) + '"}')
+PY
+)
+check_invalid_hub_input "$oversized_hub_line"
+# L1: normal Q2 exit owns and cleans a two-room session.
 export Q2DZ_TEST_MARKER="$TMP/normal"
-unset Q2DZ_FAKE_LEGACY_MODE Q2DZ_FAKE_Q2_MODE
-normal_output=$(run_session 2>&1)
-grep -Fq 'GATEWAY_STOP ' <<<"$normal_output"
+unset Q2DZ_FAKE_LEGACY_MODE
+export Q2DZ_FAKE_Q2_MODE=normal-delay
+run_hub >"$TMP/normal.output" 2>&1 &
+normal_owner=$!
+for _ in $(seq 1 100); do
+  [ -f "$TMP/normal.q2-pid" ] && [ -f "$TMP/normal.legacy-Q2_ROOM_A.pid" ] && [ -f "$TMP/normal.legacy-Q2_ROOM_B.pid" ] && break
+  sleep 0.05
+done
+[ -f "$TMP/normal.q2-pid" ]
+[ -f "$TMP/normal.legacy-Q2_ROOM_A.pid" ]
+[ -f "$TMP/normal.legacy-Q2_ROOM_B.pid" ]
+normal_q2_pid=$(<"$TMP/normal.q2-pid")
+normal_wine_pid=$(<"$TMP/normal.wine-pid")
+wait_for_managed_children "$normal_owner" 2 normal_managed
+normal_legacy_a=$(<"$TMP/normal.legacy-Q2_ROOM_A.pid")
+normal_legacy_b=$(<"$TMP/normal.legacy-Q2_ROOM_B.pid")
+set +e
+wait "$normal_owner"
+normal_rc=$?
+set -e
+[ "$normal_rc" -eq 0 ]
+grep -Fq 'HUB_READY gateways=2' "$TMP/normal.output"
 [ -f "$TMP/normal.finished" ]
-[ "$(wc -l < "$TMP/normal.legacy-endpoints")" -eq 1 ]
+[ "$(wc -l < "$TMP/normal.legacy-endpoints")" -eq 2 ]
 [ "$(<"$TMP/normal.q2-starts")" = 1 ]
-[ "$(grep -Ec '^127\.0\.0\.1:[0-9]+$' "$TMP/normal.legacy-endpoints")" -eq 1 ]
+[ "$(grep -Ec '^127\.0\.0\.1:[0-9]+$' "$TMP/normal.legacy-endpoints")" -eq 2 ]
+for pid in "${normal_managed[@]}" "$normal_legacy_a" "$normal_legacy_b" "$normal_q2_pid" "$normal_wine_pid"; do
+  ! kill -0 "$pid" 2>/dev/null
+done
 ! find "$TMP/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
 # Missing, empty, and unsupported games fail before room input or child startup.
 check_invalid_game() {
@@ -52,13 +132,6 @@ check_invalid_game() {
 check_invalid_game
 check_invalid_game --game ''
 check_invalid_game --game baseq2
-# Fake Q2 rejects an earlier connect even when the required suffix is present.
-set +e
-env -u Q2DZ_SYNTHETIC_CREDENTIAL -u Q2DZ_TEST_MARKER "$HERE/fake_q2.py" \
-  +connect 127.0.0.1:65535 +set game 3zb2 +connect 127.0.0.1:65535
-rc=$?
-set -e
-[ "$rc" -eq 64 ]
 # The real managed UDP path accepts 1400 bytes, drops 1401 in either
 # direction without exiting, and records only sizes/counters at shutdown.
 export Q2DZ_TEST_MARKER="$TMP/datagram-boundary"
@@ -161,55 +234,109 @@ set -e
 [ "$rc" -eq 72 ]
 [ "$(wc -l < "$TMP/noack-ignore-term.legacy-endpoints")" -eq 1 ]
 [ ! -e "$TMP/noack-ignore-term.q2-starts" ]
-# L3: gateway transport death closes sleeping Q2.
+# L3: a gateway crash removes only that room. Q2 and the other room stay alive.
 export Q2DZ_TEST_MARKER="$TMP/gateway-death"
-export Q2DZ_FAKE_LEGACY_MODE=exit-after-ack
-export Q2DZ_FAKE_Q2_MODE=sleep
+export Q2DZ_FAKE_LEGACY_MODE='q2.room-a=exit-after-ack;q2.room-b=normal'
+export Q2DZ_FAKE_Q2_MODE=sleep-no-probe
+run_hub >"$TMP/gateway-death.output" 2>&1 &
+gateway_death_owner=$!
+for _ in $(seq 1 100); do
+  [ -f "$TMP/gateway-death.q2-pid" ] && [ -f "$TMP/gateway-death.legacy-Q2_ROOM_B.pid" ] && break
+  sleep 0.05
+done
+[ -f "$TMP/gateway-death.q2-pid" ]
+[ -f "$TMP/gateway-death.legacy-Q2_ROOM_B.pid" ]
+gateway_death_q2_pid=$(<"$TMP/gateway-death.q2-pid")
+gateway_death_b_pid=$(<"$TMP/gateway-death.legacy-Q2_ROOM_B.pid")
+for _ in $(seq 1 100); do
+  if ! kill -0 "$(<"$TMP/gateway-death.legacy-Q2_ROOM_A.pid")" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+! kill -0 "$(<"$TMP/gateway-death.legacy-Q2_ROOM_A.pid")" 2>/dev/null
+kill -0 "$gateway_death_q2_pid"
+kill -0 "$gateway_death_b_pid"
+kill -TERM "$gateway_death_owner"
 set +e
-run_session
-rc=$?
+wait "$gateway_death_owner"
+gateway_death_rc=$?
 set -e
-[ "$rc" -eq 71 ]
-[ -f "$TMP/gateway-death.started" ]
+[ "$gateway_death_rc" -eq 143 ]
+! kill -0 "$gateway_death_q2_pid" 2>/dev/null
+! kill -0 "$gateway_death_b_pid" 2>/dev/null
 ! find "$TMP/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-# A transport-owned room-close exit is a normal ROOM_CLOSED event, not FATAL.
-export Q2DZ_TEST_MARKER="$TMP/room-close"
-export Q2DZ_FAKE_LEGACY_MODE=room-close-after-ack
+# Hub room A can close without taking down Q2PRO-X or room B. The next room
+# remains available in the same Q2 process.
+export Q2DZ_TEST_MARKER="$TMP/hub-room-close"
+export Q2DZ_FAKE_LEGACY_MODE='q2.room-a=room-close-after-ack;q2.room-b=normal'
 export Q2DZ_FAKE_Q2_MODE=sleep
+run_hub >"$TMP/hub-room-close.output" 2>&1 &
+hub_owner=$!
+for _ in $(seq 1 100); do
+  [ -f "$TMP/hub-room-close.q2-pid" ] && [ -f "$TMP/hub-room-close.legacy-Q2_ROOM_B.pid" ] && break
+  sleep 0.05
+done
+[ -f "$TMP/hub-room-close.q2-pid" ]
+[ -f "$TMP/hub-room-close.legacy-Q2_ROOM_B.pid" ]
+hub_q2_pid=$(<"$TMP/hub-room-close.q2-pid")
+hub_b_pid=$(<"$TMP/hub-room-close.legacy-Q2_ROOM_B.pid")
+for _ in $(seq 1 100); do
+  if ! kill -0 "$(<"$TMP/hub-room-close.legacy-Q2_ROOM_A.pid")" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+! kill -0 "$(<"$TMP/hub-room-close.legacy-Q2_ROOM_A.pid")" 2>/dev/null
+kill -0 "$hub_q2_pid"
+kill -0 "$hub_b_pid"
+kill -TERM "$hub_owner"
 set +e
-room_close_output=$(run_session 2>&1)
-rc=$?
+wait "$hub_owner"
+hub_room_close_rc=$?
 set -e
-if [ "$rc" -ne 73 ]; then
-  printf '%s\n' "$room_close_output" >&2
-  echo "expected coordinator room-close exit 73, got $rc" >&2
-  exit 1
-fi
-grep -Fq 'SESSION_CLOSED reason=room-closed' <<<"$room_close_output"
-[ -f "$TMP/room-close.started" ]
+[ "$hub_room_close_rc" -eq 143 ]
+! kill -0 "$hub_q2_pid" 2>/dev/null
+! kill -0 "$hub_b_pid" 2>/dev/null
 ! find "$TMP/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-# L4: hard-killing the owner leaves guardian responsible for processes and data.
-unset Q2DZ_FAKE_LEGACY_MODE
+# L4: after room A has closed, hard-killing the owner still cleans room B,
+# both managed gateways and Q2/Wine through the guardian.
+export Q2DZ_FAKE_LEGACY_MODE='q2.room-a=room-close-after-ack;q2.room-b=normal'
 export Q2DZ_FAKE_Q2_MODE=sleep
 export Q2DZ_TEST_MARKER="$TMP/hardkill"
-printf '%s' "$ROOM" | "$SESSION" \
-  --gateway "$MANAGED" --legacy-gateway "$HERE/fake_legacy.py" --adapter "$ADAPTER" \
-  --q2 "$HERE/fake_q2.py" --wine "$HERE/fake_wine.sh" --game 3zb2 --runtime-base "$TMP/runtime" \
-  --ready-timeout-ms 4000 --shutdown-grace-ms 300 &
-owner=$!
-for _ in $(seq 1 80); do [ -f "$TMP/hardkill.started" ] && break; sleep 0.05; done
-[ -f "$TMP/hardkill.started" ]
-kill -KILL "$owner"
-set +e; wait "$owner"; set -e
+run_hub >"$TMP/hardkill.output" 2>&1 &
+hardkill_owner=$!
+for _ in $(seq 1 100); do
+  [ -f "$TMP/hardkill.q2-pid" ] && [ -f "$TMP/hardkill.wine-pid" ] && \
+    [ -f "$TMP/hardkill.legacy-Q2_ROOM_A.pid" ] && [ -f "$TMP/hardkill.legacy-Q2_ROOM_B.pid" ] && break
+  sleep 0.05
+done
+[ -f "$TMP/hardkill.q2-pid" ]
+[ -f "$TMP/hardkill.wine-pid" ]
+[ -f "$TMP/hardkill.legacy-Q2_ROOM_A.pid" ]
+[ -f "$TMP/hardkill.legacy-Q2_ROOM_B.pid" ]
+hardkill_q2_pid=$(<"$TMP/hardkill.q2-pid")
+hardkill_wine_pid=$(<"$TMP/hardkill.wine-pid")
+hardkill_legacy_a=$(<"$TMP/hardkill.legacy-Q2_ROOM_A.pid")
+hardkill_legacy_b=$(<"$TMP/hardkill.legacy-Q2_ROOM_B.pid")
+wait_for_managed_children "$hardkill_owner" 2 hardkill_managed
+for _ in $(seq 1 100); do
+  if ! kill -0 "$hardkill_legacy_a" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+! kill -0 "$hardkill_legacy_a" 2>/dev/null
+kill -0 "$hardkill_q2_pid"
+kill -0 "$hardkill_legacy_b"
+kill -KILL "$hardkill_owner"
+set +e
+wait "$hardkill_owner"
+hardkill_rc=$?
+set -e
+[ "$hardkill_rc" -eq 137 ]
 for _ in $(seq 1 100); do
   if ! find "$TMP/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .; then break; fi
   sleep 0.05
 done
 ! find "$TMP/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-# No marked fake Q2 process may survive.
-if pgrep -f "$HERE/fake_q2.py" >/dev/null 2>&1; then
-  echo 'orphan fake Q2 found' >&2; exit 1
-fi
+for pid in "${hardkill_managed[@]}" "$hardkill_legacy_a" "$hardkill_legacy_b" "$hardkill_q2_pid" "$hardkill_wine_pid"; do
+  ! kill -0 "$pid" 2>/dev/null
+done
 # Secret-shaped ICE values must not occur in process command lines or runtime files.
 ! grep -R --binary-files=without-match -E 'stun:example\.invalid|credential|secret' "$TMP/runtime" 2>/dev/null
 printf 'fake lifecycle matrix: PASS\n'

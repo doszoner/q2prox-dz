@@ -148,7 +148,7 @@ if(TARGET q2dz-webrtc-gateway)
 endif()
 install(TARGETS ${Q2DZ_INSTALL_TARGETS}
         RUNTIME DESTINATION bin)
-install(PROGRAMS tools/q2dz-join tools/q2dz-launch DESTINATION bin)
+install(PROGRAMS tools/q2dz-launch DESTINATION bin)
 install(FILES config/legacy-gateway.json DESTINATION config)
 install(FILES packaging/q2dz.desktop DESTINATION share/applications RENAME q2dz.desktop)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" DESTINATION .)

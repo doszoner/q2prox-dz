@@ -4,7 +4,13 @@ Windows-поставка состоит из трёх небольших час�
 
 - `gateway/` — WebView2 UDP↔WebRTC gateway;
 - `coordinator/` — lifecycle, readiness и content preflight;
-- `product/` — room picker, portable/setup packaging и пользовательские README.
+- `product/` — catalog launcher, portable/setup packaging и пользовательские README.
+
+## Текущий режим
+
+Windows-поставка имеет один режим: `q2dz-launch.ps1` получает свежий снимок каталога Dos.Zone, выбирает не более двух совместимых комнат и передаёт их JSON координатору через `stdin`. Координатор запускает один gateway на комнату и запускает Q2PRO-X с общим Custom source. Выбора комнаты в отдельном окне нет: список открывает штатный браузер Q2PRO-X.
+
+При закрытии одной комнаты удаляется только её gateway; Q2PRO-X и остальная комната продолжают работать. Выход Q2PRO-X или жёсткое завершение владельца останавливает всю сессию. Отдельный внутренний очиститель ждёт завершения coordinator и удаляет его session directory даже при жёстком завершении.
 
 ## Local development
 

@@ -26,10 +26,15 @@ only targets used by the Start Menu shortcuts.
 
 The user extracts the release and double-clicks `Install.cmd`. It installs the
 add-on and immediately opens the first run, which asks for the existing
-`Q2PRO-X.exe`. Later launches show current public Dos.Zone Quake II rooms.
-`Join` revalidates room, alias and RTC data, checks the map locally, then starts
-the launcher-owned managed session. The game, PAKs, CFG and normal Q2PRO-X
-shortcut are not modified.
+`Q2PRO-X.exe`. Later launches fetch current public Dos.Zone Quake II rooms and
+start one managed session with up to two room gateways. Q2PRO-X's standard
+Custom browser then displays the server name, map, players and ping. The game,
+PAKs, CFG and normal Q2PRO-X shortcut are not modified.
+
+Closing one room stops only that room's gateway. Q2PRO-X and any other room
+gateway stay alive, so the user can choose another server without restarting
+the game. The current launcher has one hub flow; the old single-room behavior
+is retained only in historical rc8 artifacts.
 
 `uninstall.ps1` removes only complete add-on versions carrying a valid
 `.q2dz-owned` marker, the stable pointer/scripts, and matching shortcuts. It

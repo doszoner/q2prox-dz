@@ -17,7 +17,7 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure
 "$ROOT/tools/check-security-invariants.sh"
 
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT"/tools/q2dz-launch "$ROOT"/tests/*.py
-for script in "$ROOT"/tools/*.sh "$ROOT"/tools/q2dz-join "$ROOT"/tests/*.sh; do
+for script in "$ROOT"/tools/*.sh "$ROOT"/tests/*.sh; do
   bash -n "$script"
 done
 

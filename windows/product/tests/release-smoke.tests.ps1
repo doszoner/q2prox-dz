@@ -123,6 +123,20 @@ function Expect-Failure([string]$Name, [scriptblock]$Action) {
   Write-Host "negative smoke: $Name rejected"
 }
 
+function Test-LauncherModes([string]$Root) {
+  $launcher = Get-Content -LiteralPath (Join-Path $Root 'q2dz-launch.ps1') -Raw
+  Assert ($launcher.Contains('The launcher has no room picker')) 'packaged launcher does not start the Custom browser directly'
+  Assert (-not $launcher.Contains('ListBox')) 'packaged launcher contains a duplicate room chooser'
+  Assert (-not $launcher.Contains('--hub')) 'packaged launcher passes an obsolete coordinator mode flag'
+  Assert ($launcher.Contains("'--gateway', " + '$gateway')) 'packaged launcher does not invoke the hub coordinator'
+  Assert ($launcher.Contains('$rooms')) 'packaged launcher does not build a room snapshot'
+  Assert ($launcher.Contains('$hubInput')) 'packaged launcher does not pipe snapshot to coordinator'
+  Assert ($launcher.Contains('[Environment]::NewLine')) 'packaged launcher does not delimit hub room configurations'
+  Assert ($launcher.Contains('RedirectStandardInput')) 'packaged launcher does not use coordinator stdin'
+  Assert ($launcher.Contains('StandardInput.BaseStream')) 'packaged launcher does not write exact stdin bytes'
+  Assert ($launcher.Contains('UTF8Encoding')) 'packaged launcher does not encode stdin as UTF-8'
+}
+
 $portable = (Resolve-Path $PortableZip).Path
 $setup = (Resolve-Path $SetupZip).Path
 $work = Join-Path ([IO.Path]::GetTempPath()) ("q2dz-smoke-" + [Guid]::NewGuid().ToString('N'))
@@ -130,6 +144,7 @@ New-Item -ItemType Directory -Force $work | Out-Null
 try {
   $portableRoot = Test-Zip $portable 'portable' $ExpectedVersion $work
   [void](Test-Zip $setup 'setup' $ExpectedVersion $work -Setup)
+  Test-LauncherModes $portableRoot
 
   if ($RunNegativeTests) {
     $fixture = Join-Path $work 'fixture-text'

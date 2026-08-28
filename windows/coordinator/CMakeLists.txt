@@ -14,7 +14,7 @@ option(Q2DZ_BUILD_TESTS "Build unit and Windows lifecycle test binaries" ON)
 add_library(q2dz_core STATIC
     src/child_protocol.cpp
     src/content_check.cpp
-    src/session_state.cpp
+    src/session_safety.cpp
 )
 target_include_directories(q2dz_core PUBLIC include)
 add_executable(q2dz-content-check src/content_check_main.cpp)

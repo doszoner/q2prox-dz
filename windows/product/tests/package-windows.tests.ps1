@@ -41,7 +41,8 @@ function Relative-Files([string]$root) {
 $releaseBuilder = Get-Content -LiteralPath (Join-Path $product 'build-payload.ps1') -Raw
 foreach ($required in @(
     @("Join-Path `$product 'tests/catalog.tests.ps1'", 'Catalog contract tests failed ($LASTEXITCODE).'),
-    @("Join-Path `$product 'tests/install-windows.tests.ps1'", 'Install contract tests failed ($LASTEXITCODE).')
+    @("Join-Path `$product 'tests/install-windows.tests.ps1'", 'Install contract tests failed ($LASTEXITCODE).'),
+    @("Join-Path `$product 'tests/launcher-stdin.tests.ps1'", 'Launcher stdin contract tests failed ($LASTEXITCODE).')
 )) {
     Assert ($releaseBuilder.Contains($required[0])) "release chain does not invoke $($required[0])"
     Assert ($releaseBuilder.Contains($required[1])) "release chain does not fail closed for $($required[0])"

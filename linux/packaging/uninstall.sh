@@ -23,7 +23,7 @@ if ! cmp -s -- "$actual" "$expected"; then
 fi
 unlink "$actual"
 unlink "$expected"
-for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch q2dz-join; do
+for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch; do
   link="$BIN_HOME/$name"
   if [[ -L "$link" ]] && [[ "$(readlink -f -- "$link")" == "$INSTALL_ROOT/bin/$name" ]]; then
     unlink "$link"

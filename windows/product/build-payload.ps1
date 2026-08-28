@@ -122,6 +122,10 @@ try {
   & $installContract
   if ($LASTEXITCODE -ne 0) { throw "Install contract tests failed ($LASTEXITCODE)." }
 
+  $launcherStdinContract = Join-Path $product 'tests/launcher-stdin.tests.ps1'
+  & $launcherStdinContract
+  if ($LASTEXITCODE -ne 0) { throw "Launcher stdin contract tests failed ($LASTEXITCODE)." }
+
   $repro = Join-Path $repoRoot 'windows/coordinator/tools/check-reproducible.ps1'
   & $repro -Out (Join-Path $work 'repro') -SourceRoot $repoRoot -WebView2SdkDir $sdk -WebRtcNetReleaseDir $webrtcRelease
   if ($LASTEXITCODE -ne 0) { throw "Full-candidate /Brepro check failed ($LASTEXITCODE)." }

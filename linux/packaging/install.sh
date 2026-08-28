@@ -26,7 +26,7 @@ audit_owned_tree() {
 
 [[ -f "$PAYLOAD/VERSION" ]] || { echo "invalid package payload" >&2; exit 2; }
 for path in bin/q2dz-session bin/q2dz-managed-gateway bin/q2dz-content-check \
-  bin/q2dz-webrtc-gateway bin/q2dz-launch bin/q2dz-join \
+  bin/q2dz-webrtc-gateway bin/q2dz-launch \
   lib/libhumblenet.so lib/lib64/libwebrtc.so config/legacy-gateway.json; do
   [[ -f "$PAYLOAD/$path" ]] || { echo "package is incomplete: $path" >&2; exit 2; }
 done
@@ -59,6 +59,15 @@ if [[ -e "$INSTALL_ROOT" ]]; then
     exit 2
   }
   audit_owned_tree || { echo "refusing to update: unknown files exist under $INSTALL_ROOT" >&2; exit 2; }
+  # rc8 exposed a second, direct-connect entry point. Remove it only when the
+  # installed manifest proves that it belongs to this add-on.
+  if grep -Fxq 'bin/q2dz-join' "$OWNED_MANIFEST" && [[ -f "$INSTALL_ROOT/bin/q2dz-join" ]]; then
+    if [[ -L "$BIN_HOME/q2dz-join" ]] && \
+       [[ "$(readlink -f -- "$BIN_HOME/q2dz-join")" == "$INSTALL_ROOT/bin/q2dz-join" ]]; then
+      unlink "$BIN_HOME/q2dz-join"
+    fi
+    unlink "$INSTALL_ROOT/bin/q2dz-join"
+  fi
 fi
 [[ ! -L "$DESKTOP" ]] || { echo "refusing symlink desktop file: $DESKTOP" >&2; exit 2; }
 if [[ -e "$DESKTOP" ]] && ! grep -Fxq 'X-Q2DZ-Owned=true' "$DESKTOP"; then
@@ -78,7 +87,7 @@ manifest_tmp="$(mktemp -t q2dz-owned-paths.XXXXXX)"
 ) | LC_ALL=C sort > "$manifest_tmp"
 install -m 0600 "$manifest_tmp" "$OWNED_MANIFEST"
 unlink "$manifest_tmp"
-for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch q2dz-join; do
+for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch; do
   link="$BIN_HOME/$name"
   target="$INSTALL_ROOT/bin/$name"
   if [[ -e "$link" || -L "$link" ]]; then

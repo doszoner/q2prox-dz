@@ -64,8 +64,6 @@ struct Options {
     std::string wineprefix;
     std::string runtime_base;
     std::string game;
-    std::string map;
-    bool require_content = false;
     int ready_timeout_ms = 60000;
     int shutdown_grace_ms = 3000;
 };
@@ -81,8 +79,7 @@ void usage(std::ostream& out) {
         "  --wineprefix DIR          Existing Wine prefix (not modified by q2dz)\n"
         "  --runtime-base DIR        Private runtime root\n"
         "  --game 3zb2               Required Q2PRO-X game profile\n"
-        "  --map NAME                Validate local map content before transport startup\n"
-        "  --require-content         Missing map is a hard error\n"
+        "  Room configurations are read as one or two newline-delimited JSON objects from stdin\n"
         "  --ready-timeout-ms N      1000..180000 (default 60000)\n"
         "  --shutdown-grace-ms N     100..30000 (default 3000)\n";
 }
@@ -113,8 +110,6 @@ q2dz::Result<Options> parse_options(int argc, char** argv) {
         else if (arg == "--wineprefix") { if (!take(out.wineprefix)) return q2dz::Result<Options>::fail("--wineprefix requires value"); }
         else if (arg == "--runtime-base") { if (!take(out.runtime_base)) return q2dz::Result<Options>::fail("--runtime-base requires value"); }
         else if (arg == "--game") { if (!take(out.game)) return q2dz::Result<Options>::fail("--game requires value"); }
-        else if (arg == "--map") { if (!take(out.map)) return q2dz::Result<Options>::fail("--map requires value"); }
-        else if (arg == "--require-content") out.require_content = true;
         else if (arg == "--ready-timeout-ms" || arg == "--shutdown-grace-ms") {
             std::string text;
             if (!take(text)) return q2dz::Result<Options>::fail(arg + " requires value");
@@ -130,10 +125,34 @@ q2dz::Result<Options> parse_options(int argc, char** argv) {
         return q2dz::Result<Options>::fail("--gateway, --legacy-gateway and --adapter are required");
     }
     if (out.game != "3zb2") return q2dz::Result<Options>::fail("--game must be 3zb2");
-    if (out.require_content && out.map.empty()) {
-        return q2dz::Result<Options>::fail("--require-content requires --map");
-    }
     return q2dz::Result<Options>::ok(std::move(out));
+}
+
+constexpr std::size_t kHubMaxRooms = 2;
+constexpr std::size_t kHubMaxLine = 256U * 1024U;
+
+q2dz::Result<std::vector<std::string>> parse_hub_input(std::string_view input) {
+    std::vector<std::string> rooms;
+    if (input.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input is empty");
+    std::size_t offset = 0;
+    while (offset < input.size()) {
+        const auto newline = input.find('\n', offset);
+        auto line = input.substr(offset, newline == std::string_view::npos ? input.size() - offset : newline - offset);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (line.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input contains an empty line");
+        if (line.size() > kHubMaxLine) return q2dz::Result<std::vector<std::string>>::fail("hub input line exceeds 256 KiB");
+        auto parsed = q2dz::json::parse(line);
+        if (!parsed || !parsed.value().is_object()) return q2dz::Result<std::vector<std::string>>::fail("hub input line must be a JSON object");
+        if (auto room = q2dz::json::extract_room_config(parsed.value()); !room) {
+            return q2dz::Result<std::vector<std::string>>::fail("hub input line: " + room.error().message);
+        }
+        rooms.emplace_back(line);
+        if (rooms.size() > kHubMaxRooms) return q2dz::Result<std::vector<std::string>>::fail("hub input accepts at most two rooms");
+        if (newline == std::string_view::npos) break;
+        offset = newline + 1;
+    }
+    if (rooms.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input is empty");
+    return q2dz::Result<std::vector<std::string>>::ok(std::move(rooms));
 }
 
 fs::path default_runtime_base() {
@@ -303,9 +322,9 @@ q2dz::Result<Guardian> start_guardian(const fs::path& self,
 
 struct Child {
     pid_t pid = -1;
+    pid_t process_group = -1;
     UniqueFd control;
     UniqueFd diagnostics;
-    UniqueFd input;
 };
 
 q2dz::Result<Child> spawn_gateway(const fs::path& gateway,
@@ -357,37 +376,48 @@ q2dz::Result<Child> spawn_gateway(const fs::path& gateway,
         (void)::kill(-pid, SIGKILL);
         return q2dz::Result<Child>::fail(write_result.error().message);
     }
-    return q2dz::Result<Child>::ok(Child{pid, std::move(control.value().read), std::move(diagnostics.value().read), {}});
+    return q2dz::Result<Child>::ok(Child{pid, pid, std::move(control.value().read), std::move(diagnostics.value().read)});
 }
 
-q2dz::Result<pid_t> spawn_q2(const fs::path& wine,
-                             const fs::path& q2,
-                             const q2dz::Endpoint& endpoint,
-                             pid_t process_group,
-                             const Options& options,
-                             const std::string& session_id) {
+q2dz::Result<pid_t> spawn_q2_hub(const fs::path& wine,
+                                 const fs::path& q2,
+                                 const std::vector<q2dz::Endpoint>& endpoints,
+                                 const Options& options,
+                                 const std::string& session_id) {
+    if (endpoints.empty() || endpoints.size() > kHubMaxRooms) {
+        return q2dz::Result<pid_t>::fail("hub has no usable gateway endpoints");
+    }
+    std::string source;
+    for (const auto& endpoint : endpoints) {
+        if (!source.empty()) source.push_back(' ');
+        source += "quake2://" + endpoint.to_string();
+    }
     const pid_t pid = ::fork();
     if (pid < 0) return q2dz::Result<pid_t>::fail(q2dz::errno_message("fork Q2PRO-X"));
     if (pid == 0) {
         (void)::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-        if (::setpgid(0, process_group) != 0) _exit(126);
+        if (::setpgid(0, 0) != 0) _exit(126);
         if (::chdir(q2.parent_path().c_str()) != 0) _exit(126);
-        std::vector<std::pair<std::string,std::string>> overrides = {{"Q2DZ_SESSION_ID", session_id}};
+        std::vector<std::pair<std::string, std::string>> overrides = {{"Q2DZ_SESSION_ID", session_id}};
         if (!options.wineprefix.empty()) overrides.emplace_back("WINEPREFIX", options.wineprefix);
         auto env_storage = q2dz::current_environment_with(overrides);
         std::vector<char*> envp;
         for (auto& item : env_storage) envp.push_back(item.data());
         envp.push_back(nullptr);
-        std::vector<std::string> storage = {wine.string(), q2.string(), "+set", "game", options.game, "+connect", endpoint.to_string()};
+        std::vector<std::string> storage = {
+            wine.string(), q2.string(), "+set", "game", options.game,
+            "+set", "cl_serverbrowser_custom_source", source,
+            "+serverbrowser_open_modern"
+        };
         std::vector<char*> argv;
         for (auto& item : storage) argv.push_back(item.data());
         argv.push_back(nullptr);
         ::execve(wine.c_str(), argv.data(), envp.data());
         _exit(127);
     }
-    if (::setpgid(pid, process_group) != 0 && errno != EACCES) {
+    if (::setpgid(pid, pid) != 0 && errno != EACCES) {
         (void)::kill(pid, SIGKILL);
-        return q2dz::Result<pid_t>::fail(q2dz::errno_message("setpgid Q2PRO-X"));
+        return q2dz::Result<pid_t>::fail(q2dz::errno_message("setpgid Q2PRO-X hub"));
     }
     return q2dz::Result<pid_t>::ok(pid);
 }
@@ -460,6 +490,253 @@ void terminate_group(pid_t pgid, int grace_ms, pid_t gateway_pid, pid_t q2_pid) 
     if (q2_alive) (void)::waitpid(q2_pid, &status, 0);
 }
 
+struct HubGateway {
+    Child child;
+    std::string control_buffer;
+    std::string diagnostic_buffer;
+    std::optional<q2dz::Endpoint> endpoint;
+    bool control_eof = false;
+    bool terminal = false;
+    std::string terminal_reason;
+};
+
+int child_exit_code(int status);
+
+void stop_hub_gateway(HubGateway& gateway, int grace_ms, UniqueFd& guardian_control, std::string_view reason) {
+    if (gateway.terminal) return;
+    const pid_t process_group = gateway.child.process_group;
+    if (gateway.child.pid > 0 || process_group > 1) {
+        terminate_group(process_group, grace_ms, gateway.child.pid, -1);
+        gateway.child.pid = -1;
+    }
+    if (process_group > 1) (void)q2dz::write_all(guardian_control.get(), "DROP " + std::to_string(process_group) + "\n");
+    drain_diagnostics(gateway.child.diagnostics.get(), gateway.diagnostic_buffer);
+    gateway.child.control.reset();
+    gateway.child.diagnostics.reset();
+    gateway.terminal_reason = std::string(reason);
+    gateway.terminal = true;
+    std::cerr << "HUB_GATEWAY_STOP reason=" << reason << "\n";
+}
+
+int finish_hub(const Options& options,
+               std::vector<HubGateway>& gateways,
+               pid_t& q2_pid,
+               Guardian& guardian,
+               std::string_view reason,
+               int result_code) {
+    for (auto& gateway : gateways) stop_hub_gateway(gateway, options.shutdown_grace_ms, guardian.control, reason);
+    if (q2_pid > 0) {
+        terminate_group(q2_pid, options.shutdown_grace_ms, -1, q2_pid);
+        q2_pid = -1;
+    }
+    std::cerr << "SESSION_CLOSING reason=" << reason << "\n";
+    const auto disarm = q2dz::write_all(guardian.control.get(), "DISARM\n");
+    guardian.control.reset();
+    guardian.owner.reset();
+    int guardian_status = 0;
+    if (::waitpid(guardian.pid, &guardian_status, 0) != guardian.pid ||
+        !WIFEXITED(guardian_status) || WEXITSTATUS(guardian_status) != 0 || !disarm) {
+        std::cerr << "guardian cleanup failed\n";
+        return kCleanupFailure;
+    }
+    std::cerr << "SESSION_CLOSED reason=" << reason << "\n";
+    return result_code;
+}
+
+int run_hub(const Options& options,
+            const fs::path& gateway,
+            const fs::path& legacy,
+            const fs::path& adapter,
+            const fs::path& wine,
+            const fs::path& q2,
+            const fs::path& session_dir,
+            const std::string& session_id,
+            std::vector<std::string>& room_json,
+            Guardian& guardian,
+            Pipes& signal_pipe) {
+    std::vector<HubGateway> gateways;
+    gateways.reserve(room_json.size());
+    for (auto& input : room_json) {
+        auto child = spawn_gateway(gateway, legacy, adapter, session_dir, session_id, input);
+        q2dz::secure_clear(input);
+        if (!child) {
+            std::cerr << "HUB_GATEWAY_START_FAILED reason=" << child.error().message << "\n";
+            continue;
+        }
+        gateways.push_back(HubGateway{std::move(child.value()), {}, {}, std::nullopt, false, false, {}});
+        const pid_t process_group = gateways.back().child.process_group;
+        (void)q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(process_group) + "\n");
+    }
+    if (gateways.empty()) {
+        pid_t no_q2 = -1;
+        return finish_hub(options, gateways, no_q2, guardian, "no-gateway", kGatewayFailure);
+    }
+
+    const auto ready_deadline = q2dz::monotonic_millis() + static_cast<std::uint64_t>(options.ready_timeout_ms);
+    while (q2dz::monotonic_millis() < ready_deadline && signal_seen.load() == 0) {
+        bool pending = false;
+        for (std::size_t index = 0; index < gateways.size(); ++index) {
+            auto& gateway_state = gateways[index];
+            if (gateway_state.terminal) continue;
+            if (!gateway_state.endpoint) pending = true;
+            pollfd child_fds[2] = {
+                {gateway_state.child.control.get(), POLLIN | POLLHUP, 0},
+                {gateway_state.child.diagnostics.get(), POLLIN | POLLHUP, 0}
+            };
+            if (::poll(child_fds, 2, 0) < 0 && errno != EINTR) {
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "poll-failed");
+                continue;
+            }
+            if ((child_fds[1].revents & (POLLIN | POLLHUP)) != 0) {
+                drain_diagnostics(gateway_state.child.diagnostics.get(), gateway_state.diagnostic_buffer);
+            }
+            if ((child_fds[0].revents & (POLLIN | POLLHUP)) != 0) {
+                for (const auto& line : take_lines(gateway_state.child.control.get(), gateway_state.control_buffer, gateway_state.control_eof)) {
+                    auto event = q2dz::parse_gateway_event(line);
+                    if (!event) {
+                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-gateway-event");
+                        break;
+                    }
+                    if (event.value().type == q2dz::GatewayEventType::TransportReady) {
+                        auto endpoint = q2dz::ready_endpoint(event.value());
+                        if (!endpoint) {
+                            stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-ready-endpoint");
+                            break;
+                        }
+                        gateway_state.endpoint = endpoint.value();
+                    } else if (event.value().type == q2dz::GatewayEventType::RoomClosed ||
+                               event.value().type == q2dz::GatewayEventType::Fatal) {
+                        const auto code = event.value().fields.find("code");
+                        const bool probe_timeout = event.value().type == q2dz::GatewayEventType::Fatal &&
+                            code != event.value().fields.end() && code->second == "q2-oob-timeout";
+                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control,
+                                         event.value().type == q2dz::GatewayEventType::RoomClosed ? "room-closed-before-q2" :
+                                         (probe_timeout ? "transport-ready-timeout" : "gateway-fatal"));
+                        break;
+                    }
+                }
+            }
+            if (gateway_state.terminal) continue;
+            int status = 0;
+            if (gateway_state.child.pid > 0 && ::waitpid(gateway_state.child.pid, &status, WNOHANG) == gateway_state.child.pid) {
+                gateway_state.child.pid = -1;
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-exited-before-q2");
+            } else if (gateway_state.control_eof) {
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-control-eof-before-q2");
+            }
+        }
+        if (!pending) break;
+        pollfd signal_fd{signal_pipe.read.get(), POLLIN, 0};
+        (void)::poll(&signal_fd, 1, 20);
+    }
+    for (auto& gateway_state : gateways) {
+        if (!gateway_state.endpoint && !gateway_state.terminal) {
+            stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "transport-ready-timeout");
+        }
+    }
+    if (signal_seen.load() != 0) {
+        pid_t no_q2 = -1;
+        return finish_hub(options, gateways, no_q2, guardian, "owner-stop-before-q2", 128 + signal_seen.load());
+    }
+
+    std::vector<q2dz::Endpoint> endpoints;
+    for (const auto& gateway_state : gateways) {
+        if (!gateway_state.terminal && gateway_state.endpoint) endpoints.push_back(*gateway_state.endpoint);
+    }
+    if (endpoints.empty()) {
+        pid_t no_q2 = -1;
+        int result_code = kReadyTimeout;
+        std::string reason = "no-ready-gateway";
+        for (const auto& gateway_state : gateways) {
+            if (gateway_state.terminal_reason == "room-closed-before-q2") {
+                result_code = kRoomClosed;
+                reason = "room-closed-before-q2";
+                break;
+            }
+            if (!gateway_state.terminal_reason.empty() &&
+                gateway_state.terminal_reason != "transport-ready-timeout") {
+                result_code = kGatewayFailure;
+                reason = "gateway-failure-before-q2";
+            }
+        }
+        return finish_hub(options, gateways, no_q2, guardian, reason, result_code);
+    }
+    auto started = spawn_q2_hub(wine, q2, endpoints, options, session_id);
+    if (!started) {
+        pid_t no_q2 = -1;
+        return finish_hub(options, gateways, no_q2, guardian, "q2-spawn-failed", kQ2Failure);
+    }
+    pid_t q2_pid = started.value();
+    (void)q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(q2_pid) + "\n");
+    std::cerr << "HUB_READY gateways=" << endpoints.size() << "\n";
+
+    int result_code = 0;
+    std::string closing_reason;
+    while (q2_pid > 0 && result_code == 0 && signal_seen.load() == 0) {
+        pollfd signal_fd{signal_pipe.read.get(), POLLIN, 0};
+        const int signal_poll = ::poll(&signal_fd, 1, 200);
+        if (signal_poll < 0 && errno != EINTR) {
+            result_code = kInternal;
+            closing_reason = "poll-failed";
+            break;
+        }
+        for (auto& gateway_state : gateways) {
+            if (gateway_state.terminal) continue;
+            pollfd child_fds[2] = {
+                {gateway_state.child.control.get(), POLLIN | POLLHUP, 0},
+                {gateway_state.child.diagnostics.get(), POLLIN | POLLHUP, 0}
+            };
+            if (::poll(child_fds, 2, 0) < 0 && errno != EINTR) {
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "poll-failed");
+                continue;
+            }
+            if ((child_fds[1].revents & (POLLIN | POLLHUP)) != 0) {
+                drain_diagnostics(gateway_state.child.diagnostics.get(), gateway_state.diagnostic_buffer);
+            }
+            if ((child_fds[0].revents & (POLLIN | POLLHUP)) != 0) {
+                for (const auto& line : take_lines(gateway_state.child.control.get(), gateway_state.control_buffer, gateway_state.control_eof)) {
+                    auto event = q2dz::parse_gateway_event(line);
+                    if (!event) {
+                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-gateway-event");
+                        break;
+                    }
+                    if (event.value().type == q2dz::GatewayEventType::RoomClosed ||
+                        event.value().type == q2dz::GatewayEventType::Fatal) {
+                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control,
+                                         event.value().type == q2dz::GatewayEventType::RoomClosed ? "room-closed" : "gateway-fatal");
+                        break;
+                    }
+                }
+            }
+            if (gateway_state.terminal) continue;
+            int gateway_status = 0;
+            if (gateway_state.child.pid > 0 && ::waitpid(gateway_state.child.pid, &gateway_status, WNOHANG) == gateway_state.child.pid) {
+                gateway_state.child.pid = -1;
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-exited");
+            } else if (gateway_state.control_eof) {
+                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-control-eof");
+            }
+        }
+        int q2_status = 0;
+        if (::waitpid(q2_pid, &q2_status, WNOHANG) == q2_pid) {
+            const int code = child_exit_code(q2_status);
+            q2_pid = -1;
+            result_code = code == 0 ? 0 : kQ2Failure;
+            closing_reason = code == 0 ? "q2-normal-exit" : "q2-failed";
+        }
+        if (signal_poll > 0 && (signal_fd.revents & POLLIN) != 0) {
+            result_code = 128 + signal_seen.load();
+            closing_reason = "owner-stop";
+        }
+    }
+    if (signal_seen.load() != 0 && result_code == 0) {
+        result_code = 128 + signal_seen.load();
+        closing_reason = "owner-stop";
+    }
+    return finish_hub(options, gateways, q2_pid, guardian,
+                      closing_reason.empty() ? "hub-stopped" : closing_reason, result_code);
+}
+
 int child_exit_code(int status) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
@@ -528,15 +805,19 @@ std::vector<pid_t> marked_processes(const GuardianOptions& options) {
     return out;
 }
 
-void kill_owned(const GuardianOptions& options, pid_t pgid) {
-    if (pgid > 1 && pgid != ::getpgrp()) (void)::kill(-pgid, SIGTERM);
+void kill_owned(const GuardianOptions& options, const std::set<pid_t>& pgids) {
+    for (const auto pgid : pgids) {
+        if (pgid > 1 && pgid != ::getpgrp()) (void)::kill(-pgid, SIGTERM);
+    }
     for (const auto pid : marked_processes(options)) (void)::kill(pid, SIGTERM);
     const auto deadline = q2dz::monotonic_millis() + static_cast<std::uint64_t>(options.grace_ms);
     while (q2dz::monotonic_millis() < deadline) {
         if (marked_processes(options).empty()) break;
         ::usleep(50000);
     }
-    if (pgid > 1 && pgid != ::getpgrp()) (void)::kill(-pgid, SIGKILL);
+    for (const auto pgid : pgids) {
+        if (pgid > 1 && pgid != ::getpgrp()) (void)::kill(-pgid, SIGKILL);
+    }
     for (const auto pid : marked_processes(options)) (void)::kill(pid, SIGKILL);
 }
 
@@ -546,7 +827,7 @@ int guardian_main(int argc, char** argv) {
     (void)::setsid();
     ::umask(0077);
     (void)q2dz::disable_core_dumps_and_ptrace();
-    pid_t pgid = -1;
+    std::set<pid_t> pgids;
     std::string control_buffer;
     bool disarmed = false;
     while (true) {
@@ -567,7 +848,12 @@ int guardian_main(int argc, char** argv) {
                         int parsed = -1;
                         const auto text = std::string_view(line).substr(5);
                         const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
-                        if (result.ec == std::errc{} && result.ptr == text.data() + text.size() && parsed > 1) pgid = static_cast<pid_t>(parsed);
+                        if (result.ec == std::errc{} && result.ptr == text.data() + text.size() && parsed > 1) pgids.insert(static_cast<pid_t>(parsed));
+                    } else if (line.starts_with("DROP ")) {
+                        int parsed = -1;
+                        const auto text = std::string_view(line).substr(5);
+                        const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+                        if (result.ec == std::errc{} && result.ptr == text.data() + text.size()) pgids.erase(static_cast<pid_t>(parsed));
                     } else if (line == "DISARM") {
                         disarmed = true;
                         break;
@@ -576,10 +862,10 @@ int guardian_main(int argc, char** argv) {
             }
         }
         if (disarmed) break;
-        if ((fds[0].revents & (POLLHUP | POLLERR)) != 0) { kill_owned(options.value(), pgid); break; }
+        if ((fds[0].revents & (POLLHUP | POLLERR)) != 0) { kill_owned(options.value(), pgids); break; }
         if ((fds[1].revents & (POLLHUP | POLLERR)) != 0) {
             // Losing coordinator control without explicit DISARM is a crash.
-            kill_owned(options.value(), pgid);
+            kill_owned(options.value(), pgids);
             break;
         }
     }
@@ -602,18 +888,17 @@ int main(int argc, char** argv) {
     auto room_input = q2dz::read_all_fd(STDIN_FILENO, 1024U * 1024U);
     if (!room_input) { std::cerr << room_input.error().message << "\n"; return kConfig; }
     std::string room_json = std::move(room_input.value());
-    auto parsed_json = q2dz::json::parse(room_json);
-    if (!parsed_json) { q2dz::secure_clear(room_json); std::cerr << "invalid room configuration\n"; return kConfig; }
-    auto room = q2dz::json::extract_room_config(parsed_json.value());
-    if (!room) { q2dz::secure_clear(room_json); std::cerr << room.error().message << "\n"; return kConfig; }
-    if (options.value().map.empty()) options.value().map = room.value().map;
+    auto parsed_hub = parse_hub_input(room_json);
+    q2dz::secure_clear(room_json);
+    if (!parsed_hub) { std::cerr << parsed_hub.error().message << "\n"; return kConfig; }
+    std::vector<std::string> hub_room_json = std::move(parsed_hub.value());
 
     auto gateway = resolve_program(options.value().gateway, {});
     auto legacy = resolve_program(options.value().legacy_gateway, {});
     auto wine = resolve_program(options.value().wine, {"wine64", "wine"});
     auto q2 = discover_q2(options.value());
     if (!gateway || !legacy || !wine || !q2) {
-        q2dz::secure_clear(room_json);
+        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         if (!gateway) std::cerr << gateway.error().message << "\n";
         if (!legacy) std::cerr << legacy.error().message << "\n";
         if (!wine) std::cerr << wine.error().message << "\n";
@@ -621,44 +906,31 @@ int main(int argc, char** argv) {
         return kUnavailable;
     }
     if (!fs::is_regular_file(options.value().adapter)) {
-        q2dz::secure_clear(room_json);
+        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         std::cerr << "adapter config not found: " << options.value().adapter << "\n";
         return kUnavailable;
     }
 
-    if (!options.value().map.empty()) {
-        auto content = q2dz::find_map_content(q2.value().parent_path(), options.value().game, options.value().map);
-        if (!content) {
-            q2dz::secure_clear(room_json);
-            std::cerr << "content validation error: " << content.error().message << "\n";
-            return kConfig;
-        }
-        if (!content.value().found) {
-            std::cerr << "CONTENT_MISSING game=" << options.value().game << " map=" << options.value().map << "\n";
-            if (options.value().require_content) { q2dz::secure_clear(room_json); return kUnavailable; }
-        } else std::cerr << "CONTENT_READY source=" << content.value().source << "\n";
-    }
-
     auto runtime_base = prepare_runtime_base(options.value().runtime_base);
-    if (!runtime_base) { q2dz::secure_clear(room_json); std::cerr << runtime_base.error().message << "\n"; return kInternal; }
+    if (!runtime_base) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << runtime_base.error().message << "\n"; return kInternal; }
     auto lock = acquire_global_lock(runtime_base.value());
-    if (!lock) { q2dz::secure_clear(room_json); std::cerr << lock.error().message << "\n"; return kUnavailable; }
+    if (!lock) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << lock.error().message << "\n"; return kUnavailable; }
     cleanup_stale_sessions(runtime_base.value());
 
     const std::string session_id = q2dz::random_hex(16);
     auto session_dir = create_session_dir(runtime_base.value(), session_id);
-    if (!session_dir) { q2dz::secure_clear(room_json); std::cerr << session_dir.error().message << "\n"; return kInternal; }
+    if (!session_dir) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << session_dir.error().message << "\n"; return kInternal; }
     fs::path self = fs::canonical("/proc/self/exe");
     auto guardian = start_guardian(self, runtime_base.value(), session_dir.value(), session_id, options.value().shutdown_grace_ms);
     if (!guardian) {
-        q2dz::secure_clear(room_json);
+        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         (void)q2dz::remove_session_dir_safely(runtime_base.value(), session_dir.value(), session_id);
         std::cerr << guardian.error().message << "\n";
         return kInternal;
     }
 
     auto signal_pipe = make_pipe(true);
-    if (!signal_pipe) { q2dz::secure_clear(room_json); return kInternal; }
+    if (!signal_pipe) { for (auto& input : hub_room_json) q2dz::secure_clear(input); return kInternal; }
     signal_pipe_write = signal_pipe.value().write.get();
     struct sigaction action{};
     action.sa_handler = signal_handler;
@@ -669,143 +941,7 @@ int main(int argc, char** argv) {
     (void)::sigaction(SIGHUP, &action, nullptr);
     std::signal(SIGPIPE, SIG_IGN);
 
-    auto child = spawn_gateway(gateway.value(), legacy.value(), options.value().adapter,
-                               session_dir.value(), session_id, room_json);
-    q2dz::secure_clear(room_json);
-    if (!child) {
-        (void)q2dz::write_all(guardian.value().control.get(), "DISARM\n");
-        guardian.value().owner.reset();
-        int status = 0; (void)::waitpid(guardian.value().pid, &status, 0);
-        std::cerr << child.error().message << "\n";
-        return kGatewayFailure;
-    }
-    const pid_t pgid = child.value().pid;
-    (void)q2dz::write_all(guardian.value().control.get(), "PGID " + std::to_string(pgid) + "\n");
-
-    std::string control_buffer;
-    std::string diagnostic_buffer;
-    bool control_eof = false;
-    std::optional<q2dz::Endpoint> endpoint;
-    const auto ready_deadline = q2dz::monotonic_millis() + static_cast<std::uint64_t>(options.value().ready_timeout_ms);
-    int result_code = 0;
-    std::string closing_reason;
-    while (result_code == 0 && !endpoint && q2dz::monotonic_millis() < ready_deadline && signal_seen.load() == 0) {
-        pollfd fds[3] = {
-            {child.value().control.get(), POLLIN | POLLHUP, 0},
-            {child.value().diagnostics.get(), POLLIN | POLLHUP, 0},
-            {signal_pipe.value().read.get(), POLLIN, 0}
-        };
-        const int rc = ::poll(fds, 3, 200);
-        if (rc < 0 && errno != EINTR) { result_code = kInternal; closing_reason = "poll-failed"; break; }
-        if ((fds[1].revents & POLLIN) != 0) drain_diagnostics(child.value().diagnostics.get(), diagnostic_buffer);
-        if ((fds[0].revents & (POLLIN | POLLHUP)) != 0) {
-            for (const auto& line : take_lines(child.value().control.get(), control_buffer, control_eof)) {
-                auto event = q2dz::parse_gateway_event(line);
-                if (!event) { result_code = kGatewayFailure; closing_reason = "invalid-gateway-event"; break; }
-                if (event.value().type == q2dz::GatewayEventType::TransportReady) {
-                    auto parsed = q2dz::ready_endpoint(event.value());
-                    if (!parsed) { result_code = kGatewayFailure; closing_reason = "invalid-ready-endpoint"; break; }
-                    endpoint = parsed.value();
-                } else if (event.value().type == q2dz::GatewayEventType::Fatal) {
-                    const auto code = event.value().fields.find("code");
-                    if (code != event.value().fields.end() && code->second == "q2-oob-timeout") {
-                        result_code = kReadyTimeout; closing_reason = "q2-oob-timeout";
-                    } else {
-                        result_code = kGatewayFailure; closing_reason = "gateway-fatal";
-                    }
-                    break;
-                } else if (event.value().type == q2dz::GatewayEventType::RoomClosed) {
-                    result_code = kRoomClosed; closing_reason = "room-closed-before-ready"; break;
-                }
-            }
-        }
-        // A terminal control event is authoritative. Do not overwrite its
-        // specific result with a generic EOF/child-exit classification in the
-        // same poll iteration.
-        if (result_code != 0) break;
-        int status = 0;
-        if (::waitpid(child.value().pid, &status, WNOHANG) == child.value().pid) {
-            result_code = kGatewayFailure;
-            closing_reason = endpoint ? "gateway-exited-after-ready" : "gateway-exited-before-ready";
-            endpoint.reset();
-            break;
-        }
-        if (control_eof) {
-            result_code = kGatewayFailure;
-            closing_reason = endpoint ? "gateway-control-eof-after-ready" : "gateway-control-eof";
-            endpoint.reset();
-            break;
-        }
-    }
-    if (!endpoint && result_code == 0) {
-        result_code = signal_seen.load() ? 128 + signal_seen.load() : kReadyTimeout;
-        closing_reason = signal_seen.load() ? "owner-stop-before-ready" : "transport-ready-timeout";
-    }
-
-    pid_t q2_pid = -1;
-    if (endpoint && result_code == 0) {
-        std::cerr << "TRANSPORT_READY udp=" << endpoint->to_string() << "\n";
-        auto started = spawn_q2(wine.value(), q2.value(), *endpoint, pgid, options.value(), session_id);
-        if (!started) { result_code = kQ2Failure; closing_reason = "q2-spawn-failed"; }
-        else q2_pid = started.value();
-    }
-
-    while (q2_pid > 0 && result_code == 0 && signal_seen.load() == 0) {
-        pollfd fds[3] = {
-            {child.value().control.get(), POLLIN | POLLHUP, 0},
-            {child.value().diagnostics.get(), POLLIN | POLLHUP, 0},
-            {signal_pipe.value().read.get(), POLLIN, 0}
-        };
-        const int rc = ::poll(fds, 3, 250);
-        if (rc < 0 && errno != EINTR) { result_code = kInternal; closing_reason = "poll-failed"; break; }
-        if ((fds[1].revents & POLLIN) != 0) drain_diagnostics(child.value().diagnostics.get(), diagnostic_buffer);
-        if ((fds[0].revents & (POLLIN | POLLHUP)) != 0) {
-            for (const auto& line : take_lines(child.value().control.get(), control_buffer, control_eof)) {
-                auto event = q2dz::parse_gateway_event(line);
-                if (!event) { result_code = kGatewayFailure; closing_reason = "invalid-gateway-event"; break; }
-                if (event.value().type == q2dz::GatewayEventType::RoomClosed) {
-                    result_code = kRoomClosed; closing_reason = "room-closed"; break;
-                }
-                if (event.value().type == q2dz::GatewayEventType::Fatal) {
-                    result_code = kGatewayFailure; closing_reason = "gateway-fatal"; break;
-                }
-            }
-        }
-        // Preserve the reason carried by ROOM_CLOSED/FATAL instead of
-        // replacing it with a subsequent pipe EOF or child exit.
-        if (result_code != 0) break;
-        int q2_status = 0;
-        const pid_t q2_wait = ::waitpid(q2_pid, &q2_status, WNOHANG);
-        if (q2_wait == q2_pid) {
-            const int code = child_exit_code(q2_status);
-            q2_pid = -1;
-            result_code = code == 0 ? 0 : kQ2Failure;
-            closing_reason = code == 0 ? "q2-normal-exit" : "q2-failed";
-            break;
-        }
-        int gateway_status = 0;
-        if (::waitpid(child.value().pid, &gateway_status, WNOHANG) == child.value().pid) {
-            result_code = kGatewayFailure; closing_reason = "gateway-exited"; break;
-        }
-        if (control_eof) { result_code = kGatewayFailure; closing_reason = "gateway-control-eof"; break; }
-    }
-    if (signal_seen.load() != 0 && result_code == 0) {
-        result_code = 128 + signal_seen.load();
-        closing_reason = "owner-stop";
-    }
-
-    std::cerr << "SESSION_CLOSING reason=" << closing_reason << "\n";
-    terminate_group(pgid, options.value().shutdown_grace_ms, child.value().pid, q2_pid);
-    drain_diagnostics(child.value().diagnostics.get(), diagnostic_buffer);
-    const auto disarm = q2dz::write_all(guardian.value().control.get(), "DISARM\n");
-    guardian.value().control.reset();
-    guardian.value().owner.reset();
-    int guardian_status = 0;
-    if (::waitpid(guardian.value().pid, &guardian_status, 0) != guardian.value().pid ||
-        !WIFEXITED(guardian_status) || WEXITSTATUS(guardian_status) != 0 || !disarm) {
-        std::cerr << "guardian cleanup failed\n";
-        return kCleanupFailure;
-    }
-    std::cerr << "SESSION_CLOSED reason=" << closing_reason << "\n";
-    return result_code;
+    return run_hub(options.value(), gateway.value(), legacy.value(), options.value().adapter,
+                   wine.value(), q2.value(), session_dir.value(), session_id,
+                   hub_room_json, guardian.value(), signal_pipe.value());
 }

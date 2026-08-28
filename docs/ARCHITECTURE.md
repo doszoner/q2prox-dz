@@ -7,7 +7,7 @@
 
 Поддерживается только следующий профиль:
 
-- клиент: Q2PRO-X 1.4 by ly, сборка 2026-07-05, или точно совместимая с ней сборка;
+- клиент: Q2PRO-X 1.5 by ly, сборка 2026-08-25, или точно совместимая с ней сборка;
 - Dos.Zone room prefix: `q2`;
 - room alias: только `q2.<owner>`, составленный из `owner` в catalog и
   подтверждённый точным совпадением в свежем lookup;
@@ -38,19 +38,24 @@ HumbleNet/WebRTC receive API получает caller-sized buffer. Если API 
 таких frames upstream. Наблюдаемые live maxima для representative `baseq2` и
 `3zb2` gameplay остаются pending до Task 16 и здесь не заявляются.
 
-## Общий поток
+## Встроенный браузер комнат
 
-1. Launcher получает список готовых публичных Quake II комнат.
-2. Пользователь выбирает комнату.
-3. Launcher проверяет наличие нужной карты и получает свежие room/ICE данные.
-4. Coordinator запускает локальный gateway и ждёт реальный Quake II OOB
-   `ping`/`ack` через WebRTC.
-5. Только после readiness запускается неизменённый Q2PRO-X с
-   `+set game 3zb2 +connect 127.0.0.1:<случайный-порт>`.
-6. При выходе игры, закрытии комнаты или сбое launcher завершает всю сессию.
+Основной rc9 launcher сразу запускает hub-режим, без отдельного picker. Hub
+готовит не более двух независимых gateway и
+запускает один Q2PRO-X со штатным составным
+`cl_serverbrowser_custom_source=quake2://127.0.0.1:<порт> ...`. Q2PRO-X сам
+получает через прозрачный gateway настоящее имя сервера, карту, число сетевых
+клиентов, их имена и ping.
 
+Закрытие или падение одного gateway не завершает Q2PRO-X и второй gateway.
+После штатного таймаута либо ручного `Disconnect` пользователь выбирает другую
+комнату. Выход Q2PRO-X или hard-kill hub очищает все принадлежащие ему процессы.
 Room/ICE данные передаются через stdin, не сохраняются в аргументах,
 переменных окружения или постоянных файлах. UDP слушает только loopback.
+
+Число `players` из каталога Dos.Zone отражает браузерное lobby, а не всех
+нативных игроков, и показывается только как `Lobby N/M`. Gateway не подменяет
+Quake II status. Подробный контракт: [ADR 0004](adr/0004-q2pro-x-custom-source-room-hub.md).
 
 ## Windows
 
@@ -67,8 +72,9 @@ Coordinator использует Windows Job Object с `KILL_ON_JOB_CLOSE`. WebV
 - `linux/` — launcher, coordinator, guardian, installer и tests;
 - `linux/transport/` — используемый WebRTC-NET transport adapter.
 
-Q2PRO-X запускается через Wine. Gateway и Wine/Q2 входят в одну управляемую
-process group; guardian очищает их и session directory при смерти владельца.
+Q2PRO-X запускается через Wine. У каждого gateway и Q2 отдельная process group;
+guardian очищает весь набор по session marker и удаляет session directory при
+смерти владельца.
 
 ## Зафиксированные решения
 
@@ -76,9 +82,8 @@ process group; guardian очищает их и session directory при смер
 - [ADR 0002: Windows launcher-owned lifecycle](adr/0002-launcher-owned-session-lifecycle.md)
 - [ADR 0003: Linux managed session](adr/0003-linux-managed-session-and-guardian.md)
 
-## Предлагаемое развитие
+## Встроенный браузер
 
-[ADR 0004](adr/0004-q2pro-x-custom-source-room-hub.md) описывает переход от
-отдельного single-room picker к штатной вкладке `Custom` в server browser
-Q2PRO-X и долгоживущему room hub. До прохождения указанных в ADR runtime gates
-эта схема не считается реализованной и не заменяет текущий single-room поток.
+[ADR 0004](adr/0004-q2pro-x-custom-source-room-hub.md) описывает единственный
+пользовательский путь rc9: штатную вкладку `Custom` и room hub. До прохождения указанных в ADR runtime
+gates rc9 не считается готовым к распространению; откатом остаётся rc8.

@@ -8,18 +8,19 @@
 
 ## Контекст
 
-Текущая поставка показывает комнаты в отдельном launcher, поднимает один
-gateway и запускает Q2PRO-X с
+Поставка до rc9 показывала комнаты в отдельном launcher, поднимала один
+gateway и запускала Q2PRO-X с
 `+set game 3zb2 +connect 127.0.0.1:<port>`. Пока Q2PRO-X
-работает, эта сессия привязана к одной комнате. Для перехода в другую комнату
-пользователь должен полностью закрыть игру и повторно запустить launcher.
+работал, эта сессия была привязана к одной комнате. Для перехода в другую
+комнату пользователь должен был полностью закрыть игру и повторно запустить
+launcher.
 
-Q2PRO-X 1.4 уже имеет подходящий штатный интерфейс:
+Q2PRO-X 1.5 by ly от 2026-08-25 уже имеет подходящий штатный интерфейс:
 
 - современный server browser со вкладками `q2servers.com`, `Favorites`, `LAN`
   и `Custom`;
 - локальную адресную книгу `adr0..adr15` для `Favorites`;
-- `cl_serverbrowser_custom_source` для отдельного HTTP/file source;
+- `cl_serverbrowser_custom_source` для составного списка `quake2://`;
 - обычный Quake II `status` для получения hostname, mod, map, players и ping.
 
 На проверенной пользовательской установке четыре PlayGround-сервера появились
@@ -27,11 +28,13 @@ Q2PRO-X 1.4 уже имеет подходящий штатный интерфе
 maintainer не потребовались. Следовательно, базовая интеграция Dos.Zone также
 не требует модификации Q2PRO-X или участия его maintainer.
 
-Подтверждено локально, что меню Q2PRO-X предлагает для `Custom` значение вида
-`+http://example.com/?raw=2`. Но точный формат ответа, повторное чтение source
-по `Refresh` и переход от browser query к игровому `connect` через один gateway
-ещё не проверены end-to-end. Ниже они зафиксированы как обязательные gates, а
-не как готовые свойства текущей поставки.
+Подтверждено на exact Q2PRO-X 1.5, SHA-256
+`831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d`, что
+составной source вида
+`quake2://127.0.0.1:31001 quake2://127.0.0.1:31002` опрашивает оба endpoint.
+`status`, `getchallenge` и `connect` используют один UDP source. Свидетельства
+зафиксированы в
+[проверке exact клиента](../verification/2026-08-29-q2pro-x-custom-source.md).
 
 `Favorites` использовать для Dos.Zone нельзя: это заняло бы пользовательские
 слоты, смешало динамические комнаты с личными серверами и создало бы конфликт
@@ -39,13 +42,14 @@ maintainer не потребовались. Следовательно, базо
 
 ## Решение
 
-Целевое подключение реализуется через launcher-owned **room hub** и вкладку
-`Custom` Q2PRO-X. Текущий single-room flow остаётся поставляемым baseline до
-прохождения gates этого ADR.
+Целевое пользовательское подключение реализуется только через launcher-owned
+**room hub** и вкладку `Custom` Q2PRO-X. Отдельный picker и single-room ветка
+координатора удаляются, чтобы не поддерживать два интерфейса и два lifecycle.
+Проверенные rc8 artifacts сохраняют архивный rollback до прохождения gates rc9.
 
 ### Пользовательский сценарий
 
-1. Пользователь запускает `Q2PRO-X — Dos.Zone`.
+1. Пользователь запускает `Q2PRO-X — Dos.Zone` без предварительного picker.
 2. Room hub получает готовые публичные Quake II комнаты и свежие RTC данные
    через те же Dos.Zone endpoints, которые уже использует launcher.
 3. Hub проверяет локальное наличие карты и для каждой совместимой комнаты
@@ -63,7 +67,6 @@ maintainer не потребовались. Следовательно, базо
 Q2PRO-X Custom source
   Room A -> 127.0.0.1:31001 -> gateway -> Dos.Zone Room A
   Room B -> 127.0.0.1:31002 -> gateway -> Dos.Zone Room B
-  Room C -> 127.0.0.1:31003 -> gateway -> Dos.Zone Room C
 ```
 
 Hub отдаёт Q2PRO-X только loopback endpoints. Он не генерирует synthetic
@@ -73,22 +76,16 @@ loopback endpoint, gateway передаёт его в настоящую ком�
 
 ### Custom source contract
 
-Hub слушает HTTP только на случайном loopback high port. Launcher передаёт
-актуальный URL Q2PRO-X через штатный `cl_serverbrowser_custom_source` при
-запуске add-on; URL не является секретом. Installer и hub не редактируют CFG
-самостоятельно. Архивирует ли Q2PRO-X это значение при autosave и требуется ли
-явно очищать его при обычном запуске игры, определяет runtime gate.
+Первая версия не поднимает HTTP server и не пишет source-файл. Launcher
+передаёт Q2PRO-X составной список готовых loopback endpoints через
+`cl_serverbrowser_custom_source`. В snapshot попадает не более двух комнат.
+`Refresh` повторно опрашивает те же endpoints. Новые комнаты появляются после
+следующего запуска hub; закрытая комната может оставаться недоступной строкой
+до этого момента.
 
-Предпочтительный wire format — используемый Q2PRO-X `raw=2`: тело состоит из
-последовательных шестибайтовых IPv4 endpoints (четыре байта адреса и
-двухбайтовый UDP port). Exact byte order и URI syntax должны быть зафиксированы
-runtime-тестом до реализации. Текстовый newline-separated source допустим как
-fallback только после такого же exact runtime proof.
-
-Source содержит только gateways со статусом ready. При обычном `Refresh`
-Q2PRO-X заново читает source и опрашивает endpoints. Hub обновляет каталог не
-чаще одного раза в 30 секунд и немедленно удаляет endpoint после подтверждённого
-закрытия комнаты.
+Q2PRO-X может сохранить несекретный loopback source штатным autosave. Add-on не
+редактирует CFG и не меняет `cl_serverbrowser_default_source`: пользователь
+выбирает вкладку `Custom`. Diff изолированного профиля остаётся release gate.
 
 Существующие gateways захватывают первый loopback UDP source и отвергают второй.
 Поэтому первая проверка должна доказать, что exact Q2PRO-X использует один и тот
@@ -103,9 +100,8 @@ Q2PRO-X заново читает source и опрашивает endpoints. Hub 
 Общий контракт и одинаковое поведение на обеих платформах:
 
 - получение и валидация каталога Dos.Zone;
-- room registry и соответствие room ID → loopback UDP endpoint;
-- reconcile добавленных, сохранённых и удалённых комнат;
-- локальный Custom source;
+- snapshot до двух комнат и соответствие room ID → loopback UDP endpoint;
+- составной loopback Custom source;
 - правила readiness, refresh, room close и shutdown;
 - redaction, exit reasons и acceptance tests.
 
@@ -117,18 +113,22 @@ Q2PRO-X заново читает source и опрашивает endpoints. Hub 
 - Windows запускает native `Q2PRO-X.exe`, Linux — тот же exe через Wine;
 - установка и обнаружение Q2PRO-X остаются раздельными.
 
-Для первой реализации не создаётся общий кроссплатформенный runtime framework.
-PowerShell на Windows и Python на Linux могут реализовать небольшую orchestration
-часть отдельно, следуя одному контракту и общим fixtures. Общий C++ hub имеет
-смысл только если фактическое дублирование или расхождение поведения станет
-дороже двух небольших реализаций.
+Существующий координатор на каждой платформе становится hub coordinator.
+PowerShell и Python только собирают и валидируют снимок комнат; они не
+становятся границей владения процессами.
 
 ### Lifecycle
 
-Hub владеет одной запущенной Q2PRO-X и набором gateways. Закрытие одной комнаты
-завершает только её gateway и удаляет одну строку source; оно не завершает Q2 и
-не затрагивает другие комнаты. Закрытие активной комнаты приводит к обычному
-разрыву соединения Q2, после чего пользователь может выбрать другую комнату.
+Hub владеет одной запущенной Q2PRO-X и набором gateways. У каждого gateway свои
+config/event/owner pipes и WebView2 directory. Windows использует корневой Job
+Object для всей сессии и вложенный Job для дерева каждого gateway: закрытие
+вложенного Job убирает только соответствующие gateway/WebView2 процессы. На
+Linux у каждого gateway и Q2 отдельная process group; guardian
+очищает весь набор по существующему session marker. Закрытие или падение одной
+комнаты завершает только её gateway и не затрагивает Q2 и другие комнаты. При
+закрытии активной комнаты Q2 остаётся запущен; соединение
+завершается по штатному таймауту либо пользователь выполняет `Disconnect`,
+после чего выбирает другую комнату.
 
 Выход Q2, закрытие hub или crash владельца очищают весь принадлежащий add-on
 process tree. Windows сохраняет `KILL_ON_JOB_CLOSE`, Linux — guardian. На каждую
@@ -143,13 +143,13 @@ content checker. Несовместимая комната не показыва
 
 ## Security invariants
 
-- HTTP и UDP слушают только `127.0.0.1`.
+- UDP gateway слушают только `127.0.0.1`.
 - Room alias, ICE/TURN credentials, SDP и candidates не попадают в source,
   arguments, environment, CFG или постоянные файлы.
 - Fresh room configuration передаётся каждому gateway только через stdin.
 - В source нет room credentials и внешних адресов Dos.Zone — только loopback.
-- Hub ограничивает размер и схему внешнего каталога; допустимый предел
-  одновременно подготовленных gateways устанавливается после resource gate.
+- Hub ограничивает размер и схему внешнего каталога и готовит не более двух
+  gateway.
 - Installer не занимает `adr0..adr15`, не создаёт `servers.lst` и не изменяет
   Favorites пользователя.
 
@@ -177,8 +177,8 @@ content checker. Несовместимая комната не показыва
 
 ### Отдельный room picker и `+set game 3zb2 +connect`
 
-Уже реализован и остаётся rollback path. Он проще, но не позволяет штатно
-сменить комнату без перезапуска Q2PRO-X. Не является целевым UX.
+Удалён из текущего кода. Он сохраняется только в исторических rc8 artifacts:
+два режима создавали бы лишнюю поддержку и разный пользовательский опыт.
 
 ### First-class provider внутри Q2PRO-X
 
@@ -203,35 +203,33 @@ content checker. Несовместимая комната не показыва
 
 Компромиссы:
 
-- одновременно работает один gateway на каждую опубликованную ready-комнату;
+- одновременно работает не более двух gateway;
 - Windows может держать несколько WebView2 process trees;
 - room hub становится долгоживущим владельцем Q2 и gateways;
-- перед заменой single-room flow нужны exact runtime и resource gates.
+- перед распространением rc9 нужны exact runtime и resource gates.
 
 ## Обязательные gates
 
-1. **Custom source:** exact Q2PRO-X читает localhost source, показывает все
-   endpoints и обновляет их по `Refresh`; зафиксированы wire format, URI syntax
-   и поведение cvar autosave.
+1. **Custom source:** exact Q2PRO-X показывает оба составных `quake2://`
+   endpoint; diff normal-exit/crash профиля ограничен штатным autosave и
+   несекретным loopback source.
 2. **Real status:** две комнаты одновременно показывают фактические hostname,
    mod, map, players и измеренный через transport ping без synthetic response;
    packet trace подтверждает один UDP source для `status` и `connect`.
 3. **Switch:** Q2 входит в Room A, выполняет `Disconnect`, затем входит в Room B
    без завершения процесса Q2PRO-X; движение и выстрел видны владельцу Room B.
-4. **Isolation:** закрытие неактивной Room A не влияет на игру в Room B;
-   закрытие активной комнаты не завершает hub или Q2.
-5. **Refresh:** появление и закрытие комнат отражаются после bounded refresh,
-   stale endpoint не остаётся доступным.
-6. **Lifecycle:** normal exit, Q2 crash, gateway crash и hub hard-kill не
+4. **Room close:** закрытие активной и неактивной комнат завершает только
+   соответствующий gateway; Q2 и второй gateway остаются живы, после чего
+   выполняется вход во вторую комнату.
+5. **Lifecycle:** normal exit, Q2 crash, gateway crash и hub hard-kill не
    оставляют gateway, WebView2/Wine или session data.
-7. **Security:** source, args, env, CFG и redacted logs не содержат room/ICE
+6. **Security:** source, args, env, CFG и redacted logs не содержат room/ICE
    credentials.
-8. **Resources:** Windows и Linux измерены при 1, 4 и 8 ready-комнатах; по
-   результату устанавливается и документируется operational cap.
-9. **Packaging:** portable/setup/Linux package проходят smoke и live switch
+7. **Resources:** Windows и Linux измерены при одной и двух ready-комнатах;
+   operational cap первой версии равен двум.
+8. **Packaging:** portable/setup/Linux package проходят smoke и live switch
    именно из заново распакованных release artifacts.
 
-До прохождения gates 1–8 этот ADR остаётся `Proposed`, а существующий
-single-room launcher — единственным подтверждённым release path. Rollback после
-внедрения означает возврат launcher к одной комнате и
-`+set game 3zb2 +connect`; gateways и transport backend при этом не меняются.
+До прохождения gates 1–8 этот ADR остаётся `Proposed`, а rc9 не считается
+готовым к распространению. Rollback означает возврат к rc8; gateways и
+transport backend при этом не меняются.

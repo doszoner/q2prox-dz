@@ -1,6 +1,8 @@
 #ifdef _WIN32
 #include "win32_support.hpp"
+#include "q2dz/session_safety.hpp"
 #include <shlobj.h>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -39,6 +41,56 @@ std::wstring guid_text() {
     GUID g{}; if(CoCreateGuid(&g)!=S_OK) fail(L"CoCreateGuid failed");
     wchar_t b[64]{}; if(!StringFromGUID2(g,b,64)) fail(L"StringFromGUID2 failed");
     std::wstring s(b); for(auto& c:s) if(c==L'{'||c==L'}') c=L'-'; return s;
+}
+
+bool no_reparse_in_path(const std::filesystem::path& value) {
+    std::error_code ec;
+    const auto absolute=std::filesystem::absolute(value,ec);
+    if(ec || absolute.empty()) return false;
+    auto current=absolute.root_path();
+    if(current.empty()) current=std::filesystem::current_path(ec);
+    if(ec) return false;
+    if(!current.empty()) {
+        const DWORD attributes=GetFileAttributesW(current.c_str());
+        if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    }
+    for(const auto& component:absolute.relative_path()) {
+        current/=component;
+        const DWORD attributes=GetFileAttributesW(current.c_str());
+        if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    }
+    return true;
+}
+
+bool no_reparse_in_tree(const std::filesystem::path& value) {
+    if(!no_reparse_in_path(value)) return false;
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(value,std::filesystem::directory_options::none,ec),end;
+    if(ec) return false;
+    for(;it!=end;it.increment(ec)) {
+        if(ec) return false;
+        const DWORD attributes=GetFileAttributesW(it->path().c_str());
+        if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    }
+    return !ec;
+}
+
+bool exact_session_marker_file(const std::filesystem::path& path) {
+    constexpr auto expected=q2dz::kSessionMarker;
+    std::ifstream input(path,std::ios::binary);
+    if(!input) return false;
+    std::array<char,expected.size()+1> bytes{};
+    input.read(bytes.data(),static_cast<std::streamsize>(bytes.size()));
+    if(input.gcount()!=static_cast<std::streamsize>(expected.size())) return false;
+    return std::equal(expected.begin(),expected.end(),bytes.begin());
+}
+
+bool regular_non_reparse_file(const std::filesystem::path& path) {
+    std::error_code ec;
+    if(!std::filesystem::is_regular_file(path,ec) || ec) return false;
+    const DWORD attributes=GetFileAttributesW(path.c_str());
+    return attributes!=INVALID_FILE_ATTRIBUTES &&
+           !(attributes&FILE_ATTRIBUTE_REPARSE_POINT);
 }
 }
 
@@ -112,8 +164,25 @@ void write_all(HANDLE h,const unsigned char* p,std::size_t n){while(n){DWORD w=0
 void secure_clear(std::vector<unsigned char>& d) noexcept { if(!d.empty()) SecureZeroMemory(d.data(),d.size()); d.clear(); d.shrink_to_fit(); }
 
 std::filesystem::path create_session_directory(const std::filesystem::path& root,Handle& lock) {
-    std::filesystem::create_directories(root); for(int i=0;i<20;++i){auto p=root/(L"session"+guid_text());std::error_code ec;if(!std::filesystem::create_directory(p,ec))continue;std::ofstream(p/L"session.v1",std::ios::binary)<<"q2dz-session-v1\n";HANDLE h=CreateFileW((p/L"owner.lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_HIDDEN,nullptr);if(h==INVALID_HANDLE_VALUE){std::filesystem::remove_all(p);continue;}lock.reset(h);return p;}fail(L"cannot create unique session directory");}
+    std::filesystem::create_directories(root); for(int i=0;i<20;++i){auto p=root/(L"session"+guid_text());std::error_code ec;if(!std::filesystem::create_directory(p,ec))continue;std::ofstream(p/L"session.v1",std::ios::binary)<<q2dz::kSessionMarker;HANDLE h=CreateFileW((p/L"owner.lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_HIDDEN,nullptr);if(h==INVALID_HANDLE_VALUE){std::filesystem::remove_all(p);continue;}lock.reset(h);return p;}fail(L"cannot create unique session directory");}
 bool remove_tree_with_retry(const std::filesystem::path& p,DWORD total){const auto start=GetTickCount64();DWORD delay=50;do{std::error_code ec;std::filesystem::remove_all(p,ec);if(!std::filesystem::exists(p,ec))return true;Sleep(delay);delay=(std::min<DWORD>)(delay*2,500);}while(GetTickCount64()-start<total);return false;}
-void cleanup_stale_sessions(const std::filesystem::path& root){std::error_code ec;if(!std::filesystem::exists(root,ec))return;for(const auto& e:std::filesystem::directory_iterator(root,ec)){if(ec||!e.is_directory())continue;if(!std::filesystem::exists(e.path()/L"session.v1"))continue;HANDLE h=CreateFileW((e.path()/L"owner.lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);if(h==INVALID_HANDLE_VALUE)continue;CloseHandle(h);(void)remove_tree_with_retry(e.path(),2000);}}
+bool validate_session_for_cleanup(const std::filesystem::path& root,const std::filesystem::path& session) {
+    try {
+        if(!no_reparse_in_path(root) || !no_reparse_in_path(session)) return false;
+        std::error_code ec;
+        const auto canonical_root=std::filesystem::canonical(root,ec);
+        if(ec) return false;
+        const auto canonical_session=std::filesystem::canonical(session,ec);
+        if(ec || !q2dz::is_direct_session_child(canonical_root,canonical_session) ||
+           !q2dz::is_expected_session_name(canonical_session)) return false;
+        if(!no_reparse_in_tree(canonical_session)) return false;
+        const auto marker=canonical_session/L"session.v1";
+        const auto owner=canonical_session/L"owner.lock";
+        return exact_session_marker_file(marker) && regular_non_reparse_file(owner);
+    } catch(...) {
+        return false;
+    }
+}
+void cleanup_stale_sessions(const std::filesystem::path& root){std::error_code ec;if(!std::filesystem::exists(root,ec))return;for(const auto& e:std::filesystem::directory_iterator(root,ec)){if(ec||!e.is_directory())continue;if(!validate_session_for_cleanup(root,e.path()))continue;HANDLE h=CreateFileW((e.path()/L"owner.lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);if(h==INVALID_HANDLE_VALUE)continue;CloseHandle(h);(void)remove_tree_with_retry(e.path(),2000);}}
 } // namespace q2dz::win
 #endif

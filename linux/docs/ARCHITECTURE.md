@@ -2,21 +2,22 @@
 
 ## Decision
 
-Use one launcher-owned local session. Do not expose every Dos.Zone room as a
+Use one launcher-owned local room hub. Do not expose every Dos.Zone room as a
 synthetic UDP server and do not make Wine/Q2PRO-X responsible for WebRTC.
 
-The coordinator owns exactly one selected room, one WebRTC-NET gateway, one
-random loopback UDP endpoint and one Wine/Q2PRO-X process tree. This keeps the
-ordinary Q2PRO-X shortcut independent and makes failure cleanup deterministic.
+The coordinator owns one Wine/Q2PRO-X process and one or two independent
+WebRTC-NET gateways, each with its own random loopback UDP endpoint. The
+ordinary Q2PRO-X shortcut remains independent and failure cleanup stays
+deterministic.
 
 ## State machine
 
 ```text
-Idle
-  → ValidatingInput
-  → ValidatingContent (optional)
-  → StartingTransport
-  → WaitingForTransportReady
+  Idle
+  → ValidatingSnapshot
+  → ValidatingContent
+  → StartingGateways
+  → WaitingForGatewaysReady
   → StartingWine
   → Active
   → Closing
@@ -25,18 +26,18 @@ Idle
 any nonterminal state → Failed → Closing → Closed
 ```
 
-`TRANSPORT_READY` means a genuine Quake II OOB `ping` traversed the selected
-WebRTC-NET route and an OOB `ack` returned. Signaling success, ICE connected, or
-DataChannel open alone is insufficient.
+`TRANSPORT_READY` means a genuine Quake II OOB `ping` traversed the
+corresponding WebRTC-NET route and an OOB `ack` returned. Signaling success,
+ICE connected, or DataChannel open alone is insufficient.
 
 ## Ownership
 
-The coordinator and its children use a unique non-secret session marker. The
-managed gateway and Wine/Q2PRO-X are placed in one process group. A separate
-guardian receives the process-group id over a pipe. If the owner disappears,
-the guardian terminates the process group, searches only same-UID processes
-carrying the exact marker, and removes only a marked session directory under
-the configured runtime root.
+The coordinator and its children use a unique non-secret session marker. Each
+managed gateway and Wine/Q2PRO-X receive an independent process group. A
+separate guardian receives every group id over a pipe. If the owner disappears,
+the guardian terminates all groups, searches only same-UID processes carrying
+the exact marker, and removes only a marked session directory under the
+configured runtime root.
 
 The guardian does not terminate a shared `wineserver`, because that could break
 unrelated Wine applications. The live matrix must nevertheless prove that no
@@ -51,7 +52,7 @@ fresh room JSON
   → private pipe
   → managed gateway memory
   → parsed ICE array
-  → sealed anonymous memfd inherited only by the pinned legacy gateway
+  → sealed anonymous memfd inherited only by the corresponding legacy gateway
 ```
 
 No room JSON, ICE/TURN credential, SDP, candidate, token or secret is accepted
@@ -74,6 +75,19 @@ lifecycle or user workflow.
 - reject a second source;
 - preserve WebRTC-NET logical channel 0;
 - do not parse gameplay packets.
+
+## Snapshot and content bound
+
+The launcher takes one room catalog and one alias lookup snapshot, then obtains
+one fresh RTC response. It forwards at most two compatible rooms to the
+coordinator as newline-delimited JSON. Before starting any gateway it runs the
+existing content checker for at most eight catalog candidates (four per hub
+slot); this keeps a large public catalog from causing unbounded subprocess
+fan-out. Missing maps are skipped. If no candidate remains, Q2PRO-X is not
+started.
+
+The coordinator accepts one or two validated room lines and always starts the
+Custom browser source. It has no direct-connect or alternate single-room mode.
 
 ## Room closure
 

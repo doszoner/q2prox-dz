@@ -117,8 +117,6 @@ class LauncherTests(unittest.TestCase):
         second = room("room.q2.duplicate.1", "2")
         with self.assertRaises(launch.LaunchError):
             launch.joinable_rooms({"rooms": [first, second]})
-        with self.assertRaises(launch.LaunchError):
-            launch.revalidate_room({"rooms": [first, second]}, first["room"])
 
     def test_help_never_starts_discovery_or_network(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,37 +219,28 @@ class LauncherTests(unittest.TestCase):
 
                 with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
                      mock.patch.object(launch, "fetch_json", side_effect=fake_fetch), \
-                     mock.patch.object(launch, "choose_room", return_value=selected), \
-                     mock.patch.object(launch, "content_ready", return_value=True), \
-                     mock.patch.object(launch, "run_session") as run_session, \
                      mock.patch.object(launch, "notify"):
                     self.assertEqual(launch.main([]), 0)
                 self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT])
-                run_session.assert_not_called()
 
-    def test_fresh_profile_conflict_stops_before_new_lookup_or_rtc_fetch(self):
+    def test_invalid_snapshot_stops_before_rtc_fetch_or_session(self):
         selected = room()
         conflicting = {**selected, "createSettings": {**selected["createSettings"], "profile": "baseq2"}}
-        catalogs = iter(({"rooms": [selected]}, {"rooms": [conflicting]}))
         endpoints = []
 
         def fake_fetch(endpoint):
             endpoints.append(endpoint)
             if endpoint == launch.ROOM_ENDPOINT:
-                return next(catalogs)
+                return {"rooms": [conflicting]}
             if endpoint == launch.LOOKUP_ENDPOINT:
                 return {"aliases": ["q2.123"]}
             return [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}]
 
         with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
              mock.patch.object(launch, "fetch_json", side_effect=fake_fetch), \
-             mock.patch.object(launch, "choose_room", return_value=selected), \
-             mock.patch.object(launch, "content_ready", return_value=True), \
-             mock.patch.object(launch, "run_session") as run_session, \
              mock.patch.object(launch, "notify"):
-            self.assertEqual(launch.main([]), 2)
-        self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT, launch.ROOM_ENDPOINT])
-        run_session.assert_not_called()
+            self.assertEqual(launch.main([]), 0)
+        self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT])
 
     def test_room_list_hides_stale_unregistered_aliases(self):
         rows = [room("room.q2.live.1", "123"), room("room.q2.stale.2", "456")]
@@ -276,21 +265,6 @@ class LauncherTests(unittest.TestCase):
             2,
         )
 
-    def test_terminal_selector_returns_room_id(self):
-        rows = [room("room.q2.first.1"), room("room.q2.second.2")]
-        choice = launch.choose_room(rows, zenity=None, input_fn=lambda _prompt: "2")
-        self.assertEqual(choice["room"], "room.q2.second.2")
-
-    def test_headless_session_ignores_installed_zenity(self):
-        runner = mock.Mock()
-        with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(launch.shutil, "which", return_value="/usr/bin/zenity"):
-            choice = launch.choose_room([room()], input_fn=lambda _prompt: "1", runner=runner)
-            selected = launch.select_q2_path(input_fn=lambda _prompt: "c", runner=runner)
-        self.assertEqual(choice["room"], "room.q2.abc.123")
-        self.assertIsNone(selected)
-        runner.assert_not_called()
-
     def test_desktop_error_uses_zenity(self):
         calls = []
 
@@ -302,12 +276,6 @@ class LauncherTests(unittest.TestCase):
             launch.notify("room unavailable", zenity="/usr/bin/zenity", runner=fake_run)
         self.assertEqual(calls[0][:2], ["/usr/bin/zenity", "--error"])
         self.assertIn("--text=room unavailable", calls[0])
-
-    def test_revalidation_requires_same_ready_nonfull_q2_room(self):
-        selected = room()
-        self.assertEqual(launch.revalidate_room({"rooms": [selected]}, selected["room"]), selected)
-        self.assertIsNone(launch.revalidate_room({"rooms": [{**selected, "roomReady": False}]}, selected["room"]))
-        self.assertIsNone(launch.revalidate_room({"rooms": [{**selected, "players": 16}]}, selected["room"]))
 
     def test_room_config_requires_alias_and_fresh_rtc(self):
         selected = room()
@@ -343,7 +311,35 @@ class LauncherTests(unittest.TestCase):
                   "iceservers": [{"urls": ["stun:example.invalid"]}]}],
             )
 
-    def test_launch_command_keeps_room_data_out_of_argv(self):
+    def test_hub_command_uses_composite_source_and_no_connect(self):
+        configs = [
+            {"version": 1, "roomId": "room.q2.a.1", "alias": "q2.1",
+             "ordered": False, "iceServers": [], "map": "q2dm1", "game": "3zb2"},
+            {"version": 1, "roomId": "room.q2.b.2", "alias": "q2.2",
+             "ordered": False, "iceServers": [], "map": "ztn2dm3", "game": "3zb2"},
+        ]
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0)
+
+        rc = launch.run_hub(
+            configs,
+            "/games/Q2PRO-X.exe",
+            session="/opt/q2dz/bin/q2dz-session",
+            managed="/opt/q2dz/bin/q2dz-managed-gateway",
+            legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
+            adapter="/opt/q2dz/config/legacy-gateway.json",
+            runner=fake_run,
+        )
+        self.assertEqual(rc, 0)
+        args, kwargs = calls[0]
+        self.assertNotIn("+connect", args)
+        self.assertNotIn("+connect", kwargs["input"])
+        self.assertEqual(kwargs["input"].count("\n"), 2)
+
+    def test_hub_command_keeps_room_data_out_of_argv(self):
         config = {
             "version": 1,
             "roomId": "room.q2.abc.123",
@@ -358,10 +354,9 @@ class LauncherTests(unittest.TestCase):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0)
 
-        rc = launch.run_session(
-            config,
+        rc = launch.run_hub(
+            [config],
             q2,
-            "q2dm1",
             session="/opt/q2dz/bin/q2dz-session",
             managed="/opt/q2dz/bin/q2dz-managed-gateway",
             legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
@@ -373,10 +368,28 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args[0], "/opt/q2dz/bin/q2dz-session")
         self.assertIn("--legacy-gateway", args)
         self.assertEqual(args[args.index("--game"):args.index("--game") + 2], ["--game", "3zb2"])
-        self.assertIn("--require-content", args)
         self.assertNotIn("secret", args)
         self.assertEqual(json.loads(kwargs["input"])["iceServers"][0]["credential"], "secret")
         self.assertNotIn("shell", kwargs)
+
+    def test_hub_snapshot_takes_first_two_compatible_rooms_without_selection(self):
+        rows = [room("room.q2.one.1", "1", "q2dm1"),
+                room("room.q2.two.2", "2", "missing"),
+                room("room.q2.three.3", "3", "ztn2dm3")]
+        lookup = {"aliases": ["q2.1", "q2.2", "q2.3"]}
+        rtc = [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}]
+        with mock.patch.object(launch, "content_ready", side_effect=[True, True, False]):
+            configs = launch.make_hub_configs({"rooms": rows}, lookup, rtc, "/games/Q2PRO-X.exe")
+        self.assertEqual([config["roomId"] for config in configs], ["room.q2.one.1", "room.q2.three.3"])
+
+    def test_hub_content_checks_are_bounded_before_subprocess_fanout(self):
+        rows = [room(f"room.q2.{index}.1", str(index), "missing") for index in range(12)]
+        lookup = {"aliases": [f"q2.{index}" for index in range(12)]}
+        rtc = [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}]
+        with mock.patch.object(launch, "content_ready", return_value=False) as checked:
+            with self.assertRaises(launch.LaunchError):
+                launch.make_hub_configs({"rooms": rows}, lookup, rtc, "/games/Q2PRO-X.exe")
+        self.assertEqual(checked.call_count, launch.HUB_MAX_CONTENT_CHECKS)
 
     def test_path_store_persists_only_q2_path(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as game_tmp:
@@ -407,15 +420,12 @@ class LauncherTests(unittest.TestCase):
         replies = [
             {"rooms": [selected]},
             {"aliases": ["q2.123"]},
-            {"rooms": [selected]},
-            {"aliases": ["q2.123"]},
             [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}],
         ]
         with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
              mock.patch.object(launch, "fetch_json", side_effect=replies), \
-             mock.patch.object(launch, "choose_room", return_value=selected), \
              mock.patch.object(launch, "content_ready", return_value=True), \
-             mock.patch.object(launch, "run_session", return_value=71), \
+             mock.patch.object(launch, "run_hub", return_value=71), \
              mock.patch.object(launch, "notify") as notified:
             self.assertEqual(launch.main([]), 71)
         notified.assert_called_once_with("Dos.Zone session ended unexpectedly (code 71).")
@@ -425,15 +435,12 @@ class LauncherTests(unittest.TestCase):
         replies = [
             {"rooms": [selected]},
             {"aliases": ["q2.123"]},
-            {"rooms": [selected]},
-            {"aliases": ["q2.123"]},
             [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}],
         ]
         with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
              mock.patch.object(launch, "fetch_json", side_effect=replies), \
-             mock.patch.object(launch, "choose_room", return_value=selected), \
              mock.patch.object(launch, "content_ready", return_value=True), \
-             mock.patch.object(launch, "run_session", return_value=73), \
+             mock.patch.object(launch, "run_hub", return_value=73), \
              mock.patch.object(launch, "notify") as notified:
             self.assertEqual(launch.main([]), 73)
         notified.assert_called_once_with("The Dos.Zone room was closed.", "info")

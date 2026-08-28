@@ -89,10 +89,17 @@ fi
 grep -Fq 'user-owned desktop' "$HOME_DIR/.local/share/applications/q2dz.desktop"
 unlink "$HOME_DIR/.local/share/applications/q2dz.desktop"
 "${run_env[@]}" "$package/install.sh"
+install_root="$HOME_DIR/.local/share/q2dz"
+printf '#!/bin/sh\nexit 64\n' > "$install_root/bin/q2dz-join"
+chmod 0755 "$install_root/bin/q2dz-join"
+ln -s "$install_root/bin/q2dz-join" "$HOME_DIR/.local/bin/q2dz-join"
+printf '%s\n' 'bin/q2dz-join' >> "$install_root/.q2dz-owned-paths"
+LC_ALL=C sort -o "$install_root/.q2dz-owned-paths" "$install_root/.q2dz-owned-paths"
 "${run_env[@]}" "$package/install.sh"
 
-install_root="$HOME_DIR/.local/share/q2dz"
-for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch q2dz-join; do
+[[ ! -e "$install_root/bin/q2dz-join" ]]
+[[ ! -e "$HOME_DIR/.local/bin/q2dz-join" ]]
+for name in q2dz-session q2dz-managed-gateway q2dz-content-check q2dz-webrtc-gateway q2dz-launch; do
   [[ -x "$install_root/bin/$name" ]]
   [[ -L "$HOME_DIR/.local/bin/$name" ]]
 done

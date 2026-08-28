@@ -19,14 +19,13 @@
 
 ## Требуемый Q2PRO-X
 
-Поддерживаемый клиентский профиль — Q2PRO-X 1.4 by ly, сборка 2026-07-05, или
+Поддерживаемый клиентский профиль — Q2PRO-X 1.5 by ly, сборка 2026-08-25, или
 точно совместимая с ней сборка. Произвольные Quake II forks и другие игры
 Dos.Zone этим add-on не поддерживаются.
 
 Если Q2PRO-X отсутствует или устарел:
 
-1. Скачайте выпуск 1.4 с [официальной страницы Q2PRO-X](https://q2pro-x.com/)
-   (ссылка и версия наблюдались maintainer-ом 2026-08-23).
+1. Скачайте выпуск 1.5 с [официальной страницы Q2PRO-X](https://q2pro-x.com/).
 2. Распакуйте/установите файлы Q2PRO-X рядом с уже существующим контентом
    Quake II (`baseq2`, `3zb2` и ваши PAK-файлы).
 3. При первом запуске add-on выберите установленный `Q2PRO-X.exe`.
@@ -44,9 +43,10 @@ q2prox-dz launcher → local managed gateway → WebRTC → Dos.Zone room
 Q2PRO-X ───── UDP 127.0.0.1 ─────┘
 ```
 
-Windows использует WebView2, Linux — нативный WebRTC-NET transport. В обоих
-случаях Q2PRO-X подключается только к случайному loopback-порту, а launcher
-владеет всей сессией и завершает дочерние процессы вместе.
+Windows использует WebView2, Linux — нативный WebRTC-NET transport. Launcher
+публикует до двух loopback-портов во вкладке `Custom` Q2PRO-X: отдельного окна
+выбора комнаты нет. Закрытие одной комнаты не завершает игру, и пользователь
+может выбрать другую. Launcher владеет и очищает только созданные им процессы.
 
 - [Архитектура](docs/ARCHITECTURE.md)
 - [Сборка и выпуск](docs/RELEASE.md)
@@ -60,7 +60,9 @@ Lifecycle, content и datagram contracts покрыты source/unit tests.
 Linux gates. В [rc8](docs/verification/1.0.0-rc8.md) Windows A/B/C локализовал
 1 Hz cadence в background scheduling невидимого WebView2; выбран и проверен
 нативный fix `IsVisible(TRUE)` без Chromium-флагов. Exact package hashes и
-пройденные release gates фиксируются в той же записи rc8.
+пройденные release gates фиксируются в той же записи rc8. Новый hub-режим и его
+ещё не пройденные release gates фиксируются отдельно в
+[rc9](docs/verification/1.0.0-rc9.md).
 
 Windows RC artifacts не подписаны Authenticode. Это не мешает
 корректностному тестированию в закрытой alpha-группе, но Authenticode обязателен

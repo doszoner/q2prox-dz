@@ -327,4 +327,19 @@ $caseRoom = [pscustomobject]@{
 }
 Assert-Equal 2 (@(Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($room, $caseRoom) }))).Count 'room ids differing only by case are distinct'
 
+$launcherText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\q2dz-launch.ps1') -Raw
+Assert-True ($launcherText.Contains('The launcher has no room picker')) 'launcher starts the Custom browser directly'
+Assert-True (-not $launcherText.Contains('Open in Q2PRO-X')) 'launcher has no duplicate room action'
+Assert-True (-not $launcherText.Contains('ListBox')) 'launcher has no preliminary room chooser'
+Assert-True (-not $launcherText.Contains('--hub')) 'launcher uses the coordinator''s only supported mode'
+Assert-True ($launcherText.Contains("'--gateway', " + '$gateway')) 'launcher invokes the single hub coordinator mode'
+Assert-True ($launcherText.Contains('$hubInput')) 'launcher sends bounded hub configurations through stdin'
+Assert-True ($launcherText.Contains('$hubMaxContentChecks = 8')) 'launcher bounds content-check work for a large catalog'
+Assert-True ($launcherText.Contains('$rtcRows = Get-Q2DzJson $Q2DZ_RTC_ENDPOINT')) 'launcher fetches one RTC snapshot before checking rooms'
+Assert-True (-not $launcherText.Contains('Get-Q2DzSelectedTransport -Room $candidate')) 'launcher does not refetch transport data per room'
+Assert-True ($launcherText.Contains('[Environment]::NewLine')) 'launcher separates hub room configurations by newline'
+Assert-True ($launcherText.Contains('RedirectStandardInput')) 'launcher uses a real redirected coordinator stdin'
+Assert-True ($launcherText.Contains('StandardInput.BaseStream')) 'launcher writes coordinator stdin as explicit bytes'
+Assert-True ($launcherText.Contains('UTF8Encoding')) 'launcher encodes coordinator stdin as UTF-8 without BOM'
+
 Write-Output ('catalog contract tests: PASS ({0} shared cases)' -f $cases.Count)

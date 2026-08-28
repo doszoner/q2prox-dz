@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, signal, socket, sys, time
+import argparse, os, re, signal, socket, sys, time
 if os.environ.get('Q2DZ_SYNTHETIC_CREDENTIAL'):
     raise SystemExit('credential-shaped parent environment reached fake gateway')
 p=argparse.ArgumentParser()
@@ -16,10 +16,20 @@ with open(a.ice_file, 'rb', buffering=0) as f:
     data=f.read()
 if b'iceServers' in data or not data.startswith(b'['):
     print('bad ICE payload', file=sys.stderr); sys.exit(4)
-mode=os.environ.get('Q2DZ_FAKE_LEGACY_MODE','normal')
+alias_key = re.sub(r'[^A-Za-z0-9]', '_', a.alias).upper()
+mode_spec = os.environ.get('Q2DZ_FAKE_LEGACY_MODE', 'normal')
+mode = 'normal'
+for entry in mode_spec.split(';'):
+    name, separator, candidate = entry.partition('=')
+    if separator and name == a.alias:
+        mode = candidate
+        break
+if not separator:
+    mode = mode_spec
 marker=os.environ.get('Q2DZ_TEST_MARKER')
 attempts_path=marker+'.legacy-attempts' if marker else None
 endpoints_path=marker+'.legacy-endpoints' if marker else None
+pid_path=marker+'.legacy-'+alias_key+'.pid' if marker else None
 attempt=0
 if attempts_path:
     try:
@@ -34,6 +44,9 @@ host,port=a.bind.rsplit(':',1)
 if endpoints_path:
     with open(endpoints_path, 'a', encoding='ascii') as f:
         f.write(a.bind+'\n')
+if pid_path:
+    with open(pid_path, 'w', encoding='ascii') as f:
+        f.write(str(os.getpid()))
 if mode == 'early-exit-once' and attempt == 1:
     print('early startup exit', file=sys.stderr)
     sys.exit(11)
