@@ -20,13 +20,15 @@ if os.read(0, 1) != b'':
 hub = 'cl_serverbrowser_custom_source' in args
 if not hub:
     sys.exit(64)
-expected = ['+set', 'game', '3zb2', '+set', 'cl_serverbrowser_custom_source']
-if len(args) < len(expected) + 2 or args[:len(expected)] != expected:
+expected = [
+    '+set', 'game', '3zb2',
+    '+set', 'cl_timeout', '20',
+    '+set', 'cl_serverbrowser_custom_source',
+]
+if len(args) != len(expected) + 1 or args[:len(expected)] != expected:
     sys.exit(64)
 source = args[len(expected)]
 if not source.startswith('http://127.0.0.1:') or not source.endswith('/servers'):
-    sys.exit(64)
-if args[len(expected) + 1:] != ['+serverbrowser_open_modern']:
     sys.exit(64)
 host, source_port = source[len('http://'):].split(':', 1)
 source_port = int(source_port.split('/', 1)[0])

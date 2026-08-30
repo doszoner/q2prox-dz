@@ -5,8 +5,8 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Текущий `1.0.0-rc10` получает PASS только из
-[`1.0.0-rc10`](verification/1.0.0-rc10.md), где должны быть зафиксированы
+rollback. Текущий `1.0.0-rc11` получает PASS только из
+[`1.0.0-rc11`](verification/1.0.0-rc11.md), где должны быть зафиксированы
 точные результаты компонентных, live и package gates.
 
 Пользователю следует публиковать только три canonical архива и соседние
@@ -32,7 +32,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc10
+  -OutputDir .\dist\windows-1.0.0-rc11
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -84,5 +84,5 @@ Unsigned Windows candidates допустимы для корректностно
 закрытой alpha-группе с явным предупреждением. До широкого публичного выпуска
 необходимо выполнить Authenticode gate и заново проверить exact release archives.
 
-Пока эти условия не выполнены для конкретного rc10-архива, он остаётся
+Пока эти условия не выполнены для конкретного rc11-архива, он остаётся
 кандидатом для проверки и не считается готовой пользовательской поставкой.

@@ -1072,8 +1072,9 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
         source.publish({});
         auto q2_stdin = q2dz::win::open_null(false);
         const std::vector<std::wstring> q2_args = {
-            L"+set", L"game", L"3zb2", L"+set", L"cl_serverbrowser_custom_source",
-            source.url(), L"+serverbrowser_open_modern"
+            L"+set", L"game", L"3zb2", L"+set", L"cl_timeout", L"20",
+            L"+set", L"cl_serverbrowser_custom_source",
+            source.url()
         };
         auto pending = q2dz::win::launch_suspended(
             q2, q2_args, q2.parent_path(), q2_stdin.get(), GetStdHandle(STD_OUTPUT_HANDLE),

@@ -147,15 +147,15 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     const std::vector<std::wstring> arguments(argv + 1, argv + argc);
-    if (arguments.size() != 7 || arguments[0] != L"+set" || arguments[1] != L"game" ||
+    if (arguments.size() != 9 || arguments[0] != L"+set" || arguments[1] != L"game" ||
         arguments[2] != L"3zb2" || arguments[3] != L"+set" ||
-        arguments[4] != L"cl_serverbrowser_custom_source" ||
-        arguments[6] != L"+serverbrowser_open_modern") {
+        arguments[4] != L"cl_timeout" || arguments[5] != L"20" ||
+        arguments[6] != L"+set" || arguments[7] != L"cl_serverbrowser_custom_source") {
         WSACleanup();
         return 30;
     }
     unsigned short source_port = 0;
-    if (!parse_source_url(arguments[5], source_port)) {
+    if (!parse_source_url(arguments[8], source_port)) {
         WSACleanup();
         return 30;
     }
@@ -183,8 +183,8 @@ int wmain(int argc, wchar_t** argv) {
     write_marker(marker_directory, L"q2-source-empty", observed_count == 0 ? "1" : "0");
     write_marker(marker_directory, L"q2-source-" + std::to_wstring(observed_count));
     std::string source_url;
-    source_url.reserve(arguments[5].size());
-    for (const wchar_t character : arguments[5]) source_url.push_back(static_cast<char>(character));
+    source_url.reserve(arguments[8].size());
+    for (const wchar_t character : arguments[8]) source_url.push_back(static_cast<char>(character));
     write_marker(marker_directory, L"q2-source-url", source_url);
 
     if (mode == L"hub-room-close" || mode == L"hub-room-crash") {

@@ -6,7 +6,20 @@
 Формат следует [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии проекта — [Semantic Versioning](https://semver.org/lang/ru/).
 
+`1.0.0-rc6` — первая сохранённая версия проекта. Более ранних выпусков и
+пользовательских артефактов в истории проекта нет.
+
 ## [Unreleased]
+
+## [1.0.0-rc11] - 2026-08-30
+
+### Fixed
+
+- Q2PRO-X больше не получает команду принудительного открытия пустого
+  браузера серверов. Он использует обычную настройку стартового меню; комнаты
+  Dos.Zone доступны через штатный `Join online` → `Custom`.
+- Ожидание после закрытия комнаты ограничено 20 секундами вместо стандартных
+  120 секунд. Значение действует только в запущенном add-on процессе Q2PRO-X.
 
 ## [1.0.0-rc10] - 2026-08-30
 
@@ -76,7 +89,53 @@
 - Добавлены bounded transport cadence и datagram counters без содержимого
   пакетов и credential values.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...HEAD
+## [1.0.0-rc7] - 2026-08-24
+
+### Fixed
+
+- Windows и Linux теперь выбирают модификацию `3zb2` до подключения к серверу:
+  `+set game 3zb2 +connect 127.0.0.1:<port>`. Это устранило ошибку разбора
+  серверных данных при подключении из `baseq2`.
+
+### Added
+
+- Добавлены ограниченные обезличенные счётчики задержек Windows transport для
+  воспроизведения проблемы «90 FPS, но одно обновление мира в секунду» без
+  записи содержимого пакетов или данных комнаты.
+- Полный Windows lifecycle matrix включён в каноническую release-chain до
+  упаковки portable и setup.
+
+### Changed
+
+- Добавлена проверяемая привязка исходников и пакетов к закреплённому commit
+  WebRTC-NET и точным SHA-256 зависимостей.
+- Исправлены названия пользовательских архивов, путь сохранённого Q2PRO-X и
+  граница обязательной цифровой подписи в документации поставки.
+
+## [1.0.0-rc6] - 2026-08-23
+
+### Added
+
+- Первая пользовательская поставка шлюза для подключения установленного
+  Q2PRO-X к существующей комнате Quake II на Dos.Zone.
+- Windows portable и setup-поставки на основе WebView2, а также Linux x86-64
+  package с нативным WebRTC-NET gateway и запуском Q2PRO-X через Wine.
+- Launcher выбирает комнату, проверяет наличие нужной карты и запускает
+  неизменённый Q2PRO-X через локальный UDP endpoint.
+- Coordinator владеет Q2PRO-X и gateway как одной сессией, ограничивает
+  readiness, завершает дочерние процессы и очищает временные данные.
+- Fresh room/ICE данные передаются только внутри сессии и не сохраняются в
+  аргументах запуска, CFG или пользовательских файлах.
+
+### Changed
+
+- Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
+  PAK-файлы пользователя.
+
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...HEAD
+[1.0.0-rc11]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...v1.0.0-rc11
 [1.0.0-rc10]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...v1.0.0-rc10
 [1.0.0-rc9]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc8...v1.0.0-rc9
-[1.0.0-rc8]: https://github.com/doszoner/q2prox-dz/releases/tag/v1.0.0-rc8
+[1.0.0-rc8]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc7...v1.0.0-rc8
+[1.0.0-rc7]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc6...v1.0.0-rc7
+[1.0.0-rc6]: https://github.com/doszoner/q2prox-dz/releases/tag/v1.0.0-rc6

@@ -125,7 +125,7 @@ function Expect-Failure([string]$Name, [scriptblock]$Action) {
 
 function Test-LauncherModes([string]$Root) {
   $launcher = Get-Content -LiteralPath (Join-Path $Root 'q2dz-launch.ps1') -Raw
-  Assert ($launcher.Contains('The launcher has no room picker')) 'packaged launcher does not start the Custom browser directly'
+  Assert ($launcher.Contains('The launcher has no room picker')) 'packaged launcher keeps room selection inside Q2PRO-X'
   Assert (-not $launcher.Contains('ListBox')) 'packaged launcher contains a duplicate room chooser'
   Assert (-not $launcher.Contains('--hub')) 'packaged launcher passes an obsolete coordinator mode flag'
   Assert ($launcher.Contains("'--gateway', " + '$gateway')) 'packaged launcher does not invoke the hub coordinator'

@@ -742,8 +742,8 @@ q2dz::Result<pid_t> spawn_q2_live(const fs::path& wine,
         std::vector<std::string> storage = {
             wine.string(), q2.string(),
             "+set", "game", options.game,
-            "+set", "cl_serverbrowser_custom_source", std::string(source_url),
-            "+serverbrowser_open_modern"
+            "+set", "cl_timeout", "20",
+            "+set", "cl_serverbrowser_custom_source", std::string(source_url)
         };
         std::vector<char*> argv;
         for (auto& item : storage) argv.push_back(item.data());

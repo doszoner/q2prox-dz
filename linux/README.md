@@ -6,8 +6,11 @@
 распакуйте release-архив и выполните
 `./install.sh`. Затем откройте **Q2PRO-X — Dos.Zone** из меню приложений или
 запустите `q2dz-launch`. При первом запуске укажите существующий
-`Q2PRO-X.exe`; launcher подготовит до двух комнат и откроет штатную вкладку
-`Custom` Q2PRO-X. Подробные требования и команды приведены ниже.
+`Q2PRO-X.exe`; launcher подготовит до двух комнат, не переключая меню Q2PRO-X
+принудительно. Подробные требования и команды приведены ниже.
+
+Q2PRO-X сохраняет обычную настройку запуска. Если видна консоль, нажмите
+`Esc`, затем откройте `Join online` → `Custom` и нажмите `Refresh`.
 
 Не редактируйте CFG Q2PRO-X, Favorites или аргументы запуска. Новая комната
 появляется после очередного успешного опроса каталога (примерно 15 секунд), а
@@ -48,8 +51,8 @@ registered the connected player. Historical rc6/rc7 results remain preserved
 in their own verification records and are not promoted to rc8 by inference.
 Exact rc8 package hashes and results are recorded in
 `docs/verification/1.0.0-rc8.md`; it remains the historical rollback release.
-The current rc10 candidate is fail-closed in
-`docs/verification/1.0.0-rc10.md`.
+The current rc11 candidate is fail-closed in
+`docs/verification/1.0.0-rc11.md`.
 
 If Q2PRO-X is not installed, get the current release from the official landing
 page: <https://q2pro-x.com/>. Install or update it separately, start it once
@@ -61,9 +64,9 @@ the game client.
 Keep the archive and its adjacent `.sha256` file in the same directory:
 
 ```bash
-sha256sum -c q2prox-dz-1.0.0-rc10-linux-x86_64.tar.gz.sha256
-tar -xzf q2prox-dz-1.0.0-rc10-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc10
+sha256sum -c q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz.sha256
+tar -xzf q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc11
 ./install.sh
 ```
 

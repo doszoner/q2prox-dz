@@ -8,6 +8,7 @@ Dos.Zone. Игра, карты и игровые данные поставляю
 ```text
 Install or unpack q2prox-dz.
 Run Q2PRO-X - Dos.Zone.
+Open Join online, then Custom.
 Use the ordinary Refresh button in Custom to see newly created or closed rooms.
 Do not edit Q2PRO-X CFG, Favorites or command-line arguments.
 ```
@@ -18,6 +19,10 @@ Launcher опрашивает каталог примерно раз в 15 се�
 комната сохраняется; третья не вытесняет уже выбранные две. Если каталог
 временно недоступен, текущие комнаты сохраняются.
 
+Запускатель не открывает меню Q2PRO-X принудительно: клиент использует свою
+обычную настройку запуска. Если после запуска видна консоль, нажмите `Esc`,
+откройте `Join online` → `Custom` и нажмите `Refresh`.
+
 ## Если Q2PRO-X ещё не установлен
 
 Скачайте последнюю поддерживаемую версию с официального сайта
@@ -27,13 +32,12 @@ Launcher опрашивает каталог примерно раз в 15 се�
 
 ## Windows setup
 
-1. Скачайте `q2prox-dz-1.0.0-rc10-windows-x64-setup.zip` и полностью
+1. Скачайте `q2prox-dz-1.0.0-rc11-windows-x64-setup.zip` и полностью
    распакуйте его.
 2. Закройте уже запущенный Q2PRO-X и запустите `Install.cmd`.
 3. `Install.cmd` сам откроет первый запуск. Укажите в нём установленный
    `Q2PRO-X.exe`.
-4. Во встроенной вкладке `Custom` нажмите обычную кнопку `Refresh` и выберите
-   комнату.
+4. Откройте `Join online` → `Custom`, нажмите `Refresh` и выберите комнату.
 
 Права администратора не нужны. После первого запуска используйте ярлык
 **Q2PRO-X - Dos.Zone** из меню «Пуск». Не запускайте этот ярлык повторно, пока
@@ -43,11 +47,11 @@ Q2PRO-X - Dos.Zone**.
 
 ## Windows portable
 
-1. Скачайте `q2prox-dz-1.0.0-rc10-windows-x64-portable.zip` и распакуйте его в
+1. Скачайте `q2prox-dz-1.0.0-rc11-windows-x64-portable.zip` и распакуйте его в
    отдельную папку.
 2. Закройте уже запущенный Q2PRO-X и запустите `Run.cmd`.
 3. При первом запуске укажите `Q2PRO-X.exe`.
-4. В открывшейся вкладке `Custom` нажмите `Refresh` и выберите комнату.
+4. Откройте `Join online` → `Custom`, нажмите `Refresh` и выберите комнату.
 
 Для обновления распакуйте новый архив в новую папку и запустите новый
 `Run.cmd`. Для удаления удалите portable-папку. Сохранённый путь к Q2PRO-X
@@ -64,13 +68,14 @@ Microsoft Evergreen Runtime x64:
 [linux/README.md](linux/README.md).
 
 ```bash
-tar -xzf q2prox-dz-1.0.0-rc10-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc10
+tar -xzf q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc11
 ./install.sh
 ```
 
 Запустите **Q2PRO-X — Dos.Zone** из меню приложений или командой
-`q2dz-launch`. В `Custom` нажмите обычную кнопку `Refresh` и выберите комнату.
+`q2dz-launch`. Откройте `Join online` → `Custom`, нажмите `Refresh` и выберите
+комнату.
 Повторный `./install.sh` обновляет add-on. Удаление:
 
 ```bash
