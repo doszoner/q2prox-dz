@@ -5,7 +5,7 @@
 Use one launcher-owned local room hub. Do not expose every Dos.Zone room as a
 synthetic UDP server and do not make Wine/Q2PRO-X responsible for WebRTC.
 
-The coordinator owns one Wine/Q2PRO-X process and one or two independent
+The coordinator owns one Wine/Q2PRO-X process and zero, one or two independent
 WebRTC-NET gateways, each with its own random loopback UDP endpoint. The
 ordinary Q2PRO-X shortcut remains independent and failure cleanup stays
 deterministic.
@@ -76,18 +76,27 @@ lifecycle or user workflow.
 - preserve WebRTC-NET logical channel 0;
 - do not parse gameplay packets.
 
-## Snapshot and content bound
+## Live catalog and content bound
 
-The launcher takes one room catalog and one alias lookup snapshot, then obtains
-one fresh RTC response. It forwards at most two compatible rooms to the
-coordinator as newline-delimited JSON. Before starting any gateway it runs the
-existing content checker for at most eight catalog candidates (four per hub
-slot); this keeps a large public catalog from causing unbounded subprocess
-fan-out. Missing maps are skipped. If no candidate remains, Q2PRO-X is not
-started.
+The launcher starts the coordinator and Q2PRO-X even when the initial catalog
+has no compatible room. It polls the catalog approximately every 15 seconds.
+After each successful poll it sends independent commands for the two slots;
+unchanged rooms keep their original configuration and do not restart a gateway.
+A new room fills a free slot after content and transport readiness checks. A
+room absent from two consecutive successful polls is cleared; a catalog error
+leaves the existing slots unchanged. A ready full room is retained, and a third
+room does not evict either retained slot.
 
-The coordinator accepts one or two validated room lines and always starts the
-Custom browser source. It has no direct-connect or alternate single-room mode.
+The existing content checker examines at most eight candidates (four per hub
+slot). Missing maps are skipped, but an empty candidate set does not prevent
+Q2PRO-X from starting with an empty `Custom` source.
+
+The coordinator starts one stable loopback HTTP `Custom` source and one
+Q2PRO-X process. It accepts newline-delimited slot updates while both remain
+alive: later commands add, clear or replace individual gateways without
+replacing Q2PRO-X. The ordinary Q2PRO-X `Custom` `Refresh` requests the current
+zero-to-two endpoint list. There is no direct-connect or alternate single-room
+mode.
 
 ## Room closure
 

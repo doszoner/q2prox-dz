@@ -4,6 +4,7 @@
 import gzip
 import socket
 import json
+import dataclasses
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ FETCH_TIMEOUT = 15
 MAX_BODY = 2 * 1024 * 1024
 ROOM_CLOSED_EXIT = 73
 HUB_MAX_ROOMS = 2
+MAX_HUB_COMMAND_BYTES = 256 * 1024
+HUB_POLL_SECONDS = 15.0
 # Keep content checks bounded even when the public catalog is large. Four
 # candidates per slot is enough to skip missing maps without spawning an
 # unbounded number of helper processes.
@@ -50,6 +53,13 @@ HOSTNAME = re.compile(
 
 class LaunchError(RuntimeError):
     pass
+
+
+@dataclasses.dataclass
+class HubSlot:
+    room_id: str = ""
+    config: str = ""
+    misses: int = 0
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -330,20 +340,22 @@ def validate_room_payload(payload):
     return q2_count > 0
 
 
-def joinable_rooms(payload):
+def ready_rooms(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("rooms"), list):
         raise LaunchError("room catalog has an invalid schema")
-    valid_rows = [row for row in payload["rooms"] if _strict_room(row)]
-    seen_rooms = set()
-    for row in valid_rows:
-        if row["room"] in seen_rooms:
-            raise LaunchError("room catalog has duplicate room ids")
-        seen_rooms.add(row["room"])
-    rows = [
-        row for row in valid_rows
+    strict_rows = [row for row in payload["rooms"] if _strict_room(row)]
+    room_ids = [row["room"] for row in strict_rows]
+    if len(room_ids) != len(set(room_ids)):
+        raise LaunchError("room catalog has duplicate room ids")
+    rows = [row for row in strict_rows if row["roomReady"]]
+    return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
+
+
+def joinable_rooms(payload):
+    return [
+        row for row in ready_rooms(payload)
         if row["roomReady"] and row["players"] < row["createSettings"]["maxPlayers"]
     ]
-    return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
 
 
 def registered_rooms(rows, lookup):
@@ -351,6 +363,90 @@ def registered_rooms(rows, lookup):
         raise LaunchError("alias lookup has an invalid schema")
     registered = set(lookup["aliases"])
     return [row for row in rows if f"q2.{row['owner']}" in registered]
+
+
+def _config_text(config):
+    if isinstance(config, str):
+        text = config
+    else:
+        try:
+            text = json.dumps(config, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise LaunchError("room configuration cannot be serialized") from exc
+    if not text or "\n" in text or "\r" in text:
+        raise LaunchError("room configuration must fit one line")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LaunchError("room configuration is not valid UTF-8") from exc
+    return text
+
+
+def encode_slot(index, slot):
+    if index < 0 or index >= HUB_MAX_ROOMS:
+        raise LaunchError("invalid hub slot")
+    payload = (
+        f"{index} -\n" if not slot.room_id
+        else f"{index} {slot.room_id} {slot.config}\n"
+    )
+    try:
+        payload_bytes = payload.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LaunchError("hub slot command is not valid UTF-8") from exc
+    if len(payload_bytes) > MAX_HUB_COMMAND_BYTES:
+        raise LaunchError("hub slot command exceeds 256 KiB")
+    return payload
+
+
+def reconcile_slots(slots, rows, make_config):
+    """Retain known rooms and fill empty slots from ready registered rows."""
+    if len(slots) != HUB_MAX_ROOMS:
+        raise LaunchError("hub requires exactly two slots")
+    by_id = {row["room"]: row for row in rows}
+    updated = []
+    for slot in slots:
+        if not slot.room_id:
+            updated.append(HubSlot())
+            continue
+        row = by_id.get(slot.room_id)
+        if row is not None:
+            updated.append(HubSlot(slot.room_id, slot.config, 0))
+        elif slot.misses < 1:
+            updated.append(HubSlot(slot.room_id, slot.config, slot.misses + 1))
+        else:
+            updated.append(HubSlot())
+
+    active_ids = {slot.room_id for slot in updated if slot.room_id}
+    attempted = 0
+    for row in rows:
+        if attempted >= HUB_MAX_CONTENT_CHECKS:
+            break
+        room_id = row["room"]
+        if room_id in active_ids or row["players"] >= row["createSettings"]["maxPlayers"]:
+            continue
+        empty_index = next((index for index, slot in enumerate(updated) if not slot.room_id), None)
+        if empty_index is None:
+            break
+        attempted += 1
+        try:
+            config_text = _config_text(make_config(row))
+            candidate = HubSlot(room_id, config_text, 0)
+            encode_slot(empty_index, candidate)
+        except LaunchError:
+            continue
+        updated[empty_index] = candidate
+        active_ids.add(room_id)
+    return updated
+
+
+def poll_once(slots, fetch, writer):
+    """Apply one successful refresh; catalog failures leave slots untouched."""
+    try:
+        updated = fetch()
+    except LaunchError:
+        return slots
+    writer(updated)
+    return updated
 
 
 def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subprocess.run):
@@ -534,8 +630,63 @@ def content_ready(q2_path, map_name, content_checker=None, runner=subprocess.run
     return result.returncode == 0
 
 
-def run_hub(configs, q2_path, *, session, managed, legacy, adapter, runner=subprocess.run):
-    if not 1 <= len(configs) <= HUB_MAX_ROOMS:
+def wait_child(process, timeout=10.0):
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def write_slots(process, slots):
+    try:
+        for index, slot in enumerate(slots):
+            process.stdin.write(encode_slot(index, slot))
+        process.stdin.flush()
+        return None
+    except BrokenPipeError:
+        code = wait_child(process)
+        if code is None:
+            raise LaunchError("coordinator closed stdin but did not exit")
+        return code
+
+
+def _initial_slots(configs):
+    slots = [HubSlot(), HubSlot()]
+    for index, config in enumerate(configs[:HUB_MAX_ROOMS]):
+        if isinstance(config, HubSlot):
+            slots[index] = dataclasses.replace(config)
+            continue
+        if not isinstance(config, dict) or not isinstance(config.get("roomId"), str) or not config["roomId"]:
+            raise LaunchError("hub room configuration has no room id")
+        slots[index] = HubSlot(config["roomId"], _config_text(config), 0)
+    return slots
+
+
+def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=subprocess.run):
+    fetch = fetch or fetch_json
+    catalog = fetch(ROOM_ENDPOINT)
+    lookup = fetch(LOOKUP_ENDPOINT)
+    rows = registered_rooms(ready_rooms(catalog), lookup)
+    rtc_rows = None
+    rtc_attempted = False
+
+    def make_config(row):
+        nonlocal rtc_rows, rtc_attempted
+        if not content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner):
+            raise LaunchError("room map is not available locally")
+        if not rtc_attempted:
+            rtc_attempted = True
+            rtc_rows = fetch(RTC_ENDPOINT)
+        if rtc_rows is None:
+            raise LaunchError("fresh RTC configuration is unavailable")
+        return make_room_config(row, lookup, rtc_rows)
+
+    return reconcile_slots(slots, rows, make_config)
+
+
+def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
+            runner=None, popen=None, refresh=None, poll_interval=HUB_POLL_SECONDS):
+    if len(configs) > HUB_MAX_ROOMS:
         raise LaunchError("Q2PRO-X hub accepts one or two rooms")
     args = [
         str(session),
@@ -545,12 +696,49 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter, runner=subpr
         "--q2", str(q2_path),
         "--game", GAME,
     ]
-    payload = "".join(json.dumps(config, separators=(",", ":")) + "\n" for config in configs)
+    slots = _initial_slots(configs)
+    starter = popen or runner or subprocess.Popen
+    process = starter(args, stdin=subprocess.PIPE, text=True, encoding="utf-8")
     try:
-        result = runner(args, input=payload, text=True, check=False)
-        return result.returncode
+        code = write_slots(process, slots)
+        if code is not None:
+            return code
+        refresh_fn = refresh or refresh_slots
+        while True:
+            code = wait_child(process, timeout=poll_interval)
+            if code is not None:
+                return code
+            child_code = None
+
+            def publish(updated):
+                nonlocal child_code
+                child_code = write_slots(process, updated)
+
+            slots = poll_once(
+                slots,
+                lambda: refresh_fn(slots, q2_path),
+                publish,
+            )
+            if child_code is not None:
+                return child_code
     finally:
-        payload = ""
+        stdin = getattr(process, "stdin", None)
+        if stdin:
+            try:
+                stdin.close()
+            except BrokenPipeError:
+                if process.poll() is None:
+                    raise
+        if process.poll() is None:
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5.0)
 
 
 def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
@@ -563,6 +751,8 @@ def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None
             config = make_room_config(row, lookup, rtc_rows)
         except LaunchError:
             continue
+        config = dict(config)
+        config["roomId"] = row["room"]
         configs.append(config)
         if len(configs) == HUB_MAX_ROOMS:
             break
@@ -585,17 +775,15 @@ def main(argv=None):
         q2_path = discover_q2() or select_q2_path()
         if not q2_path:
             return 3
-        catalog = fetch_json(ROOM_ENDPOINT)
-        lookup = fetch_json(LOOKUP_ENDPOINT)
-        rooms = registered_rooms(joinable_rooms(catalog), lookup)
-        if not rooms:
-            notify("There are no joinable Quake II rooms right now.", "info")
-            return 0
         paths = _installed_paths()
-        rtc = fetch_json(RTC_ENDPOINT)
-        configs = make_hub_configs(catalog, lookup, rtc, q2_path)
+        slots = [HubSlot(), HubSlot()]
+        slots = poll_once(
+            slots,
+            lambda: refresh_slots(slots, q2_path),
+            lambda _updated: None,
+        )
         result = run_hub(
-            configs,
+            slots,
             q2_path,
             session=paths["session"],
             managed=paths["managed"],

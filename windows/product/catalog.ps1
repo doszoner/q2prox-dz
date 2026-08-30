@@ -13,6 +13,8 @@ $Q2DZ_MAX_PLAYERS = 64
 $Q2DZ_MAX_ICE_SERVERS = 16
 $Q2DZ_MAX_ICE_URL = 2048
 $Q2DZ_MAX_ICE_FIELD = 1024
+$Q2DZ_MAX_HUB_COMMAND_BYTES = 256KB
+$Q2DZ_HUB_MAX_CONTENT_CHECKS = 8
 
 function Test-Q2DzEndpoint {
   param([Parameter(Mandatory = $true)][string]$Uri)
@@ -287,6 +289,128 @@ function Test-Q2DzRoomRow {
   return $true
 }
 
+function New-Q2DzHubSlot {
+  param(
+    [string]$RoomId = '',
+    [string]$Config = '',
+    [int]$Misses = 0
+  )
+  return [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses }
+}
+
+function Get-Q2DzReadyRooms {
+  param([Parameter(Mandatory = $true)]$Value)
+  if ($null -eq $Value -or $null -eq $Value.PSObject -or
+      $Value.PSObject.Properties.Name -notcontains 'rooms') {
+    throw 'room catalog has an invalid schema'
+  }
+  if ($Value.rooms -isnot [array]) { throw 'room catalog has an invalid schema' }
+  $result = @()
+  $seenRooms = @()
+  foreach ($row in @($Value.rooms)) {
+    if (-not (Test-Q2DzRoomRow $row)) { continue }
+    if ($seenRooms -ccontains [string]$row.room) { throw 'room catalog has duplicate room ids' }
+    $seenRooms += [string]$row.room
+    if ($row.roomReady) { $result += $row }
+  }
+  return @($result | Sort-Object `
+    @{ Expression = { $_.createSettings.name.ToLowerInvariant() } }, `
+    @{ Expression = { [string]$_.room } })
+}
+
+function Select-Q2DzRegisteredRooms {
+  param(
+    [Parameter(Mandatory = $true)]$Rows,
+    [Parameter(Mandatory = $true)]$LookupPayload
+  )
+  if (-not (Test-Q2DzAliasPayload $LookupPayload)) { throw 'alias lookup has an invalid schema' }
+  $aliases = @($LookupPayload.aliases)
+  $result = @()
+  foreach ($row in @($Rows)) {
+    if ($aliases -ccontains ('q2.{0}' -f ([string]$row.owner))) { $result += $row }
+  }
+  return @($result)
+}
+
+function ConvertTo-Q2DzHubCommand {
+  param(
+    [int]$Index,
+    [Parameter(Mandatory = $true)]$Slot
+  )
+  if ($Index -lt 0 -or $Index -gt 1) { throw 'invalid hub slot' }
+  $value = if ([string]::IsNullOrEmpty($Slot.RoomId)) {
+    '-'
+  } else {
+    ('{0} {1}' -f $Slot.RoomId, $Slot.Config)
+  }
+  $text = ('{0} {1}' -f $Index, $value) + "`n"
+  if ([Text.Encoding]::UTF8.GetByteCount($text) -gt $Q2DZ_MAX_HUB_COMMAND_BYTES) {
+    throw 'hub slot command exceeds 256 KiB'
+  }
+  return $text
+}
+
+function Update-Q2DzHubSlots {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$Slots,
+    [object[]]$Rows = @(),
+    [Parameter(Mandatory = $true)][scriptblock]$MakeConfig,
+    [int]$MaxCandidates = $Q2DZ_HUB_MAX_CONTENT_CHECKS
+  )
+  if ($Slots.Count -ne 2) { throw 'hub requires exactly two slots' }
+  if ($MaxCandidates -lt 0) { throw 'invalid hub candidate limit' }
+
+  $updated = @()
+  foreach ($slot in $Slots) {
+    if ([string]::IsNullOrEmpty($slot.RoomId)) {
+      $updated += New-Q2DzHubSlot
+      continue
+    }
+    $retained = $null
+    foreach ($row in @($Rows)) {
+      if ([string]$row.room -ceq [string]$slot.RoomId) { $retained = $row; break }
+    }
+    if ($null -ne $retained) {
+      $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) 0
+    } elseif ([int]$slot.Misses -lt 1) {
+      $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) ([int]$slot.Misses + 1)
+    } else {
+      $updated += New-Q2DzHubSlot
+    }
+  }
+
+  $activeIds = @($updated | Where-Object { -not [string]::IsNullOrEmpty($_.RoomId) } |
+    ForEach-Object { [string]$_.RoomId })
+  $attempted = 0
+  foreach ($row in @($Rows)) {
+    if ($attempted -ge $MaxCandidates) { break }
+    $roomId = [string]$row.room
+    if ($activeIds -ccontains $roomId) { continue }
+    if ($row.players -ge $row.createSettings.maxPlayers) { continue }
+    $emptyIndex = $null
+    for ($index = 0; $index -lt $updated.Count; $index++) {
+      if ([string]::IsNullOrEmpty($updated[$index].RoomId)) { $emptyIndex = $index; break }
+    }
+    if ($null -eq $emptyIndex) { break }
+    $attempted++
+    try {
+      $configValues = @(& $MakeConfig $row)
+      if ($configValues.Count -ne 1 -or $configValues[0] -isnot [string]) { throw 'room configuration must be one string' }
+      $config = [string]$configValues[0]
+      if ([string]::IsNullOrEmpty($config) -or $config.Contains("`r") -or $config.Contains("`n")) {
+        throw 'room configuration must fit one line'
+      }
+      $candidate = New-Q2DzHubSlot $roomId $config 0
+      ConvertTo-Q2DzHubCommand $emptyIndex $candidate | Out-Null
+    } catch {
+      continue
+    }
+    $updated[$emptyIndex] = $candidate
+    $activeIds += $roomId
+  }
+  return @($updated)
+}
+
 function Test-Q2DzRoomPayload {
   param($Value)
   if ($null -eq $Value -or $null -eq $Value.PSObject -or
@@ -309,18 +433,9 @@ function Test-Q2DzRoomPayload {
 
 function Get-Q2DzJoinableRooms {
   param($Value)
-  if ($null -eq $Value -or $null -eq $Value.PSObject -or
-      $Value.PSObject.Properties.Name -notcontains 'rooms') { throw 'room catalog has an invalid schema' }
-  if ($Value.rooms -isnot [array]) { throw 'room catalog has an invalid schema' }
-  $result = @()
-  $seenRooms = @()
-  foreach ($row in @($Value.rooms)) {
-    if (-not (Test-Q2DzRoomRow $row)) { continue }
-    if ($seenRooms -ccontains [string]$row.room) { throw 'room catalog has duplicate room ids' }
-    $seenRooms += [string]$row.room
-    if ($row.roomReady -and $row.players -lt $row.createSettings.maxPlayers) { $result += $row }
-  }
-  return @($result | Sort-Object { $_.createSettings.name })
+  return @(Get-Q2DzReadyRooms $Value | Where-Object {
+    $_.players -lt $_.createSettings.maxPlayers
+  })
 }
 
 function Get-Q2DzRegisteredRooms {
@@ -328,13 +443,7 @@ function Get-Q2DzRegisteredRooms {
     [Parameter(Mandatory = $true)]$Catalog,
     [Parameter(Mandatory = $true)]$LookupPayload
   )
-  if (-not (Test-Q2DzAliasPayload $LookupPayload)) { throw 'alias lookup has an invalid schema' }
-  $aliases = @($LookupPayload.aliases)
-  $result = @()
-  foreach ($row in (Get-Q2DzJoinableRooms $Catalog)) {
-    if ($aliases -ccontains ('q2.{0}' -f ([string]$row.owner))) { $result += $row }
-  }
-  return @($result | Sort-Object { $_.createSettings.name })
+  return @(Select-Q2DzRegisteredRooms -Rows (Get-Q2DzJoinableRooms $Catalog) -LookupPayload $LookupPayload)
 }
 
 function Test-Q2DzSelectedRoom {

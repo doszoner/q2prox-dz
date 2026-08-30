@@ -4,10 +4,10 @@
 описывают обязательный путь, но сами по себе не заявляют PASS.
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
-последующие field findings. `1.0.0-rc8` получает PASS только из
-[`1.0.0-rc8`](verification/1.0.0-rc8.md). Текущий `1.0.0-rc9` получает PASS
-только из [`1.0.0-rc9`](verification/1.0.0-rc9.md), где должны быть
-зафиксированы exact hub live gates и source/artifact hashes.
+последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
+rollback. Текущий `1.0.0-rc10` получает PASS только из
+[`1.0.0-rc10`](verification/1.0.0-rc10.md), где должны быть зафиксированы
+точные результаты компонентных, live и package gates.
 
 Пользователю следует публиковать только три canonical архива и соседние
 `.sha256`:
@@ -32,7 +32,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc9
+  -OutputDir .\dist\windows-1.0.0-rc10
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -83,3 +83,6 @@ source is the public repository
 Unsigned Windows candidates допустимы для корректностного тестирования в
 закрытой alpha-группе с явным предупреждением. До широкого публичного выпуска
 необходимо выполнить Authenticode gate и заново проверить exact release archives.
+
+Пока эти условия не выполнены для конкретного rc10-архива, он остаётся
+кандидатом для проверки и не считается готовой пользовательской поставкой.

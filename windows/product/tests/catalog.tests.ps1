@@ -221,6 +221,62 @@ $rtc = [pscustomobject]@{
 }
 $lookupPayload = [pscustomobject]@{ aliases = @('q2.1') }
 
+# Live hub slot planner tests are pure: no network, timer, process or content
+# checker is involved.  They describe the bounded state transitions before
+# the launcher starts using them.
+$slot = {
+  param([string]$RoomId = '', [string]$Config = '', [int]$Misses = 0)
+  [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses }
+}
+$roomB = [pscustomobject]@{
+  room = 'room.q2.test.2'; owner = '2'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
+  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Other'; map = 'q2dm2'; maxPlayers = 16 }
+}
+$readyRows = @(Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = @($roomB, $room) }))
+Assert-Equal $roomB.room $readyRows[0].room 'ready rooms are sorted by name'
+Assert-Equal 2 $readyRows.Count 'ready room selection retains all ready rooms, including full rooms'
+Assert-Equal 2 (@(Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($roomB, $room) }))).Count 'joinable rooms only apply the capacity filter'
+Assert-Equal 1 (@(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload ([pscustomobject]@{ aliases = @('q2.1') }))).Count 'registered selection filters ready rows by alias'
+
+$makeConfig = {
+  param($row)
+  if ($row.room -eq $room.room) { return 'A' }
+  return 'B'
+}
+$planned = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows $readyRows -MakeConfig $makeConfig
+Assert-Equal $room.room $planned[0].RoomId 'existing room is retained'
+Assert-Equal 'A' $planned[0].Config 'existing room keeps its original config'
+Assert-Equal $roomB.room $planned[1].RoomId 'free slot is filled from ready rows'
+Assert-Equal 'B' $planned[1].Config 'new room receives its compact config'
+
+$oneMiss = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @() -MakeConfig $makeConfig
+Assert-Equal $room.room $oneMiss[0].RoomId 'one successful missing poll retains a room'
+Assert-Equal 1 $oneMiss[0].Misses 'one successful missing poll increments misses'
+$twoMisses = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 1), (& $slot)) -Rows @() -MakeConfig $makeConfig
+Assert-Equal '' $twoMisses[0].RoomId 'two successful missing polls free a slot'
+
+$fullRoom = $room | Select-Object *
+$fullRoom.players = $fullRoom.createSettings.maxPlayers
+$retainedFull = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @($fullRoom) -MakeConfig $makeConfig
+Assert-Equal $room.room $retainedFull[0].RoomId 'retained room is not removed when full'
+$newFull = Update-Q2DzHubSlots -Slots @((& $slot), (& $slot)) -Rows @($fullRoom) -MakeConfig $makeConfig
+Assert-Equal '' $newFull[0].RoomId 'new full room does not fill a free slot'
+
+$oversizedConfig = { param($row) if ($row.room -eq $roomB.room) { return ('x' * (256KB)) }; return 'A' }
+$oversized = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @($room, $roomB) -MakeConfig $oversizedConfig
+Assert-Equal $room.room $oversized[0].RoomId 'oversized candidate does not disturb retained room'
+Assert-Equal '' $oversized[1].RoomId 'oversized candidate is skipped locally'
+$threeRows = @($room, $roomB, ($roomB | Select-Object *))
+$threeRows[2].room = 'room.q2.test.3'; $threeRows[2].owner = '3'
+$threeRows[2].createSettings.name = 'Third'
+$threeSlots = Update-Q2DzHubSlots -Slots @((& $slot), (& $slot)) -Rows $threeRows -MakeConfig { param($row) return $row.room }
+Assert-Equal 2 (@($threeSlots | Where-Object { $_.RoomId })).Count 'hub never admits more than two rooms'
+
+Assert-Equal "0 -`n" (ConvertTo-Q2DzHubCommand 0 (& $slot)) 'empty slot command is independent and newline terminated'
+Assert-Equal "1 -`n" (ConvertTo-Q2DzHubCommand 1 (& $slot)) 'second empty slot command is independent and newline terminated'
+Assert-Throws { ConvertTo-Q2DzHubCommand 2 (& $slot) } 'third hub slot is rejected'
+Assert-Throws { ConvertTo-Q2DzHubCommand 0 (& $slot 'room.q2.large' ('x' * (256KB))) } 'oversized hub command is rejected'
+
 $unsupportedProfileRoom = [pscustomobject]@{
   room = 'room.q2.unsupported-profile.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
   createSettings = [pscustomobject]@{ prefix = 'q2'; profile = 'baseq2'; name = 'Unsupported'; map = 'q2dm1'; maxPlayers = 16 }
@@ -333,11 +389,11 @@ Assert-True (-not $launcherText.Contains('Open in Q2PRO-X')) 'launcher has no du
 Assert-True (-not $launcherText.Contains('ListBox')) 'launcher has no preliminary room chooser'
 Assert-True (-not $launcherText.Contains('--hub')) 'launcher uses the coordinator''s only supported mode'
 Assert-True ($launcherText.Contains("'--gateway', " + '$gateway')) 'launcher invokes the single hub coordinator mode'
-Assert-True ($launcherText.Contains('$hubInput')) 'launcher sends bounded hub configurations through stdin'
-Assert-True ($launcherText.Contains('$hubMaxContentChecks = 8')) 'launcher bounds content-check work for a large catalog'
-Assert-True ($launcherText.Contains('$rtcRows = Get-Q2DzJson $Q2DZ_RTC_ENDPOINT')) 'launcher fetches one RTC snapshot before checking rooms'
+Assert-True ($launcherText.Contains('Get-Q2DzLiveHubSlots')) 'launcher refreshes the live hub state'
+Assert-True ($launcherText.Contains('Update-Q2DzHubSlots')) 'launcher uses the bounded slot planner'
+Assert-True ($launcherText.Contains('ConvertTo-Q2DzHubCommand')) 'launcher sends independent bounded slot commands'
+Assert-True ($launcherText.Contains('$rtcState')) 'launcher fetches one RTC snapshot while filling slots'
 Assert-True (-not $launcherText.Contains('Get-Q2DzSelectedTransport -Room $candidate')) 'launcher does not refetch transport data per room'
-Assert-True ($launcherText.Contains('[Environment]::NewLine')) 'launcher separates hub room configurations by newline'
 Assert-True ($launcherText.Contains('RedirectStandardInput')) 'launcher uses a real redirected coordinator stdin'
 Assert-True ($launcherText.Contains('StandardInput.BaseStream')) 'launcher writes coordinator stdin as explicit bytes'
 Assert-True ($launcherText.Contains('UTF8Encoding')) 'launcher encodes coordinator stdin as UTF-8 without BOM'

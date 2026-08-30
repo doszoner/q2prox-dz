@@ -2,11 +2,18 @@
 
 ## Быстрый старт
 
-Установите Wine и Python 3, распакуйте release-архив и выполните
+Это пользовательская Linux-поставка `q2prox-dz`: установите Wine и Python 3,
+распакуйте release-архив и выполните
 `./install.sh`. Затем откройте **Q2PRO-X — Dos.Zone** из меню приложений или
 запустите `q2dz-launch`. При первом запуске укажите существующий
 `Q2PRO-X.exe`; launcher подготовит до двух комнат и откроет штатную вкладку
 `Custom` Q2PRO-X. Подробные требования и команды приведены ниже.
+
+Не редактируйте CFG Q2PRO-X, Favorites или аргументы запуска. Новая комната
+появляется после очередного успешного опроса каталога (примерно 15 секунд), а
+закрытая — после двух таких опросов, в которых её уже нет; в обоих случаях
+достаточно обычного `Refresh` во вкладке `Custom`. Q2PRO-X перезапускать не
+нужно.
 
 This package lets an existing Windows x64 `Q2PRO-X.exe` join a currently
 running public Quake II room on Dos.Zone through Wine. It does not include
@@ -40,8 +47,9 @@ managed-session cleanup on the Manjaro validation host. The owner browser
 registered the connected player. Historical rc6/rc7 results remain preserved
 in their own verification records and are not promoted to rc8 by inference.
 Exact rc8 package hashes and results are recorded in
-`docs/verification/1.0.0-rc8.md`; it remains the rollback release. Current rc9
-hub evidence is fail-closed in `docs/verification/1.0.0-rc9.md`.
+`docs/verification/1.0.0-rc8.md`; it remains the historical rollback release.
+The current rc10 candidate is fail-closed in
+`docs/verification/1.0.0-rc10.md`.
 
 If Q2PRO-X is not installed, get the current release from the official landing
 page: <https://q2pro-x.com/>. Install or update it separately, start it once
@@ -53,9 +61,9 @@ the game client.
 Keep the archive and its adjacent `.sha256` file in the same directory:
 
 ```bash
-sha256sum -c q2prox-dz-1.0.0-rc9-linux-x86_64.tar.gz.sha256
-tar -xzf q2prox-dz-1.0.0-rc9-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc9
+sha256sum -c q2prox-dz-1.0.0-rc10-linux-x86_64.tar.gz.sha256
+tar -xzf q2prox-dz-1.0.0-rc10-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc10
 ./install.sh
 ```
 
@@ -71,17 +79,19 @@ q2dz-launch
 ```
 
 On the first run, select the existing `Q2PRO-X.exe`. The launcher stores only
-that path. It takes one bounded catalog/alias snapshot, checks the maps for a
-small bounded set of candidates, obtains one fresh RTC configuration in memory,
-starts up to two independent local gateways, and launches Q2PRO-X only after
-real Quake II readiness round trips. There is no separate room picker or Join
-window. The room rows are shown by the ordinary Q2PRO-X `Custom` browser.
+that path. It validates the catalog, checks maps for a small bounded set of
+candidates, obtains fresh RTC configuration in memory, starts up to two
+independent local gateways, and launches Q2PRO-X only after real Quake II
+readiness round trips. There is no separate room picker or Join window. Room
+rows are shown by the ordinary Q2PRO-X `Custom` browser.
 
-Use `Refresh` in that browser to query the prepared loopback endpoints. To move
-between rooms, use Q2PRO-X's normal `Disconnect`, then select another row in
-`Custom`; Q2PRO-X itself does not need to restart. The hub snapshot is rebuilt
-on the next `q2dz-launch` run, so a room created or closed after startup may not
-appear until then.
+The launcher polls the catalog approximately every 15 seconds while the game
+is open. Use `Refresh` in `Custom` to query the current loopback endpoints. A
+closed room is removed after two successful polls that no longer contain it;
+catalog errors retain the current rooms. To move between rooms, use Q2PRO-X's
+normal `Disconnect`, then select another row in `Custom`; Q2PRO-X itself does
+not need to restart. An active full room is retained and a third room does not
+evict either existing slot.
 
 After installing or moving Q2PRO-X, select the new executable with:
 

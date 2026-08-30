@@ -82,6 +82,175 @@ def room(room_id="room.q2.abc.123", owner="123", map_name="q2dm1"):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_live_slots_keep_existing_room_and_fill_free_slot(self):
+        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        rows = [room("room.a", "1"), room("room.b", "2")]
+
+        def make_config(row):
+            return row["room"].split(".")[-1].upper()
+
+        updated = launch.reconcile_slots(slots, rows, make_config)
+        self.assertEqual(
+            [(slot.room_id, slot.config) for slot in updated],
+            [("room.a", "A"), ("room.b", "B")],
+        )
+
+    def test_one_missing_poll_does_not_remove_room(self):
+        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        updated = launch.reconcile_slots(slots, [], lambda _row: "unused")
+        self.assertEqual(updated[0], launch.HubSlot("room.a", "A", 1))
+
+    def test_ready_rooms_excludes_not_ready_rooms(self):
+        not_ready = room("room.q2.not-ready.1", "1")
+        not_ready["roomReady"] = False
+        self.assertEqual(launch.ready_rooms({"rooms": [not_ready]}), [])
+
+    def test_retained_room_false_readiness_clears_after_two_successful_polls(self):
+        not_ready = room("room.q2.not-ready.1", "1")
+        not_ready["roomReady"] = False
+        rows = launch.ready_rooms({"rooms": [not_ready]})
+        slots = [launch.HubSlot("room.q2.not-ready.1", "A", 0), launch.HubSlot()]
+        first = launch.reconcile_slots(slots, rows, lambda _row: "unused")
+        second = launch.reconcile_slots(first, rows, lambda _row: "unused")
+        self.assertEqual(first[0], launch.HubSlot("room.q2.not-ready.1", "A", 1))
+        self.assertEqual(second[0], launch.HubSlot())
+
+    def test_catalog_validation_checks_not_ready_q2_rows_and_duplicates(self):
+        not_ready = room("room.q2.not-ready.1", "1")
+        not_ready["roomReady"] = False
+        self.assertTrue(launch.validate_room_payload({"rooms": [not_ready]}))
+        invalid = room("room.q2.invalid.2", "2")
+        invalid["createSettings"]["map"] = "bad map"
+        self.assertFalse(launch.validate_room_payload({"rooms": [not_ready, invalid]}))
+        duplicate = room("room.q2.not-ready.1", "2")
+        duplicate["roomReady"] = False
+        self.assertFalse(launch.validate_room_payload({"rooms": [not_ready, duplicate]}))
+
+    def test_two_missing_polls_free_slot(self):
+        slots = [launch.HubSlot("room.a", "A", 1), launch.HubSlot()]
+        updated = launch.reconcile_slots(slots, [], lambda _row: "unused")
+        self.assertEqual(updated[0], launch.HubSlot())
+
+    def test_catalog_failure_sends_no_commands_and_preserves_slots(self):
+        existing_slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        writer = mock.Mock()
+
+        def fetch_raises():
+            raise launch.LaunchError("catalog unavailable")
+
+        self.assertEqual(
+            launch.poll_once(existing_slots, fetch_raises, writer),
+            existing_slots,
+        )
+        writer.assert_not_called()
+
+    def test_successful_poll_writes_heartbeat_even_when_slots_do_not_change(self):
+        existing_slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        writer = mock.Mock()
+        self.assertEqual(
+            launch.poll_once(existing_slots, lambda: existing_slots, writer),
+            existing_slots,
+        )
+        writer.assert_called_once_with(existing_slots)
+
+    def test_retained_room_is_not_removed_when_it_becomes_full(self):
+        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        full = room("room.a", "1")
+        full["players"] = full["createSettings"]["maxPlayers"]
+        updated = launch.reconcile_slots(slots, [full], lambda _row: "unused")
+        self.assertEqual(updated[0], launch.HubSlot("room.a", "A", 0))
+
+    def test_new_full_room_does_not_fill_free_slot(self):
+        full = room("room.b", "2")
+        full["players"] = full["createSettings"]["maxPlayers"]
+        slots = [launch.HubSlot(), launch.HubSlot()]
+        self.assertEqual(
+            launch.reconcile_slots(slots, [full], lambda _row: "unused"),
+            slots,
+        )
+
+    def test_three_rooms_fill_only_two_slots_without_evicting_retained_room(self):
+        slots = [launch.HubSlot("room.b", "B", 0), launch.HubSlot()]
+        rows = [room("room.a", "1"), room("room.b", "2"), room("room.c", "3")]
+        updated = launch.reconcile_slots(
+            slots,
+            rows,
+            lambda row: row["room"].split(".")[-1].upper(),
+        )
+        self.assertEqual(
+            [(slot.room_id, slot.config) for slot in updated],
+            [("room.b", "B"), ("room.a", "A")],
+        )
+
+    def test_slot_commands_are_independent_and_bounded(self):
+        self.assertEqual(launch.encode_slot(0, launch.HubSlot()), "0 -\n")
+        self.assertEqual(launch.encode_slot(1, launch.HubSlot()), "1 -\n")
+        self.assertEqual(
+            launch.encode_slot(0, launch.HubSlot("room.a", "{\"map\":\"q2dm1\"}")),
+            '0 room.a {"map":"q2dm1"}\n',
+        )
+        with self.assertRaises(launch.LaunchError):
+            launch.encode_slot(
+                0,
+                launch.HubSlot("room.a", "x" * launch.MAX_HUB_COMMAND_BYTES),
+            )
+
+    def test_oversized_new_config_does_not_disturb_retained_room(self):
+        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        rows = [room("room.a", "1"), room("room.b", "2")]
+
+        def make_config(row):
+            return "A" if row["room"] == "room.a" else "x" * launch.MAX_HUB_COMMAND_BYTES
+
+        self.assertEqual(
+            launch.reconcile_slots(slots, rows, make_config),
+            [launch.HubSlot("room.a", "A", 0), launch.HubSlot()],
+        )
+
+    def test_refresh_does_not_fetch_rtc_or_check_content_without_free_slot(self):
+        rows = [room("room.q2.a.1", "1"), room("room.q2.b.2", "2")]
+        replies = {
+            launch.ROOM_ENDPOINT: {"rooms": rows},
+            launch.LOOKUP_ENDPOINT: {"aliases": ["q2.1", "q2.2"]},
+        }
+        endpoints = []
+
+        def fetch(endpoint):
+            endpoints.append(endpoint)
+            return replies[endpoint]
+
+        slots = [launch.HubSlot("room.q2.a.1", "A"), launch.HubSlot("room.q2.b.2", "B")]
+        with mock.patch.object(launch, "content_ready") as checked:
+            updated = launch.refresh_slots(slots, "/games/Q2PRO-X.exe", fetch=fetch)
+        self.assertEqual(updated, slots)
+        self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT])
+        checked.assert_not_called()
+
+    def test_refresh_fetches_rtc_only_when_filling_a_free_slot(self):
+        selected = room("room.q2.a.1", "1")
+        replies = {
+            launch.ROOM_ENDPOINT: {"rooms": [selected]},
+            launch.LOOKUP_ENDPOINT: {"aliases": ["q2.1"]},
+            launch.RTC_ENDPOINT: [{"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:example.invalid"]}]}],
+        }
+        endpoints = []
+
+        def fetch(endpoint):
+            endpoints.append(endpoint)
+            return replies[endpoint]
+
+        slots = [launch.HubSlot(), launch.HubSlot()]
+        with mock.patch.object(launch, "content_ready", return_value=True) as checked:
+            updated = launch.refresh_slots(slots, "/games/Q2PRO-X.exe", fetch=fetch)
+        self.assertEqual([slot.room_id for slot in updated], [selected["room"], ""])
+        self.assertEqual(
+            endpoints,
+            [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT, launch.RTC_ENDPOINT],
+        )
+        checked.assert_called_once_with(
+            "/games/Q2PRO-X.exe", "q2dm1", None, runner=subprocess.run
+        )
+
     def test_shared_catalog_contract_cases(self):
         validators = {
             "rooms": launch.validate_room_payload,
@@ -117,6 +286,13 @@ class LauncherTests(unittest.TestCase):
         second = room("room.q2.duplicate.1", "2")
         with self.assertRaises(launch.LaunchError):
             launch.joinable_rooms({"rooms": [first, second]})
+
+    def test_duplicate_room_ids_are_rejected_before_readiness_filter(self):
+        ready = room("room.q2.duplicate.1", "1")
+        not_ready = room("room.q2.duplicate.1", "2")
+        not_ready["roomReady"] = False
+        with self.assertRaises(launch.LaunchError):
+            launch.joinable_rooms({"rooms": [ready, not_ready]})
 
     def test_help_never_starts_discovery_or_network(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,9 +395,11 @@ class LauncherTests(unittest.TestCase):
 
                 with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
                      mock.patch.object(launch, "fetch_json", side_effect=fake_fetch), \
+                     mock.patch.object(launch, "run_hub", return_value=0) as run_hub, \
                      mock.patch.object(launch, "notify"):
                     self.assertEqual(launch.main([]), 0)
                 self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT])
+                run_hub.assert_called_once()
 
     def test_invalid_snapshot_stops_before_rtc_fetch_or_session(self):
         selected = room()
@@ -238,9 +416,11 @@ class LauncherTests(unittest.TestCase):
 
         with mock.patch.object(launch, "discover_q2", return_value=Path("/games/Q2PRO-X.exe")), \
              mock.patch.object(launch, "fetch_json", side_effect=fake_fetch), \
+             mock.patch.object(launch, "run_hub", return_value=0) as run_hub, \
              mock.patch.object(launch, "notify"):
             self.assertEqual(launch.main([]), 0)
         self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT])
+        run_hub.assert_called_once()
 
     def test_room_list_hides_stale_unregistered_aliases(self):
         rows = [room("room.q2.live.1", "123"), room("room.q2.stale.2", "456")]
@@ -320,9 +500,34 @@ class LauncherTests(unittest.TestCase):
         ]
         calls = []
 
-        def fake_run(args, **kwargs):
+        class FakeInput:
+            def __init__(self):
+                self.payload = ""
+
+            def write(self, value):
+                self.payload += value
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeInput()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        def fake_popen(args, **kwargs):
             calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0)
+            process = FakeProcess()
+            calls[-1] = (args, {**kwargs, "process": process})
+            return process
 
         rc = launch.run_hub(
             configs,
@@ -331,13 +536,13 @@ class LauncherTests(unittest.TestCase):
             managed="/opt/q2dz/bin/q2dz-managed-gateway",
             legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
             adapter="/opt/q2dz/config/legacy-gateway.json",
-            runner=fake_run,
+            popen=fake_popen,
         )
         self.assertEqual(rc, 0)
         args, kwargs = calls[0]
         self.assertNotIn("+connect", args)
-        self.assertNotIn("+connect", kwargs["input"])
-        self.assertEqual(kwargs["input"].count("\n"), 2)
+        self.assertNotIn("+connect", kwargs["process"].stdin.payload)
+        self.assertEqual(kwargs["process"].stdin.payload.count("\n"), 2)
 
     def test_hub_command_keeps_room_data_out_of_argv(self):
         config = {
@@ -350,9 +555,34 @@ class LauncherTests(unittest.TestCase):
         q2 = "/games/Q2PRO-X.exe"
         calls = []
 
-        def fake_run(args, **kwargs):
+        class FakeInput:
+            def __init__(self):
+                self.payload = ""
+
+            def write(self, value):
+                self.payload += value
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeInput()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        def fake_popen(args, **kwargs):
             calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0)
+            process = FakeProcess()
+            calls[-1] = (args, {**kwargs, "process": process})
+            return process
 
         rc = launch.run_hub(
             [config],
@@ -361,7 +591,7 @@ class LauncherTests(unittest.TestCase):
             managed="/opt/q2dz/bin/q2dz-managed-gateway",
             legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
             adapter="/opt/q2dz/config/legacy-gateway.json",
-            runner=fake_run,
+            popen=fake_popen,
         )
         self.assertEqual(rc, 0)
         args, kwargs = calls[0]
@@ -369,8 +599,92 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--legacy-gateway", args)
         self.assertEqual(args[args.index("--game"):args.index("--game") + 2], ["--game", "3zb2"])
         self.assertNotIn("secret", args)
-        self.assertEqual(json.loads(kwargs["input"])["iceServers"][0]["credential"], "secret")
+        line = kwargs["process"].stdin.payload.splitlines()[0]
+        self.assertEqual(json.loads(line.split(" ", 2)[2])["iceServers"][0]["credential"], "secret")
         self.assertNotIn("shell", kwargs)
+
+    def test_coordinator_exit_before_reading_is_returned_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = Path(tmp) / "coordinator.py"
+            coordinator.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(74)\n", encoding="utf-8")
+            coordinator.chmod(0o755)
+            rc = launch.run_hub(
+                [],
+                "/games/Q2PRO-X.exe",
+                session=coordinator,
+                managed="/opt/q2dz/bin/q2dz-managed-gateway",
+                legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
+                adapter="/opt/q2dz/config/legacy-gateway.json",
+            )
+        self.assertEqual(rc, 74)
+
+    def test_coordinator_exit_after_first_command_is_returned_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = Path(tmp) / "coordinator.py"
+            coordinator.write_text(
+                "#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.exit(74)\n",
+                encoding="utf-8",
+            )
+            coordinator.chmod(0o755)
+            rc = launch.run_hub(
+                [],
+                "/games/Q2PRO-X.exe",
+                session=coordinator,
+                managed="/opt/q2dz/bin/q2dz-managed-gateway",
+                legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
+                adapter="/opt/q2dz/config/legacy-gateway.json",
+            )
+        self.assertEqual(rc, 74)
+
+    def test_hub_polls_after_timeout_and_sends_heartbeat(self):
+        class FakeInput:
+            def __init__(self):
+                self.payload = ""
+
+            def write(self, value):
+                self.payload += value
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeInput()
+                self.waits = 0
+
+            def wait(self, timeout=None):
+                self.waits += 1
+                if self.waits == 1:
+                    raise subprocess.TimeoutExpired("fake", timeout)
+                return 74
+
+            def poll(self):
+                return 74
+
+        processes = []
+
+        def fake_popen(_args, **_kwargs):
+            process = FakeProcess()
+            processes.append(process)
+            return process
+
+        slots = [launch.HubSlot(), launch.HubSlot()]
+        rc = launch.run_hub(
+            slots,
+            "/games/Q2PRO-X.exe",
+            session="/opt/q2dz/bin/q2dz-session",
+            managed="/opt/q2dz/bin/q2dz-managed-gateway",
+            legacy="/opt/q2dz/bin/q2dz-webrtc-gateway",
+            adapter="/opt/q2dz/config/legacy-gateway.json",
+            popen=fake_popen,
+            refresh=lambda current, _q2: current,
+            poll_interval=0,
+        )
+        self.assertEqual(rc, 74)
+        self.assertEqual(processes[0].stdin.payload, "0 -\n1 -\n0 -\n1 -\n")
 
     def test_hub_snapshot_takes_first_two_compatible_rooms_without_selection(self):
         rows = [room("room.q2.one.1", "1", "q2dm1"),

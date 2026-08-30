@@ -8,6 +8,29 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc10] - 2026-08-30
+
+### Added
+
+- Живое обновление списка комнат Dos.Zone во вкладке `Custom`: launcher
+  опрашивает каталог примерно раз в 15 секунд, а Q2PRO-X получает текущие
+  строки после обычного `Refresh`.
+- Запуск с пустым списком `Custom`: отсутствие комнат или временная ошибка
+  каталога не требуют отдельного окна и не завершают Q2PRO-X.
+
+### Changed
+
+- Поддерживаются два независимых слота комнат. Уже выбранная активная полная
+  комната сохраняется; третья комната её не вытесняет.
+- Для перехода между комнатами достаточно штатного `Disconnect` и выбора другой
+  строки в `Custom`; ручное редактирование CFG, Favorites и аргументов запуска
+  не требуется.
+
+### Fixed
+
+- Windows coordinator больше не завершает локальный HTTP-источник `Custom` с
+  `WSAEINVAL`: запрашиваемые флаги `WSAPoll` приведены к контракту Winsock.
+
 ## [1.0.0-rc9] - 2026-08-29
 
 ### Added
@@ -53,6 +76,7 @@
 - Добавлены bounded transport cadence и datagram counters без содержимого
   пакетов и credential values.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...HEAD
+[1.0.0-rc10]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...v1.0.0-rc10
 [1.0.0-rc9]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc8...v1.0.0-rc9
 [1.0.0-rc8]: https://github.com/doszoner/q2prox-dz/releases/tag/v1.0.0-rc8

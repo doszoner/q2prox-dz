@@ -14,15 +14,19 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <netinet/in.h>
 #include <optional>
 #include <poll.h>
 #include <set>
 #include <string>
+#include <sys/socket.h>
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 #include <cctype>
@@ -39,9 +43,6 @@ constexpr int kUsage = 64;
 constexpr int kConfig = 65;
 constexpr int kUnavailable = 69;
 constexpr int kInternal = 70;
-constexpr int kGatewayFailure = 71;
-constexpr int kReadyTimeout = 72;
-constexpr int kRoomClosed = 73;
 constexpr int kQ2Failure = 74;
 constexpr int kCleanupFailure = 75;
 
@@ -79,7 +80,7 @@ void usage(std::ostream& out) {
         "  --wineprefix DIR          Existing Wine prefix (not modified by q2dz)\n"
         "  --runtime-base DIR        Private runtime root\n"
         "  --game 3zb2               Required Q2PRO-X game profile\n"
-        "  Room configurations are read as one or two newline-delimited JSON objects from stdin\n"
+        "  Hub commands are read as newline-delimited '<slot> <room-id> <JSON>' or '<slot> -' lines\n"
         "  --ready-timeout-ms N      1000..180000 (default 60000)\n"
         "  --shutdown-grace-ms N     100..30000 (default 3000)\n";
 }
@@ -131,29 +132,183 @@ q2dz::Result<Options> parse_options(int argc, char** argv) {
 constexpr std::size_t kHubMaxRooms = 2;
 constexpr std::size_t kHubMaxLine = 256U * 1024U;
 
-q2dz::Result<std::vector<std::string>> parse_hub_input(std::string_view input) {
-    std::vector<std::string> rooms;
-    if (input.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input is empty");
-    std::size_t offset = 0;
-    while (offset < input.size()) {
-        const auto newline = input.find('\n', offset);
-        auto line = input.substr(offset, newline == std::string_view::npos ? input.size() - offset : newline - offset);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        if (line.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input contains an empty line");
-        if (line.size() > kHubMaxLine) return q2dz::Result<std::vector<std::string>>::fail("hub input line exceeds 256 KiB");
-        auto parsed = q2dz::json::parse(line);
-        if (!parsed || !parsed.value().is_object()) return q2dz::Result<std::vector<std::string>>::fail("hub input line must be a JSON object");
-        if (auto room = q2dz::json::extract_room_config(parsed.value()); !room) {
-            return q2dz::Result<std::vector<std::string>>::fail("hub input line: " + room.error().message);
-        }
-        rooms.emplace_back(line);
-        if (rooms.size() > kHubMaxRooms) return q2dz::Result<std::vector<std::string>>::fail("hub input accepts at most two rooms");
-        if (newline == std::string_view::npos) break;
-        offset = newline + 1;
-    }
-    if (rooms.empty()) return q2dz::Result<std::vector<std::string>>::fail("hub input is empty");
-    return q2dz::Result<std::vector<std::string>>::ok(std::move(rooms));
+struct SlotCommand {
+    std::size_t slot = 0;
+    std::optional<std::string> room_id;
+    std::optional<std::string> config;
+};
+
+void clear_slot_command(SlotCommand& command) noexcept {
+    if (command.config) q2dz::secure_clear(*command.config);
 }
+
+bool valid_utf8(std::string_view value) {
+    std::size_t index = 0;
+    while (index < value.size()) {
+        const auto byte = static_cast<unsigned char>(value[index]);
+        std::size_t length = 0;
+        std::uint32_t codepoint = 0;
+        if (byte <= 0x7fU) {
+            ++index;
+            continue;
+        } else if (byte >= 0xc2U && byte <= 0xdfU) {
+            length = 2;
+            codepoint = byte & 0x1fU;
+        } else if (byte >= 0xe0U && byte <= 0xefU) {
+            length = 3;
+            codepoint = byte & 0x0fU;
+        } else if (byte >= 0xf0U && byte <= 0xf4U) {
+            length = 4;
+            codepoint = byte & 0x07U;
+        } else {
+            return false;
+        }
+        if (index + length > value.size()) return false;
+        for (std::size_t offset = 1; offset < length; ++offset) {
+            const auto continuation = static_cast<unsigned char>(value[index + offset]);
+            if ((continuation & 0xc0U) != 0x80U) return false;
+            codepoint = (codepoint << 6U) | (continuation & 0x3fU);
+        }
+        if ((length == 3 && codepoint < 0x800U) ||
+            (length == 4 && codepoint < 0x10000U) ||
+            codepoint > 0x10ffffU ||
+            (codepoint >= 0xd800U && codepoint <= 0xdfffU)) return false;
+        index += length;
+    }
+    return true;
+}
+
+bool safe_room_id(std::string_view value) {
+    if (value.empty() || value.size() > 255U) return false;
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (!(std::isalnum(c) || c == '.' || c == '-' || c == '_')) return false;
+    }
+    return true;
+}
+
+q2dz::Result<SlotCommand> parse_slot_command(std::string_view line) {
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (line.empty() || line.size() + 1U > kHubMaxLine) {
+        return q2dz::Result<SlotCommand>::fail("hub command line exceeds 256 KiB or is empty");
+    }
+    if (!valid_utf8(line) || line.size() < 3U || (line[0] != '0' && line[0] != '1') || line[1] != ' ') {
+        return q2dz::Result<SlotCommand>::fail("hub command framing is invalid");
+    }
+    SlotCommand command;
+    command.slot = static_cast<std::size_t>(line[0] - '0');
+    if (line.substr(2) == "-") return q2dz::Result<SlotCommand>::ok(std::move(command));
+    const auto first = line.find(' ', 2);
+    if (first == std::string_view::npos) return q2dz::Result<SlotCommand>::fail("hub command lacks room value");
+    const auto room = line.substr(2, first - 2);
+    if (room == "-") return q2dz::Result<SlotCommand>::fail("empty hub slot has trailing data");
+    if (!safe_room_id(room)) return q2dz::Result<SlotCommand>::fail("hub room ID is unsafe");
+    if (first + 1U >= line.size()) return q2dz::Result<SlotCommand>::fail("hub command lacks room JSON");
+    const auto config = line.substr(first + 1U);
+    if (!valid_utf8(config)) return q2dz::Result<SlotCommand>::fail("hub room JSON is not UTF-8");
+    auto parsed = q2dz::json::parse(config);
+    if (!parsed || !parsed.value().is_object()) {
+        return q2dz::Result<SlotCommand>::fail("hub room JSON must be an object");
+    }
+    command.room_id = std::string(room);
+    command.config = std::string(config);
+    return q2dz::Result<SlotCommand>::ok(std::move(command));
+}
+
+class SlotCommandReader {
+public:
+    q2dz::Result<std::vector<SlotCommand>> read(int fd, bool& eof) {
+        std::vector<SlotCommand> commands;
+        std::array<char, 8192> data{};
+        while (true) {
+            const ssize_t count = ::read(fd, data.data(), data.size());
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                secure_clear_storage(buffer_);
+                return q2dz::Result<std::vector<SlotCommand>>::fail(q2dz::errno_message("read hub input"));
+            }
+            if (count == 0) {
+                eof = true;
+                break;
+            }
+            buffer_.append(data.data(), static_cast<std::size_t>(count));
+            if (auto parsed = parse_complete_lines(commands); !parsed) {
+                return q2dz::Result<std::vector<SlotCommand>>::fail(parsed.error().message);
+            }
+            if (buffer_.size() >= kHubMaxLine && buffer_.find('\n') == std::string::npos) {
+                clear_commands(commands);
+                secure_clear_storage(buffer_);
+                return q2dz::Result<std::vector<SlotCommand>>::fail("hub command line exceeds 256 KiB");
+            }
+        }
+        if (auto parsed = parse_complete_lines(commands); !parsed) {
+            return q2dz::Result<std::vector<SlotCommand>>::fail(parsed.error().message);
+        }
+        if (eof && !buffer_.empty()) {
+            clear_commands(commands);
+            secure_clear_storage(buffer_);
+            return q2dz::Result<std::vector<SlotCommand>>::fail("hub input ended after a partial command");
+        }
+        return q2dz::Result<std::vector<SlotCommand>>::ok(std::move(commands));
+    }
+
+private:
+    static void clear_commands(std::vector<SlotCommand>& commands) noexcept {
+        for (auto& command : commands) clear_slot_command(command);
+    }
+
+    static void secure_clear_storage(std::string& value) noexcept {
+        // resize() cannot grow beyond the already allocated capacity.  This
+        // makes the subsequent wipe cover stale bytes left in the backing
+        // allocation, not just the current logical string.
+        try {
+            value.resize(value.capacity(), '\0');
+        } catch (...) {
+            // Best effort fallback: secure_clear() still wipes the logical
+            // string if an implementation unexpectedly throws here.
+        }
+        q2dz::secure_clear(value);
+    }
+
+    void erase_prefix(std::size_t count) {
+        if (count == 0) return;
+        std::string unread;
+        if (count < buffer_.size()) unread.assign(buffer_.data() + count, buffer_.size() - count);
+        secure_clear_storage(buffer_);
+        buffer_.swap(unread);
+        secure_clear_storage(unread);
+    }
+
+    q2dz::Result<void> parse_complete_lines(std::vector<SlotCommand>& commands) {
+        while (true) {
+            const auto newline = buffer_.find('\n');
+            if (newline == std::string::npos) break;
+            if (newline + 1U > kHubMaxLine) {
+                clear_commands(commands);
+                secure_clear_storage(buffer_);
+                return q2dz::Result<void>::fail("hub command line exceeds 256 KiB");
+            }
+            std::string line(buffer_.data(), newline);
+            erase_prefix(newline + 1U);
+            auto parsed = parse_slot_command(line);
+            q2dz::secure_clear(line);
+            if (!parsed) {
+                clear_commands(commands);
+                secure_clear_storage(buffer_);
+                return q2dz::Result<void>::fail(parsed.error().message);
+            }
+            commands.push_back(std::move(parsed.value()));
+        }
+        return q2dz::Result<void>::ok();
+    }
+
+public:
+    ~SlotCommandReader() { secure_clear_storage(buffer_); }
+
+private:
+    std::string buffer_;
+};
 
 fs::path default_runtime_base() {
     if (const char* value = std::getenv("XDG_RUNTIME_DIR"); value && *value) return fs::path(value) / "q2dz";
@@ -276,6 +431,192 @@ q2dz::Result<Pipes> make_pipe(bool nonblocking_read = false) {
     return q2dz::Result<Pipes>::ok(Pipes{UniqueFd(fds[0]), UniqueFd(fds[1])});
 }
 
+class CustomSource {
+public:
+    q2dz::Result<void> start() {
+        if (worker_.joinable()) return q2dz::Result<void>::fail("custom source already started");
+        UniqueFd listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+        if (!listener) return q2dz::Result<void>::fail(q2dz::errno_message("custom source socket"));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(0);
+        if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            return q2dz::Result<void>::fail(q2dz::errno_message("custom source bind"));
+        }
+        if (::listen(listener.get(), 4) != 0) {
+            return q2dz::Result<void>::fail(q2dz::errno_message("custom source listen"));
+        }
+        socklen_t address_length = sizeof(address);
+        if (::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_length) != 0 || ntohs(address.sin_port) < 1024) {
+            return q2dz::Result<void>::fail(q2dz::errno_message("custom source getsockname"));
+        }
+        int stop_fds[2]{};
+        if (::pipe2(stop_fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+            return q2dz::Result<void>::fail(q2dz::errno_message("custom source stop pipe"));
+        }
+        listener_ = std::move(listener);
+        stop_read_.reset(stop_fds[0]);
+        stop_write_.reset(stop_fds[1]);
+        url_ = "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/servers";
+        try {
+            worker_ = std::thread([this] { serve(); });
+        } catch (const std::exception& error) {
+            listener_.reset();
+            stop_read_.reset();
+            stop_write_.reset();
+            url_.clear();
+            return q2dz::Result<void>::fail(std::string("custom source thread: ") + error.what());
+        }
+        return q2dz::Result<void>::ok();
+    }
+
+    [[nodiscard]] std::string url() const { return url_; }
+
+    void publish(const std::vector<q2dz::Endpoint>& endpoints) {
+        std::string body;
+        for (const auto& endpoint : endpoints) {
+            body += "127.0.0.1:" + std::to_string(endpoint.port) + "\n";
+        }
+        std::lock_guard lock(mutex_);
+        body_ = std::move(body);
+    }
+
+    [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
+
+    void stop() noexcept {
+        if (!worker_.joinable()) {
+            listener_.reset();
+            stop_read_.reset();
+            stop_write_.reset();
+            return;
+        }
+        const unsigned char byte = 1;
+        (void)::write(stop_write_.get(), &byte, sizeof(byte));
+        worker_.join();
+        listener_.reset();
+        stop_read_.reset();
+        stop_write_.reset();
+    }
+
+    ~CustomSource() { stop(); }
+    CustomSource() = default;
+    CustomSource(const CustomSource&) = delete;
+    CustomSource& operator=(const CustomSource&) = delete;
+
+private:
+    static std::size_t header_end(std::string_view request) {
+        const auto crlf = request.find("\r\n\r\n");
+        if (crlf != std::string_view::npos) return crlf + 4U;
+        const auto lf = request.find("\n\n");
+        return lf == std::string_view::npos ? std::string_view::npos : lf + 2U;
+    }
+
+    bool send_all(int client, std::string_view response) {
+        std::size_t offset = 0;
+        const auto deadline = q2dz::monotonic_millis() + 1000U;
+        while (offset < response.size()) {
+            const ssize_t count = ::send(client, response.data() + offset, response.size() - offset, MSG_NOSIGNAL);
+            if (count > 0) {
+                offset += static_cast<std::size_t>(count);
+                continue;
+            }
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                const auto now = q2dz::monotonic_millis();
+                if (now >= deadline) return false;
+                pollfd fd{client, POLLOUT, 0};
+                (void)::poll(&fd, 1, static_cast<int>(deadline - now));
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool serve_client(int client) {
+        UniqueFd owned(client);
+        std::string request;
+        const auto deadline = q2dz::monotonic_millis() + 1000U;
+        while (header_end(request) == std::string_view::npos) {
+            const auto now = q2dz::monotonic_millis();
+            if (now >= deadline) return true;
+            pollfd fds[2] = {{stop_read_.get(), POLLIN | POLLHUP, 0}, {owned.get(), POLLIN | POLLHUP, 0}};
+            const int timeout = static_cast<int>(deadline - now);
+            const int result = ::poll(fds, 2, timeout);
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                failed_.store(true);
+                return false;
+            }
+            if ((fds[0].revents & (POLLIN | POLLHUP)) != 0) return false;
+            if ((fds[1].revents & (POLLIN | POLLHUP)) == 0) continue;
+            std::array<char, 2048> buffer{};
+            const ssize_t count = ::recv(owned.get(), buffer.data(), buffer.size(), 0);
+            if (count < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                return true;
+            }
+            if (count == 0) return true;
+            request.append(buffer.data(), static_cast<std::size_t>(count));
+            if (request.size() > 8U * 1024U) return true;
+        }
+
+        const auto first_line_end = request.find('\n');
+        std::string_view first_line(request.data(), first_line_end == std::string::npos ? request.size() : first_line_end);
+        if (!first_line.empty() && first_line.back() == '\r') first_line.remove_suffix(1);
+        std::string response;
+        if (first_line == "GET /servers HTTP/1.1") {
+            std::string body;
+            {
+                std::lock_guard lock(mutex_);
+                body = body_;
+            }
+            response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                       "Cache-Control: no-store\r\nContent-Length: " + std::to_string(body.size()) +
+                       "\r\nConnection: close\r\n\r\n" + body;
+        } else {
+            response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        }
+        (void)send_all(owned.get(), response);
+        return true;
+    }
+
+    void serve() noexcept {
+        while (true) {
+            pollfd fds[2] = {{stop_read_.get(), POLLIN | POLLHUP, 0}, {listener_.get(), POLLIN | POLLERR | POLLHUP, 0}};
+            const int result = ::poll(fds, 2, -1);
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                failed_.store(true);
+                break;
+            }
+            if ((fds[0].revents & (POLLIN | POLLHUP)) != 0) break;
+            if ((fds[1].revents & (POLLERR | POLLHUP)) != 0) {
+                failed_.store(true);
+                break;
+            }
+            if ((fds[1].revents & POLLIN) == 0) continue;
+            const int client = ::accept4(listener_.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                failed_.store(true);
+                break;
+            }
+            if (!serve_client(client)) break;
+        }
+    }
+
+    UniqueFd listener_;
+    UniqueFd stop_read_;
+    UniqueFd stop_write_;
+    std::thread worker_;
+    mutable std::mutex mutex_;
+    std::string body_;
+    std::string url_;
+    std::atomic<bool> failed_{false};
+};
+
 struct Guardian {
     pid_t pid = -1;
     UniqueFd owner;
@@ -379,34 +720,29 @@ q2dz::Result<Child> spawn_gateway(const fs::path& gateway,
     return q2dz::Result<Child>::ok(Child{pid, pid, std::move(control.value().read), std::move(diagnostics.value().read)});
 }
 
-q2dz::Result<pid_t> spawn_q2_hub(const fs::path& wine,
-                                 const fs::path& q2,
-                                 const std::vector<q2dz::Endpoint>& endpoints,
-                                 const Options& options,
-                                 const std::string& session_id) {
-    if (endpoints.empty() || endpoints.size() > kHubMaxRooms) {
-        return q2dz::Result<pid_t>::fail("hub has no usable gateway endpoints");
-    }
-    std::string source;
-    for (const auto& endpoint : endpoints) {
-        if (!source.empty()) source.push_back(' ');
-        source += "quake2://" + endpoint.to_string();
-    }
+q2dz::Result<pid_t> spawn_q2_live(const fs::path& wine,
+                                  const fs::path& q2,
+                                  std::string_view source_url,
+                                  const Options& options,
+                                  const std::string& session_id) {
     const pid_t pid = ::fork();
     if (pid < 0) return q2dz::Result<pid_t>::fail(q2dz::errno_message("fork Q2PRO-X"));
     if (pid == 0) {
         (void)::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
         if (::setpgid(0, 0) != 0) _exit(126);
         if (::chdir(q2.parent_path().c_str()) != 0) _exit(126);
-        std::vector<std::pair<std::string, std::string>> overrides = {{"Q2DZ_SESSION_ID", session_id}};
+        UniqueFd devnull(::open("/dev/null", O_RDONLY | O_CLOEXEC));
+        if (!devnull || ::dup2(devnull.get(), STDIN_FILENO) < 0) _exit(126);
+        std::vector<std::pair<std::string, std::string>> overrides = { {"Q2DZ_SESSION_ID", session_id} };
         if (!options.wineprefix.empty()) overrides.emplace_back("WINEPREFIX", options.wineprefix);
         auto env_storage = q2dz::current_environment_with(overrides);
         std::vector<char*> envp;
         for (auto& item : env_storage) envp.push_back(item.data());
         envp.push_back(nullptr);
         std::vector<std::string> storage = {
-            wine.string(), q2.string(), "+set", "game", options.game,
-            "+set", "cl_serverbrowser_custom_source", source,
+            wine.string(), q2.string(),
+            "+set", "game", options.game,
+            "+set", "cl_serverbrowser_custom_source", std::string(source_url),
             "+serverbrowser_open_modern"
         };
         std::vector<char*> argv;
@@ -417,7 +753,7 @@ q2dz::Result<pid_t> spawn_q2_hub(const fs::path& wine,
     }
     if (::setpgid(pid, pid) != 0 && errno != EACCES) {
         (void)::kill(pid, SIGKILL);
-        return q2dz::Result<pid_t>::fail(q2dz::errno_message("setpgid Q2PRO-X hub"));
+        return q2dz::Result<pid_t>::fail(q2dz::errno_message("setpgid Q2PRO-X"));
     }
     return q2dz::Result<pid_t>::ok(pid);
 }
@@ -490,46 +826,272 @@ void terminate_group(pid_t pgid, int grace_ms, pid_t gateway_pid, pid_t q2_pid) 
     if (q2_alive) (void)::waitpid(q2_pid, &status, 0);
 }
 
-struct HubGateway {
+struct LiveGateway {
     Child child;
     std::string control_buffer;
     std::string diagnostic_buffer;
     std::optional<q2dz::Endpoint> endpoint;
+    bool ready = false;
     bool control_eof = false;
-    bool terminal = false;
-    std::string terminal_reason;
+    std::uint64_t ready_deadline = 0;
 };
 
-int child_exit_code(int status);
+struct LiveSlot {
+    std::string room_id;
+    unsigned post_ready_failures = 0;
+    bool tombstone = false;
+    std::optional<LiveGateway> gateway;
+};
 
-void stop_hub_gateway(HubGateway& gateway, int grace_ms, UniqueFd& guardian_control, std::string_view reason) {
-    if (gateway.terminal) return;
+void stop_live_gateway(LiveGateway& gateway,
+                       const Options& options,
+                       Guardian& guardian,
+                       std::string_view reason) {
     const pid_t process_group = gateway.child.process_group;
     if (gateway.child.pid > 0 || process_group > 1) {
-        terminate_group(process_group, grace_ms, gateway.child.pid, -1);
+        terminate_group(process_group, options.shutdown_grace_ms, gateway.child.pid, -1);
         gateway.child.pid = -1;
     }
-    if (process_group > 1) (void)q2dz::write_all(guardian_control.get(), "DROP " + std::to_string(process_group) + "\n");
-    drain_diagnostics(gateway.child.diagnostics.get(), gateway.diagnostic_buffer);
+    if (process_group > 1) {
+        (void)q2dz::write_all(guardian.control.get(), "DROP " + std::to_string(process_group) + "\n");
+    }
+    if (gateway.child.diagnostics) drain_diagnostics(gateway.child.diagnostics.get(), gateway.diagnostic_buffer);
     gateway.child.control.reset();
     gateway.child.diagnostics.reset();
-    gateway.terminal_reason = std::string(reason);
-    gateway.terminal = true;
     std::cerr << "HUB_GATEWAY_STOP reason=" << reason << "\n";
 }
 
-int finish_hub(const Options& options,
-               std::vector<HubGateway>& gateways,
-               pid_t& q2_pid,
-               Guardian& guardian,
-               std::string_view reason,
-               int result_code) {
-    for (auto& gateway : gateways) stop_hub_gateway(gateway, options.shutdown_grace_ms, guardian.control, reason);
+void remove_live_gateway(LiveSlot& slot,
+                         const Options& options,
+                         Guardian& guardian,
+                         std::string_view reason) {
+    if (slot.gateway) {
+        stop_live_gateway(*slot.gateway, options, guardian, reason);
+        slot.gateway.reset();
+    }
+}
+
+std::vector<q2dz::Endpoint> live_endpoints(const std::array<LiveSlot, kHubMaxRooms>& slots) {
+    std::vector<q2dz::Endpoint> endpoints;
+    for (const auto& slot : slots) {
+        if (slot.gateway && slot.gateway->ready && slot.gateway->endpoint) endpoints.push_back(*slot.gateway->endpoint);
+    }
+    return endpoints;
+}
+
+void publish_live_source(CustomSource& source, const std::array<LiveSlot, kHubMaxRooms>& slots) {
+    source.publish(live_endpoints(slots));
+}
+
+void unpublish_live_gateway(LiveSlot& slot,
+                            CustomSource& source,
+                            const std::array<LiveSlot, kHubMaxRooms>& slots) {
+    if (slot.gateway) {
+        slot.gateway->ready = false;
+        slot.gateway->endpoint.reset();
+    }
+    publish_live_source(source, slots);
+}
+
+void mark_live_gateway_failure(LiveSlot& slot,
+                               const Options& options,
+                               Guardian& guardian,
+                               CustomSource& source,
+                               const std::array<LiveSlot, kHubMaxRooms>& slots,
+                               std::string_view reason,
+                               bool room_closed) {
+    const bool was_ready = slot.gateway && slot.gateway->ready;
+    unpublish_live_gateway(slot, source, slots);
+    remove_live_gateway(slot, options, guardian, reason);
+    if (room_closed || !was_ready || slot.post_ready_failures != 0) {
+        slot.tombstone = true;
+    } else {
+        slot.post_ready_failures = 1;
+    }
+    publish_live_source(source, slots);
+}
+
+q2dz::Result<void> validate_live_room_config(std::string_view config) {
+    auto parsed = q2dz::json::parse(config);
+    if (!parsed || !parsed.value().is_object()) return q2dz::Result<void>::fail("room JSON must be an object");
+    if (auto room = q2dz::json::extract_room_config(parsed.value()); !room) {
+        return q2dz::Result<void>::fail(room.error().message);
+    }
+    return q2dz::Result<void>::ok();
+}
+
+q2dz::Result<void> start_live_gateway(LiveSlot& slot,
+                                      const fs::path& gateway,
+                                      const fs::path& legacy,
+                                      const fs::path& adapter,
+                                      const fs::path& session_dir,
+                                      const std::string& session_id,
+                                      const Options& options,
+                                      Guardian& guardian,
+                                      std::string_view room_json) {
+    auto child = spawn_gateway(gateway, legacy, adapter, session_dir, session_id, room_json);
+    if (!child) return q2dz::Result<void>::fail(child.error().message);
+    LiveGateway runtime{std::move(child.value()), {}, {}, std::nullopt, false, false,
+                        q2dz::monotonic_millis() + static_cast<std::uint64_t>(options.ready_timeout_ms)};
+    const pid_t process_group = runtime.child.process_group;
+    slot.gateway.emplace(std::move(runtime));
+    if (!q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(process_group) + "\n")) {
+        remove_live_gateway(slot, options, guardian, "guardian-control-failed");
+        return q2dz::Result<void>::fail("guardian control pipe failed");
+    }
+    return q2dz::Result<void>::ok();
+}
+
+q2dz::Result<void> process_live_command(SlotCommand& command,
+                                        std::array<LiveSlot, kHubMaxRooms>& slots,
+                                        const fs::path& gateway,
+                                        const fs::path& legacy,
+                                        const fs::path& adapter,
+                                        const fs::path& session_dir,
+                                        const std::string& session_id,
+                                        const Options& options,
+                                        Guardian& guardian,
+                                        CustomSource& source) {
+    auto& slot = slots[command.slot];
+    if (!command.room_id) {
+        unpublish_live_gateway(slot, source, slots);
+        remove_live_gateway(slot, options, guardian, "slot-cleared");
+        slot.room_id.clear();
+        slot.post_ready_failures = 0;
+        slot.tombstone = false;
+        publish_live_source(source, slots);
+        clear_slot_command(command);
+        return q2dz::Result<void>::ok();
+    }
+
+    const std::string requested_id = *command.room_id;
+    const bool same_room = slot.room_id == requested_id;
+    if (same_room && (slot.gateway || slot.tombstone)) {
+        // Heartbeats for a live or tombstoned room carry fresh credentials but
+        // cannot change its lifecycle state.
+        clear_slot_command(command);
+        return q2dz::Result<void>::ok();
+    }
+    if (!command.config) {
+        slot.tombstone = true;
+        clear_slot_command(command);
+        return q2dz::Result<void>::ok();
+    }
+    const auto semantic = validate_live_room_config(*command.config);
+    if (!same_room) {
+        unpublish_live_gateway(slot, source, slots);
+        remove_live_gateway(slot, options, guardian, "slot-replaced");
+        slot.room_id = requested_id;
+        slot.post_ready_failures = 0;
+        slot.tombstone = false;
+    }
+    if (!semantic) {
+        slot.tombstone = true;
+        q2dz::secure_clear(*command.config);
+        publish_live_source(source, slots);
+        return q2dz::Result<void>::ok();
+    }
+    auto started = start_live_gateway(slot, gateway, legacy, adapter, session_dir, session_id,
+                                      options, guardian, *command.config);
+    q2dz::secure_clear(*command.config);
+    if (!started) {
+        if (started.error().message == "guardian control pipe failed") return started;
+        slot.tombstone = true;
+    }
+    publish_live_source(source, slots);
+    return q2dz::Result<void>::ok();
+}
+
+bool process_live_gateway(LiveSlot& slot,
+                          const Options& options,
+                          Guardian& guardian,
+                          CustomSource& source,
+                          const std::array<LiveSlot, kHubMaxRooms>& slots) {
+    if (!slot.gateway) return false;
+    auto& gateway = *slot.gateway;
+    pollfd child_fds[2] = {
+        {gateway.child.control.get(), POLLIN | POLLHUP, 0},
+        {gateway.child.diagnostics.get(), POLLIN | POLLHUP, 0}
+    };
+    if (::poll(child_fds, 2, 0) < 0 && errno != EINTR) {
+        mark_live_gateway_failure(slot, options, guardian, source, slots, "gateway-poll-failed", false);
+        return true;
+    }
+    if ((child_fds[1].revents & (POLLIN | POLLHUP)) != 0) {
+        drain_diagnostics(gateway.child.diagnostics.get(), gateway.diagnostic_buffer);
+    }
+    if ((child_fds[0].revents & (POLLIN | POLLHUP)) != 0) {
+        for (const auto& line : take_lines(gateway.child.control.get(), gateway.control_buffer, gateway.control_eof)) {
+            auto event = q2dz::parse_gateway_event(line);
+            if (!event) {
+                mark_live_gateway_failure(slot, options, guardian, source, slots, "invalid-gateway-event", false);
+                return true;
+            }
+            switch (event.value().type) {
+                case q2dz::GatewayEventType::TransportReady: {
+                    if (gateway.ready) {
+                        mark_live_gateway_failure(slot, options, guardian, source, slots, "duplicate-transport-ready", false);
+                        return true;
+                    }
+                    auto endpoint = q2dz::ready_endpoint(event.value());
+                    if (!endpoint) {
+                        mark_live_gateway_failure(slot, options, guardian, source, slots, "invalid-ready-endpoint", false);
+                        return true;
+                    }
+                    gateway.endpoint = endpoint.value();
+                    gateway.ready = true;
+                    publish_live_source(source, slots);
+                    break;
+                }
+                case q2dz::GatewayEventType::RoomClosed:
+                    mark_live_gateway_failure(slot, options, guardian, source, slots, "room-closed", true);
+                    return true;
+                case q2dz::GatewayEventType::Fatal:
+                    mark_live_gateway_failure(slot, options, guardian, source, slots, "gateway-fatal", false);
+                    return true;
+                case q2dz::GatewayEventType::Heartbeat:
+                    break;
+            }
+            if (!slot.gateway) return true;
+        }
+    }
+    if (!slot.gateway) return true;
+    auto& current = *slot.gateway;
+    int status = 0;
+    if (current.child.pid > 0 && ::waitpid(current.child.pid, &status, WNOHANG) == current.child.pid) {
+        current.child.pid = -1;
+        mark_live_gateway_failure(slot, options, guardian, source, slots,
+                                  current.ready ? "gateway-exited" : "gateway-exited-before-ready", false);
+        return true;
+    }
+    if (current.control_eof) {
+        mark_live_gateway_failure(slot, options, guardian, source, slots,
+                                  current.ready ? "gateway-control-eof" : "gateway-control-eof-before-ready", false);
+        return true;
+    }
+    if (!current.ready && q2dz::monotonic_millis() >= current.ready_deadline) {
+        mark_live_gateway_failure(slot, options, guardian, source, slots, "transport-ready-timeout", false);
+        return true;
+    }
+    return false;
+}
+
+int child_exit_code(int status);
+
+int finish_live_hub(const Options& options,
+                    std::array<LiveSlot, kHubMaxRooms>& slots,
+                    pid_t& q2_pid,
+                    Guardian& guardian,
+                    CustomSource& source,
+                    std::string_view reason,
+                    int result_code) {
+    source.publish({});
+    source.stop();
+    for (auto& slot : slots) remove_live_gateway(slot, options, guardian, reason);
     if (q2_pid > 0) {
         terminate_group(q2_pid, options.shutdown_grace_ms, -1, q2_pid);
         q2_pid = -1;
     }
-    std::cerr << "SESSION_CLOSING reason=" << reason << "\n";
     const auto disarm = q2dz::write_all(guardian.control.get(), "DISARM\n");
     guardian.control.reset();
     guardian.owner.reset();
@@ -543,198 +1105,104 @@ int finish_hub(const Options& options,
     return result_code;
 }
 
-int run_hub(const Options& options,
-            const fs::path& gateway,
-            const fs::path& legacy,
-            const fs::path& adapter,
-            const fs::path& wine,
-            const fs::path& q2,
-            const fs::path& session_dir,
-            const std::string& session_id,
-            std::vector<std::string>& room_json,
-            Guardian& guardian,
-            Pipes& signal_pipe) {
-    std::vector<HubGateway> gateways;
-    gateways.reserve(room_json.size());
-    for (auto& input : room_json) {
-        auto child = spawn_gateway(gateway, legacy, adapter, session_dir, session_id, input);
-        q2dz::secure_clear(input);
-        if (!child) {
-            std::cerr << "HUB_GATEWAY_START_FAILED reason=" << child.error().message << "\n";
-            continue;
-        }
-        gateways.push_back(HubGateway{std::move(child.value()), {}, {}, std::nullopt, false, false, {}});
-        const pid_t process_group = gateways.back().child.process_group;
-        (void)q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(process_group) + "\n");
-    }
-    if (gateways.empty()) {
+int run_live_hub(const Options& options,
+                 const fs::path& gateway,
+                 const fs::path& legacy,
+                 const fs::path& adapter,
+                 const fs::path& wine,
+                 const fs::path& q2,
+                 const fs::path& session_dir,
+                 const std::string& session_id,
+                 Guardian& guardian,
+                 Pipes& signal_pipe) {
+    CustomSource source;
+    if (auto started = source.start(); !started) {
+        std::array<LiveSlot, kHubMaxRooms> slots{};
         pid_t no_q2 = -1;
-        return finish_hub(options, gateways, no_q2, guardian, "no-gateway", kGatewayFailure);
+        return finish_live_hub(options, slots, no_q2, guardian, source,
+                               "source-start-failed", kInternal);
+    }
+    source.publish({});
+    auto q2_result = spawn_q2_live(wine, q2, source.url(), options, session_id);
+    if (!q2_result) {
+        std::array<LiveSlot, kHubMaxRooms> slots{};
+        pid_t no_q2 = -1;
+        return finish_live_hub(options, slots, no_q2, guardian, source, "q2-spawn-failed", kQ2Failure);
+    }
+    pid_t q2_pid = q2_result.value();
+    if (auto registered = q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(q2_pid) + "\n"); !registered) {
+        std::array<LiveSlot, kHubMaxRooms> slots{};
+        return finish_live_hub(options, slots, q2_pid, guardian, source,
+                               "guardian-control-failed", kInternal);
+    }
+    if (auto nonblocking = q2dz::set_nonblocking(STDIN_FILENO); !nonblocking) {
+        std::array<LiveSlot, kHubMaxRooms> slots{};
+        return finish_live_hub(options, slots, q2_pid, guardian, source, "hub-input-failed", kInternal);
     }
 
-    const auto ready_deadline = q2dz::monotonic_millis() + static_cast<std::uint64_t>(options.ready_timeout_ms);
-    while (q2dz::monotonic_millis() < ready_deadline && signal_seen.load() == 0) {
-        bool pending = false;
-        for (std::size_t index = 0; index < gateways.size(); ++index) {
-            auto& gateway_state = gateways[index];
-            if (gateway_state.terminal) continue;
-            if (!gateway_state.endpoint) pending = true;
-            pollfd child_fds[2] = {
-                {gateway_state.child.control.get(), POLLIN | POLLHUP, 0},
-                {gateway_state.child.diagnostics.get(), POLLIN | POLLHUP, 0}
-            };
-            if (::poll(child_fds, 2, 0) < 0 && errno != EINTR) {
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "poll-failed");
-                continue;
-            }
-            if ((child_fds[1].revents & (POLLIN | POLLHUP)) != 0) {
-                drain_diagnostics(gateway_state.child.diagnostics.get(), gateway_state.diagnostic_buffer);
-            }
-            if ((child_fds[0].revents & (POLLIN | POLLHUP)) != 0) {
-                for (const auto& line : take_lines(gateway_state.child.control.get(), gateway_state.control_buffer, gateway_state.control_eof)) {
-                    auto event = q2dz::parse_gateway_event(line);
-                    if (!event) {
-                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-gateway-event");
-                        break;
-                    }
-                    if (event.value().type == q2dz::GatewayEventType::TransportReady) {
-                        auto endpoint = q2dz::ready_endpoint(event.value());
-                        if (!endpoint) {
-                            stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-ready-endpoint");
-                            break;
-                        }
-                        gateway_state.endpoint = endpoint.value();
-                    } else if (event.value().type == q2dz::GatewayEventType::RoomClosed ||
-                               event.value().type == q2dz::GatewayEventType::Fatal) {
-                        const auto code = event.value().fields.find("code");
-                        const bool probe_timeout = event.value().type == q2dz::GatewayEventType::Fatal &&
-                            code != event.value().fields.end() && code->second == "q2-oob-timeout";
-                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control,
-                                         event.value().type == q2dz::GatewayEventType::RoomClosed ? "room-closed-before-q2" :
-                                         (probe_timeout ? "transport-ready-timeout" : "gateway-fatal"));
-                        break;
-                    }
-                }
-            }
-            if (gateway_state.terminal) continue;
-            int status = 0;
-            if (gateway_state.child.pid > 0 && ::waitpid(gateway_state.child.pid, &status, WNOHANG) == gateway_state.child.pid) {
-                gateway_state.child.pid = -1;
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-exited-before-q2");
-            } else if (gateway_state.control_eof) {
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-control-eof-before-q2");
-            }
-        }
-        if (!pending) break;
-        pollfd signal_fd{signal_pipe.read.get(), POLLIN, 0};
-        (void)::poll(&signal_fd, 1, 20);
-    }
-    for (auto& gateway_state : gateways) {
-        if (!gateway_state.endpoint && !gateway_state.terminal) {
-            stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "transport-ready-timeout");
-        }
-    }
-    if (signal_seen.load() != 0) {
-        pid_t no_q2 = -1;
-        return finish_hub(options, gateways, no_q2, guardian, "owner-stop-before-q2", 128 + signal_seen.load());
-    }
-
-    std::vector<q2dz::Endpoint> endpoints;
-    for (const auto& gateway_state : gateways) {
-        if (!gateway_state.terminal && gateway_state.endpoint) endpoints.push_back(*gateway_state.endpoint);
-    }
-    if (endpoints.empty()) {
-        pid_t no_q2 = -1;
-        int result_code = kReadyTimeout;
-        std::string reason = "no-ready-gateway";
-        for (const auto& gateway_state : gateways) {
-            if (gateway_state.terminal_reason == "room-closed-before-q2") {
-                result_code = kRoomClosed;
-                reason = "room-closed-before-q2";
-                break;
-            }
-            if (!gateway_state.terminal_reason.empty() &&
-                gateway_state.terminal_reason != "transport-ready-timeout") {
-                result_code = kGatewayFailure;
-                reason = "gateway-failure-before-q2";
-            }
-        }
-        return finish_hub(options, gateways, no_q2, guardian, reason, result_code);
-    }
-    auto started = spawn_q2_hub(wine, q2, endpoints, options, session_id);
-    if (!started) {
-        pid_t no_q2 = -1;
-        return finish_hub(options, gateways, no_q2, guardian, "q2-spawn-failed", kQ2Failure);
-    }
-    pid_t q2_pid = started.value();
-    (void)q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(q2_pid) + "\n");
-    std::cerr << "HUB_READY gateways=" << endpoints.size() << "\n";
-
+    std::array<LiveSlot, kHubMaxRooms> slots{};
+    SlotCommandReader reader;
+    bool input_eof = false;
     int result_code = 0;
     std::string closing_reason;
-    while (q2_pid > 0 && result_code == 0 && signal_seen.load() == 0) {
-        pollfd signal_fd{signal_pipe.read.get(), POLLIN, 0};
-        const int signal_poll = ::poll(&signal_fd, 1, 200);
-        if (signal_poll < 0 && errno != EINTR) {
+    while (result_code == 0 && signal_seen.load() == 0) {
+        if (source.failed()) {
+            result_code = kInternal;
+            closing_reason = "source-failed";
+            break;
+        }
+        pollfd fds[2] = {{signal_pipe.read.get(), POLLIN, 0}, {STDIN_FILENO, POLLIN | POLLHUP, 0}};
+        const int poll_result = ::poll(fds, 2, 100);
+        if (poll_result < 0 && errno != EINTR) {
             result_code = kInternal;
             closing_reason = "poll-failed";
             break;
         }
-        for (auto& gateway_state : gateways) {
-            if (gateway_state.terminal) continue;
-            pollfd child_fds[2] = {
-                {gateway_state.child.control.get(), POLLIN | POLLHUP, 0},
-                {gateway_state.child.diagnostics.get(), POLLIN | POLLHUP, 0}
-            };
-            if (::poll(child_fds, 2, 0) < 0 && errno != EINTR) {
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "poll-failed");
-                continue;
+        if ((fds[1].revents & (POLLIN | POLLHUP)) != 0) {
+            auto commands = reader.read(STDIN_FILENO, input_eof);
+            if (!commands) {
+                std::cerr << "HUB_PROTOCOL_ERROR " << commands.error().message << "\n";
+                result_code = kConfig;
+                closing_reason = "hub-protocol-failed";
+                break;
             }
-            if ((child_fds[1].revents & (POLLIN | POLLHUP)) != 0) {
-                drain_diagnostics(gateway_state.child.diagnostics.get(), gateway_state.diagnostic_buffer);
-            }
-            if ((child_fds[0].revents & (POLLIN | POLLHUP)) != 0) {
-                for (const auto& line : take_lines(gateway_state.child.control.get(), gateway_state.control_buffer, gateway_state.control_eof)) {
-                    auto event = q2dz::parse_gateway_event(line);
-                    if (!event) {
-                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "invalid-gateway-event");
-                        break;
-                    }
-                    if (event.value().type == q2dz::GatewayEventType::RoomClosed ||
-                        event.value().type == q2dz::GatewayEventType::Fatal) {
-                        stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control,
-                                         event.value().type == q2dz::GatewayEventType::RoomClosed ? "room-closed" : "gateway-fatal");
-                        break;
-                    }
+            for (auto& command : commands.value()) {
+                auto processed = process_live_command(command, slots, gateway, legacy, adapter, session_dir, session_id,
+                                                      options, guardian, source);
+                clear_slot_command(command);
+                if (!processed) {
+                    std::cerr << "HUB_FATAL guardian-control-failed\n";
+                    result_code = kInternal;
+                    closing_reason = "guardian-control-failed";
+                    break;
                 }
             }
-            if (gateway_state.terminal) continue;
-            int gateway_status = 0;
-            if (gateway_state.child.pid > 0 && ::waitpid(gateway_state.child.pid, &gateway_status, WNOHANG) == gateway_state.child.pid) {
-                gateway_state.child.pid = -1;
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-exited");
-            } else if (gateway_state.control_eof) {
-                stop_hub_gateway(gateway_state, options.shutdown_grace_ms, guardian.control, "gateway-control-eof");
+            if (input_eof) {
+                closing_reason = "control-eof";
+                break;
             }
         }
+        for (auto& slot : slots) (void)process_live_gateway(slot, options, guardian, source, slots);
+        if (source.failed()) {
+            result_code = kInternal;
+            closing_reason = "source-failed";
+            break;
+        }
         int q2_status = 0;
-        if (::waitpid(q2_pid, &q2_status, WNOHANG) == q2_pid) {
+        if (q2_pid > 0 && ::waitpid(q2_pid, &q2_status, WNOHANG) == q2_pid) {
             const int code = child_exit_code(q2_status);
             q2_pid = -1;
             result_code = code == 0 ? 0 : kQ2Failure;
             closing_reason = code == 0 ? "q2-normal-exit" : "q2-failed";
-        }
-        if (signal_poll > 0 && (signal_fd.revents & POLLIN) != 0) {
-            result_code = 128 + signal_seen.load();
-            closing_reason = "owner-stop";
+            break;
         }
     }
-    if (signal_seen.load() != 0 && result_code == 0) {
+    if (signal_seen.load() != 0 && closing_reason.empty()) {
         result_code = 128 + signal_seen.load();
         closing_reason = "owner-stop";
     }
-    return finish_hub(options, gateways, q2_pid, guardian,
-                      closing_reason.empty() ? "hub-stopped" : closing_reason, result_code);
+    if (closing_reason.empty()) closing_reason = "hub-stopped";
+    return finish_live_hub(options, slots, q2_pid, guardian, source, closing_reason, result_code);
 }
 
 int child_exit_code(int status) {
@@ -885,20 +1353,11 @@ int main(int argc, char** argv) {
     auto options = parse_options(argc, argv);
     if (!options) { std::cerr << options.error().message << "\n"; usage(std::cerr); return kUsage; }
 
-    auto room_input = q2dz::read_all_fd(STDIN_FILENO, 1024U * 1024U);
-    if (!room_input) { std::cerr << room_input.error().message << "\n"; return kConfig; }
-    std::string room_json = std::move(room_input.value());
-    auto parsed_hub = parse_hub_input(room_json);
-    q2dz::secure_clear(room_json);
-    if (!parsed_hub) { std::cerr << parsed_hub.error().message << "\n"; return kConfig; }
-    std::vector<std::string> hub_room_json = std::move(parsed_hub.value());
-
     auto gateway = resolve_program(options.value().gateway, {});
     auto legacy = resolve_program(options.value().legacy_gateway, {});
     auto wine = resolve_program(options.value().wine, {"wine64", "wine"});
     auto q2 = discover_q2(options.value());
     if (!gateway || !legacy || !wine || !q2) {
-        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         if (!gateway) std::cerr << gateway.error().message << "\n";
         if (!legacy) std::cerr << legacy.error().message << "\n";
         if (!wine) std::cerr << wine.error().message << "\n";
@@ -906,31 +1365,37 @@ int main(int argc, char** argv) {
         return kUnavailable;
     }
     if (!fs::is_regular_file(options.value().adapter)) {
-        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         std::cerr << "adapter config not found: " << options.value().adapter << "\n";
         return kUnavailable;
     }
 
     auto runtime_base = prepare_runtime_base(options.value().runtime_base);
-    if (!runtime_base) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << runtime_base.error().message << "\n"; return kInternal; }
+    if (!runtime_base) { std::cerr << runtime_base.error().message << "\n"; return kInternal; }
     auto lock = acquire_global_lock(runtime_base.value());
-    if (!lock) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << lock.error().message << "\n"; return kUnavailable; }
+    if (!lock) { std::cerr << lock.error().message << "\n"; return kUnavailable; }
     cleanup_stale_sessions(runtime_base.value());
 
     const std::string session_id = q2dz::random_hex(16);
     auto session_dir = create_session_dir(runtime_base.value(), session_id);
-    if (!session_dir) { for (auto& input : hub_room_json) q2dz::secure_clear(input); std::cerr << session_dir.error().message << "\n"; return kInternal; }
+    if (!session_dir) { std::cerr << session_dir.error().message << "\n"; return kInternal; }
     fs::path self = fs::canonical("/proc/self/exe");
     auto guardian = start_guardian(self, runtime_base.value(), session_dir.value(), session_id, options.value().shutdown_grace_ms);
     if (!guardian) {
-        for (auto& input : hub_room_json) q2dz::secure_clear(input);
         (void)q2dz::remove_session_dir_safely(runtime_base.value(), session_dir.value(), session_id);
         std::cerr << guardian.error().message << "\n";
         return kInternal;
     }
 
     auto signal_pipe = make_pipe(true);
-    if (!signal_pipe) { for (auto& input : hub_room_json) q2dz::secure_clear(input); return kInternal; }
+    if (!signal_pipe) {
+        (void)q2dz::write_all(guardian.value().control.get(), "DISARM\n");
+        guardian.value().control.reset();
+        guardian.value().owner.reset();
+        int guardian_status = 0;
+        (void)::waitpid(guardian.value().pid, &guardian_status, 0);
+        (void)q2dz::remove_session_dir_safely(runtime_base.value(), session_dir.value(), session_id);
+        return kInternal;
+    }
     signal_pipe_write = signal_pipe.value().write.get();
     struct sigaction action{};
     action.sa_handler = signal_handler;
@@ -941,7 +1406,7 @@ int main(int argc, char** argv) {
     (void)::sigaction(SIGHUP, &action, nullptr);
     std::signal(SIGPIPE, SIG_IGN);
 
-    return run_hub(options.value(), gateway.value(), legacy.value(), options.value().adapter,
-                   wine.value(), q2.value(), session_dir.value(), session_id,
-                   hub_room_json, guardian.value(), signal_pipe.value());
+    return run_live_hub(options.value(), gateway.value(), legacy.value(), options.value().adapter,
+                        wine.value(), q2.value(), session_dir.value(), session_id,
+                        guardian.value(), signal_pipe.value());
 }
