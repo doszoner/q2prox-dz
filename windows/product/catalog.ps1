@@ -131,7 +131,7 @@ function Get-Q2DzJson {
   $client = New-Q2DzHttpClient
   try {
     $value = Read-Q2DzJson -Client $client -Uri $Endpoint
-    Write-Output -NoEnumerate $value
+    Write-Output $value
   }
   finally { $client.Dispose() }
 }

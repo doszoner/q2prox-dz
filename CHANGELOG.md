@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc12] - 2026-08-31
+
+### Fixed
+
+- Windows launcher снова заполняет вкладку `Custom`: результат чтения
+  каталогов Dos.Zone больше не получает лишний уровень массива при прохождении
+  через блок PowerShell. Добавлена проверка как корневого объекта каталога, так
+  и корневого массива RTC через фактический путь загрузки.
+
 ## [1.0.0-rc11] - 2026-08-30
 
 ### Fixed
@@ -132,7 +141,8 @@
 - Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
   PAK-файлы пользователя.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...HEAD
+[1.0.0-rc12]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...v1.0.0-rc12
 [1.0.0-rc11]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...v1.0.0-rc11
 [1.0.0-rc10]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...v1.0.0-rc10
 [1.0.0-rc9]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc8...v1.0.0-rc9

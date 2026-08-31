@@ -143,6 +143,19 @@ try {
 }
 
 $server = $null
+$originalRoomEndpoint = $Q2DZ_ROOM_ENDPOINT
+try {
+  $server = Start-TestHttpListener -Body ([Text.Encoding]::UTF8.GetBytes('{"rooms":[]}'))
+  $Q2DZ_ROOM_ENDPOINT = $server.Uri
+  $catalogObject = Get-Q2DzJson $server.Uri
+  Assert-True ($catalogObject.PSObject.Properties.Name -contains 'rooms') 'Get-Q2DzJson must not wrap a top-level object'
+  Assert-True ($catalogObject.rooms -is [array]) 'Get-Q2DzJson must preserve nested arrays'
+} finally {
+  $Q2DZ_ROOM_ENDPOINT = $originalRoomEndpoint
+  if ($server) { Stop-TestHttpListener $server }
+}
+
+$server = $null
 $client = New-Q2DzHttpClient
 try {
   $arrayBody = [Text.Encoding]::UTF8.GetBytes('[{"domain":"lvc.example.invalid","iceservers":[{"urls":["stun:example.invalid"]}]}]')
@@ -153,6 +166,21 @@ try {
 } finally {
   if ($server) { Stop-TestHttpListener $server }
   $client.Dispose()
+}
+
+$server = $null
+$originalRtcEndpoint = $Q2DZ_RTC_ENDPOINT
+try {
+  $arrayBody = [Text.Encoding]::UTF8.GetBytes('[{"domain":"lvc.example.invalid","iceservers":[{"urls":["stun:example.invalid"]}]}]')
+  $server = Start-TestHttpListener -Body $arrayBody
+  $Q2DZ_RTC_ENDPOINT = $server.Uri
+  $arrayThroughFetch = @(& { param($Endpoint) Get-Q2DzJson $Endpoint } $server.Uri)
+  Assert-Equal 1 $arrayThroughFetch.Count 'one-row RTC response must remain one flat row through FetchJson'
+  Assert-True ($arrayThroughFetch[0] -isnot [array]) 'FetchJson must not nest a top-level array'
+  Assert-True (Test-Q2DzRtcPayload $arrayThroughFetch) 'flat one-row RTC response must validate'
+} finally {
+  $Q2DZ_RTC_ENDPOINT = $originalRtcEndpoint
+  if ($server) { Stop-TestHttpListener $server }
 }
 
 $server = $null
