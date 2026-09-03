@@ -459,7 +459,7 @@ def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
                 try:
                     updated.append(HubSlot(slot.room_id, _config_text(make_config(row)), 0, map_name))
                 except LaunchError:
-                    updated.append(dataclasses.replace(slot, send=False) if _room_kind(row) == "q2ded" else HubSlot())
+                    updated.append(dataclasses.replace(slot, send=False))
             else:
                 updated.append(HubSlot(slot.room_id, slot.config, 0, slot.map_name or map_name))
         elif slot.misses < 1:

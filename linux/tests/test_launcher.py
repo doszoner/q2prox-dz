@@ -640,6 +640,12 @@ class LauncherTests(unittest.TestCase):
         checked.assert_called_once_with(legacy)
         self.assertEqual(updated[3].map_name, "q2dm2")
         self.assertIn('"q2dm2"', updated[3].config)
+        def rtc_failure(_row):
+            raise launch.LaunchError("RTC unavailable")
+
+        failed = launch.reconcile_slots(slots5(q2a=old), [legacy], rtc_failure, lambda _row: True)
+        self.assertEqual((failed[3].room_id, failed[3].config), (old.room_id, old.config))
+        self.assertFalse(failed[3].send)
 
     def test_failed_dedicated_rtc_refresh_preserves_live_slots_and_sends_nothing(self):
         selected = dedicated_room()

@@ -441,9 +441,7 @@ function Update-Q2DzHubSlots {
           if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }
           $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$values[0]) 0 $map
         } catch {
-          if ((Get-Q2DzRoomKind $retained) -ceq 'q2ded') {
-            $updated += New-Q2DzHubSlot $slot.RoomId $slot.Config $slot.Misses $slot.MapName $false
-          } else { $updated += New-Q2DzHubSlot }
+          $updated += New-Q2DzHubSlot $slot.RoomId $slot.Config $slot.Misses $slot.MapName $false
         }
       } else {
         $savedMap = if ([string]::IsNullOrEmpty([string]$slot.MapName)) { $map } else { [string]$slot.MapName }

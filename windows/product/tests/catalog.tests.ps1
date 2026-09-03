@@ -389,6 +389,11 @@ $legacyMap = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room '{"map"
 Assert-Equal 1 $legacyMapChecks 'legacy q2 map change is checked once'
 Assert-Equal 'q2dm2' $legacyMap[3].MapName 'legacy q2 map state is refreshed'
 Assert-True $legacyMap[3].Config.Contains('q2dm2') 'legacy q2 config follows the changed map'
+$legacyRtcFailure = Update-Q2DzHubSlots `
+  -Slots @(& $q2Slots (& $slot $room.room '{"map":"q2dm1"}' 0 'q2dm1')) -Rows @($legacyChangedMap) `
+  -MakeConfig { throw 'RTC unavailable' } -MapAvailable { return $true }
+Assert-Equal $room.room $legacyRtcFailure[3].RoomId 'temporary RTC failure keeps active legacy q2'
+Assert-Equal $false $legacyRtcFailure[3].Send 'temporary RTC failure sends no destructive q2 command'
 
 $unsupportedProfileRoom = [pscustomobject]@{
   room = 'room.q2.unsupported-profile.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
