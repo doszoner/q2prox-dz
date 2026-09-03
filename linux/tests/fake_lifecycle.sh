@@ -116,9 +116,13 @@ sleep 0.1
 [ "$(<"$CASE/mark.legacy-Q2_ROOM_A.pid")" = "$gateway_a_pid" ]
 send_room 1 room.q2.b q2.room-b
 wait_file "$CASE/mark.legacy-Q2_ROOM_B.pid"
-wait_source_count 2
+send_room 2 room.q2.c q2.room-c
+send_room 3 room.q2.d q2.room-d
+send_room 4 room.q2.e q2.room-e
+for alias in C D E; do wait_file "$CASE/mark.legacy-Q2_ROOM_${alias}.pid"; done
+wait_source_count 5
 printf '0 -\n' >&$WRITER
-wait_source_count 1
+wait_source_count 4
 stop_case 143
 
 # Two valid roughly-140 KiB commands in one stream must be parsed independently;
@@ -191,16 +195,19 @@ kill -0 "$isolation_q2_pid"
 kill -0 "$isolation_b_pid"
 stop_case 143
 
-# A hard owner kill is recovered by the guardian, including Q2 and both rooms.
+# A hard owner kill is recovered by the guardian, including Q2 and five rooms.
 start_case hard-kill normal sleep
-send_room 0 room.q2.a q2.room-a
-send_room 1 room.q2.b q2.room-b
-wait_file "$CASE/mark.legacy-Q2_ROOM_A.pid"
-wait_file "$CASE/mark.legacy-Q2_ROOM_B.pid"
+hard_rooms=(a b c d e)
+for index in "${!hard_rooms[@]}"; do
+  room=${hard_rooms[$index]}
+  send_room "$index" "room.q2.$room" "q2.room-$room"
+  wait_file "$CASE/mark.legacy-Q2_ROOM_${room^^}.pid"
+done
+wait_source_count 5
 hard_q2_pid=$(<"$CASE/mark.q2-pid")
 hard_wine_pid=$(<"$CASE/mark.wine-pid")
-hard_a_pid=$(<"$CASE/mark.legacy-Q2_ROOM_A.pid")
-hard_b_pid=$(<"$CASE/mark.legacy-Q2_ROOM_B.pid")
+hard_gateway_pids=()
+for letter in A B C D E; do hard_gateway_pids+=("$(<"$CASE/mark.legacy-Q2_ROOM_${letter}.pid")"); done
 kill -KILL "$OWNER"
 set +e
 wait "$OWNER"
@@ -213,7 +220,7 @@ for _ in $(seq 1 200); do
   sleep 0.025
 done
 ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-for pid in "$hard_q2_pid" "$hard_wine_pid" "$hard_a_pid" "$hard_b_pid"; do
+for pid in "$hard_q2_pid" "$hard_wine_pid" "${hard_gateway_pids[@]}"; do
   ! kill -0 "$pid" 2>/dev/null
 done
 
@@ -337,9 +344,32 @@ for _ in $(seq 1 160); do [ "$(<"$CASE/mark.legacy-attempts")" -gt "$b_attempts"
 wait_source_count 1
 stop_case 143
 
+# A dedicated binding gets exactly two recovery starts after ROOM_CLOSED.
+start_case dedicated-recovery 'room.q2ded.server=room-close-after-ack' sleep-no-probe
+send_room 0 room.q2ded.server room.q2ded.server
+wait_file "$CASE/mark.legacy-attempts"
+for expected in 2 3; do
+  for _ in $(seq 1 160); do
+    [ "$(<"$CASE/mark.legacy-attempts")" -ge "$((expected - 1))" ] &&
+      [ "$(grep -Fc 'reason=room-closed' "$CASE/output")" -ge "$((expected - 1))" ] && break
+    sleep 0.025
+  done
+  send_room 0 room.q2ded.server room.q2ded.server
+  for _ in $(seq 1 160); do [ "$(<"$CASE/mark.legacy-attempts")" -ge "$expected" ] && break; sleep 0.025; done
+  [ "$(<"$CASE/mark.legacy-attempts")" = "$expected" ]
+done
+for _ in $(seq 1 160); do
+  [ "$(grep -Fc 'reason=room-closed' "$CASE/output")" -ge 3 ] && break
+  sleep 0.025
+done
+send_room 0 room.q2ded.server room.q2ded.server
+sleep 0.1
+[ "$(<"$CASE/mark.legacy-attempts")" = 3 ]
+stop_case 143
+
 # Malformed framing, oversized input, and EOF after partial input are fatal.
 start_case malformed
-printf '2 -
+printf '5 -
 ' >&$WRITER
 exec {WRITER}>&-
 set +e

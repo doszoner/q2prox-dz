@@ -129,7 +129,7 @@ q2dz::Result<Options> parse_options(int argc, char** argv) {
     return q2dz::Result<Options>::ok(std::move(out));
 }
 
-constexpr std::size_t kHubMaxRooms = 2;
+constexpr std::size_t kHubMaxRooms = 5;
 constexpr std::size_t kHubMaxLine = 256U * 1024U;
 
 struct SlotCommand {
@@ -192,7 +192,8 @@ q2dz::Result<SlotCommand> parse_slot_command(std::string_view line) {
     if (line.empty() || line.size() + 1U > kHubMaxLine) {
         return q2dz::Result<SlotCommand>::fail("hub command line exceeds 256 KiB or is empty");
     }
-    if (!valid_utf8(line) || line.size() < 3U || (line[0] != '0' && line[0] != '1') || line[1] != ' ') {
+    if (!valid_utf8(line) || line.size() < 3U || line[0] < '0' ||
+        line[0] >= static_cast<char>('0' + kHubMaxRooms) || line[1] != ' ') {
         return q2dz::Result<SlotCommand>::fail("hub command framing is invalid");
     }
     SlotCommand command;
@@ -839,9 +840,14 @@ struct LiveGateway {
 struct LiveSlot {
     std::string room_id;
     unsigned post_ready_failures = 0;
+    unsigned dedicated_restarts = 0;
     bool tombstone = false;
     std::optional<LiveGateway> gateway;
 };
+
+bool is_dedicated_room(std::string_view room_id) {
+    return room_id.starts_with("room.q2ded.");
+}
 
 void stop_live_gateway(LiveGateway& gateway,
                        const Options& options,
@@ -903,7 +909,9 @@ void mark_live_gateway_failure(LiveSlot& slot,
     const bool was_ready = slot.gateway && slot.gateway->ready;
     unpublish_live_gateway(slot, source, slots);
     remove_live_gateway(slot, options, guardian, reason);
-    if (room_closed || !was_ready || slot.post_ready_failures != 0) {
+    if (is_dedicated_room(slot.room_id)) {
+        slot.tombstone = slot.dedicated_restarts >= 2;
+    } else if (room_closed || !was_ready || slot.post_ready_failures != 0) {
         slot.tombstone = true;
     } else {
         slot.post_ready_failures = 1;
@@ -958,6 +966,7 @@ q2dz::Result<void> process_live_command(SlotCommand& command,
         remove_live_gateway(slot, options, guardian, "slot-cleared");
         slot.room_id.clear();
         slot.post_ready_failures = 0;
+        slot.dedicated_restarts = 0;
         slot.tombstone = false;
         publish_live_source(source, slots);
         clear_slot_command(command);
@@ -983,6 +992,7 @@ q2dz::Result<void> process_live_command(SlotCommand& command,
         remove_live_gateway(slot, options, guardian, "slot-replaced");
         slot.room_id = requested_id;
         slot.post_ready_failures = 0;
+        slot.dedicated_restarts = 0;
         slot.tombstone = false;
     }
     if (!semantic) {
@@ -991,12 +1001,13 @@ q2dz::Result<void> process_live_command(SlotCommand& command,
         publish_live_source(source, slots);
         return q2dz::Result<void>::ok();
     }
+    if (same_room && is_dedicated_room(slot.room_id)) ++slot.dedicated_restarts;
     auto started = start_live_gateway(slot, gateway, legacy, adapter, session_dir, session_id,
                                       options, guardian, *command.config);
     q2dz::secure_clear(*command.config);
     if (!started) {
         if (started.error().message == "guardian control pipe failed") return started;
-        slot.tombstone = true;
+        slot.tombstone = !is_dedicated_room(slot.room_id) || slot.dedicated_restarts >= 2;
     }
     publish_live_source(source, slots);
     return q2dz::Result<void>::ok();

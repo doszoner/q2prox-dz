@@ -33,6 +33,15 @@ static void test_json() {
     assert(!room.value().ordered);
     assert(room.value().map == "q2dm1");
     assert(q2dz::json::stringify(room.value().ice_servers).find("stun:example.invalid") != std::string::npos);
+    auto dedicated = q2dz::json::parse(R"({"alias":"room.q2ded.example.server","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"q2dm1","game":"3zb2"})");
+    assert(dedicated);
+    auto dedicated_room = q2dz::json::extract_room_config(dedicated.value());
+    assert(dedicated_room);
+    assert(dedicated_room.value().alias == "room.q2ded.example.server");
+    auto empty_dedicated = q2dz::json::parse(R"({"alias":"room.q2ded.","iceServers":[{}]})");
+    assert(empty_dedicated && !q2dz::json::extract_room_config(empty_dedicated.value()));
+    auto empty_q2 = q2dz::json::parse(R"({"alias":"q2.","iceServers":[{}]})");
+    assert(empty_q2 && !q2dz::json::extract_room_config(empty_q2.value()));
     assert(!q2dz::json::parse("{\"a\":1,\"a\":2}"));
     assert(!q2dz::json::parse("[1,]"));
     auto ordered = q2dz::json::parse(R"({"alias":"q2.demo","iceServers":[{}],"ordered":true})");

@@ -310,7 +310,9 @@ const Value* find_first(const Value& root,
 }
 
 static bool safe_alias(std::string_view alias) {
-    if (alias.size() < 4 || alias.size() > 255 || !alias.starts_with("q2.")) return false;
+    const bool q2 = alias.size() > 3 && alias.starts_with("q2.");
+    const bool q2ded = alias.size() > 11 && alias.starts_with("room.q2ded.");
+    if (alias.size() > 255 || !(q2 || q2ded)) return false;
     for (const char raw : alias) {
         const auto c = static_cast<unsigned char>(raw);
         if (!(std::isalnum(c) || c == '.' || c == '-' || c == '_')) return false;
@@ -322,7 +324,7 @@ Result<RoomConfig> extract_room_config(const Value& root) {
     RoomConfig out;
     const auto* alias = find_first(root, {{"alias"}, {"roomAlias"}, {"room", "alias"}, {"net", "alias"}});
     if (!alias || !alias->as_string() || !safe_alias(*alias->as_string())) {
-        return Result<RoomConfig>::fail("room JSON must contain a safe q2.* alias");
+        return Result<RoomConfig>::fail("room JSON must contain a safe q2.* or room.q2ded.* alias");
     }
     out.alias = *alias->as_string();
 
