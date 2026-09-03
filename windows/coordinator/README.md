@@ -4,7 +4,7 @@ This directory closes the process-lifecycle gap identified by the Windows runtim
 
 ## Implemented
 
-- one hub session containing up to two independent rooms;
+- one hub session containing up to five independent rooms;
 - direct child launch without shell expansion;
 - one root Windows Job Object for hard session cleanup and one nested Job per
   gateway, all with `KILL_ON_JOB_CLOSE`;
@@ -38,7 +38,7 @@ The exact tested WebView2 gateway must implement `MANAGED-GATEWAY-PROTOCOL.md`. 
 
 ## Hub invocation
 
-A launcher/catalog component writes one or two fresh room JSON objects to stdin,
+A launcher/catalog component writes up to five fresh room JSON objects to stdin,
 one object per non-empty line:
 
 ```powershell
@@ -51,3 +51,7 @@ The coordinator itself has no room picker and no direct `+connect` mode. The
 user opens Q2PRO-X `Join online` → `Custom`; Q2PRO-X owns room selection. The old
 single-room direct-connect behavior is retained only in historical release
 artifacts, not in the current executable.
+
+Legacy `q2` rooms keep the existing tombstone policy. A `room.q2ded.*` binding
+may start twice more after failure or `ROOM_CLOSED`; successful readiness does
+not reset this budget. Closing one room never closes Q2PRO-X or sibling rooms.

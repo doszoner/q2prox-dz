@@ -40,7 +40,7 @@ constexpr int kInternalFailure = 2;
 constexpr int kProtocolFailure = 13;
 constexpr int kCleanupFailure = 14;
 constexpr int kQ2Failure = 74;
-constexpr std::size_t kHubMaxRooms = 2;
+constexpr std::size_t kHubMaxRooms = 5;
 constexpr std::size_t kHubMaxLineBytes = 256U * 1024U;
 constexpr std::size_t kHubMaxQueuedCommands = 64;
 constexpr std::size_t kHubCommandsPerCycle = 1;
@@ -195,7 +195,8 @@ bool parse_slot_line(std::string_view line, SlotCommand& command) {
     if (line.empty() || line.size() + 1U > kHubMaxLineBytes) {
         return false;
     }
-    if (!valid_utf8(line) || line.size() < 3U || (line[0] != '0' && line[0] != '1') || line[1] != ' ') {
+    if (!valid_utf8(line) || line.size() < 3U || line[0] < '0' ||
+        line[0] >= static_cast<char>('0' + kHubMaxRooms) || line[1] != ' ') {
         return false;
     }
     command.slot = static_cast<std::size_t>(line[0] - '0');
@@ -771,10 +772,15 @@ void stop_hub_gateway(HubGateway& gateway, DWORD graceful_ms) noexcept {
 struct LiveSlot {
     std::string room_id;
     unsigned post_ready_failures = 0;
+    unsigned dedicated_restarts = 0;
     bool tombstone = false;
     std::uint64_t generation = 0;
     std::unique_ptr<HubGateway> gateway;
 };
+
+bool is_dedicated_room(std::string_view room_id) {
+    return room_id.starts_with("room.q2ded.");
+}
 
 std::vector<q2dz::LoopbackEndpoint> ready_endpoints(const std::array<LiveSlot, kHubMaxRooms>& slots) {
     std::vector<q2dz::LoopbackEndpoint> result;
@@ -867,7 +873,9 @@ void mark_slot_failure(LiveSlot& slot,
     const bool was_ready = slot.gateway && slot.gateway->ready;
     unpublish_slot_gateway(slot, source, slots);
     remove_slot_gateway(slot, graceful_ms);
-    if (room_closed || !was_ready || slot.post_ready_failures != 0) {
+    if (is_dedicated_room(slot.room_id)) {
+        slot.tombstone = slot.dedicated_restarts >= 2;
+    } else if (room_closed || !was_ready || slot.post_ready_failures != 0) {
         slot.tombstone = true;
     } else {
         slot.post_ready_failures = 1;
@@ -964,6 +972,7 @@ void process_slot_command(SlotCommand& command,
         remove_slot_gateway(slot, options.graceful_ms);
         slot.room_id.clear();
         slot.post_ready_failures = 0;
+        slot.dedicated_restarts = 0;
         slot.tombstone = false;
         publish_source(source, slots);
         return;
@@ -980,6 +989,7 @@ void process_slot_command(SlotCommand& command,
         remove_slot_gateway(slot, options.graceful_ms);
         slot.room_id = requested;
         slot.post_ready_failures = 0;
+        slot.dedicated_restarts = 0;
         slot.tombstone = false;
     }
     if (!command.config) {
@@ -987,13 +997,14 @@ void process_slot_command(SlotCommand& command,
         publish_source(source, slots);
         return;
     }
+    if (same_room && is_dedicated_room(slot.room_id)) ++slot.dedicated_restarts;
     try {
         if (!start_slot_gateway(slot, command.slot, root_job, options.ready_ms, options.graceful_ms,
                                 gateway, session, *command.config)) {
-            slot.tombstone = true;
+            slot.tombstone = !is_dedicated_room(slot.room_id) || slot.dedicated_restarts >= 2;
         }
     } catch (...) {
-        slot.tombstone = true;
+        slot.tombstone = !is_dedicated_room(slot.room_id) || slot.dedicated_restarts >= 2;
     }
     q2dz::win::secure_clear(*command.config);
     publish_source(source, slots);

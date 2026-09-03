@@ -156,6 +156,8 @@ function Assert-CoordinatorInvariants {
   if ($sourceText -notmatch 'control\.drain\(kHubCommandsPerCycle') {
     throw 'control command drain is not bounded per cycle'
   }
+  if ($sourceText -notmatch 'kHubMaxRooms = 5') { throw 'coordinator must accept five room slots' }
+  if ($sourceText -notmatch 'dedicated_restarts >= 2') { throw 'dedicated recovery budget is missing' }
   if ($sourceText -match 'events\.finished') { throw 'Queue.finished must not be read without its mutex' }
   Write-Host 'PASS coordinator-source-invariants'
 }
@@ -177,10 +179,43 @@ try {
   if ([int](Get-Content (Join-Path $case.Dir 'gateway-room-a.pid')) -ne $roomAPid) { throw 'heartbeat restarted room A' }
   Send-Command $case.Process ("1 room-b " + (Room-Json 'room-b'))
   if (-not (Wait-Path (Join-Path $case.Dir 'gateway-room-b.pid'))) { throw 'room B did not start' }
-  if (-not (Wait-SourceCount $source 2)) { throw 'source did not publish room B' }
+  foreach ($index in 2..4) {
+    $id = "room-$index"
+    Send-Command $case.Process ("$index $id " + (Room-Json $id))
+    if (-not (Wait-Path (Join-Path $case.Dir "gateway-$id.pid"))) { throw "room $index did not start" }
+  }
+  if (-not (Wait-SourceCount $source 5)) { throw 'source did not publish five rooms' }
   Send-Command $case.Process '0 -'
-  if (-not (Wait-SourceCount $source 1)) { throw 'source did not remove room A' }
+  if (-not (Wait-SourceCount $source 4)) { throw 'source did not remove room A' }
   if ([int](Get-Content (Marker $case.Dir 'q2.pid')) -ne $q2Pid) { throw 'slot update restarted Q2' }
+  Stop-Case $case
+
+  # A dedicated binding gets exactly two recovery starts after ROOM_CLOSED.
+  $case = Start-Case 'dedicated-recovery' 'normal' 'normal' 'long-running' 'room-close-after-ready'
+  if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw 'dedicated recovery did not start Q2' }
+  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $dedicatedId = 'room.q2ded.server'
+  $pidPath = Join-Path $case.Dir "gateway-$dedicatedId.pid"
+  Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
+  if (-not (Wait-Path $pidPath)) { throw 'dedicated initial gateway did not start' }
+  $previousPid = [int](Get-Content $pidPath)
+  foreach ($recovery in 1..2) {
+    if (-not (Wait-SourceCount $source 0)) { throw "dedicated attempt $recovery did not close" }
+    Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
+    $deadline = [Environment]::TickCount + 10000
+    do {
+      $currentPid = [int](Get-Content $pidPath)
+      if ($currentPid -ne $previousPid) { break }
+      Start-Sleep -Milliseconds 50
+    } while ([Environment]::TickCount -lt $deadline)
+    if ($currentPid -eq $previousPid) { throw "dedicated recovery $recovery did not start" }
+    $previousPid = $currentPid
+  }
+  if (-not (Wait-SourceCount $source 0)) { throw 'dedicated final attempt did not close' }
+  Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
+  Start-Sleep -Milliseconds 500
+  if ([int](Get-Content $pidPath) -ne $previousPid) { throw 'tombstoned dedicated restarted' }
+  Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'dedicated recovery Q2'
   Stop-Case $case
 
   # A burst of slot replacements must not starve a concurrently exiting Q2.
@@ -297,8 +332,14 @@ try {
   # Hard termination of the coordinator is covered by the inherited cleanup guardian.
   $case = Start-Case 'coordinator-hard-kill'
   if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw 'hard-kill did not start Q2' }
-  Send-Command $case.Process ("0 room-a " + (Room-Json 'room-a'))
-  if (-not (Wait-Path (Join-Path $case.Dir 'gateway-room-a.pid'))) { throw 'hard-kill did not start room A' }
+  foreach ($index in 0..4) {
+    $id = "hard-$index"
+    Send-Command $case.Process ("$index $id " + (Room-Json $id))
+    if (-not (Wait-Path (Join-Path $case.Dir "gateway-$id.pid"))) { throw "hard-kill did not start room $index" }
+  }
+  if (-not (Wait-SourceCount (Get-Content (Marker $case.Dir 'q2-source-url')) 5)) {
+    throw 'hard-kill did not publish five rooms'
+  }
   $hardSessions = Join-Path $case.Dir 'sessions'
   if (-not (Wait-Path $hardSessions)) { throw 'hard-kill did not create session root' }
   $hardSession = @(Get-ChildItem -LiteralPath $hardSessions -Directory -ErrorAction Stop)
@@ -317,7 +358,7 @@ try {
 
   # Malformed command and partial EOF are protocol failures.
   foreach ($item in @(
-    @{ Name = 'malformed'; Payload = '2 -';
+    @{ Name = 'malformed'; Payload = '5 -';
       Expected = 13 },
     @{ Name = 'partial'; Payload = '0 room-partial {';
       Expected = 13 },
