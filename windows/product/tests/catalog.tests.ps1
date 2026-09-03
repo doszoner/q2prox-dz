@@ -307,6 +307,12 @@ Assert-Equal $room.room $oneMiss[3].RoomId 'one successful missing poll retains 
 Assert-Equal 1 $oneMiss[3].Misses 'one successful missing poll increments misses'
 $twoMisses = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 1)) -Rows @() -MakeConfig $makeConfig
 Assert-Equal '' $twoMisses[3].RoomId 'two successful missing polls free a slot'
+$missingDedicated = Update-Q2DzHubSlots -Slots @(& $q2Slots $null $null (& $slot 'room.q2ded.server' 'old' 0 'q2dm1')) `
+  -Rows @() -MakeConfig $makeConfig
+Assert-Equal 'room.q2ded.server' $missingDedicated[0].RoomId 'one missing poll retains dedicated slot'
+Assert-Equal $false $missingDedicated[0].Send 'missing dedicated does not send stale recovery config'
+$missingDedicatedAgain = Update-Q2DzHubSlots -Slots $missingDedicated -Rows @() -MakeConfig $makeConfig
+Assert-Equal '' $missingDedicatedAgain[0].RoomId 'two missing polls clear dedicated slot'
 
 $fullRoom = $room | Select-Object *
 $fullRoom.players = $fullRoom.createSettings.maxPlayers

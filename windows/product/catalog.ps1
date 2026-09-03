@@ -450,7 +450,8 @@ function Update-Q2DzHubSlots {
         $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) 0 $savedMap
       }
     } elseif ([int]$slot.Misses -lt 1) {
-      $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) ([int]$slot.Misses + 1) ([string]$slot.MapName)
+      $send = (Get-Q2DzSlotKind $slotIndex) -cne 'q2ded'
+      $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) ([int]$slot.Misses + 1) ([string]$slot.MapName) $send
     } else {
       $updated += New-Q2DzHubSlot
     }

@@ -125,6 +125,14 @@ class LauncherTests(unittest.TestCase):
         updated = launch.reconcile_slots(slots, [], lambda _row: "unused")
         self.assertEqual(updated[3], launch.HubSlot("room.a", "A", 1))
 
+    def test_missing_dedicated_is_held_once_without_stale_recovery(self):
+        current = slots5(dedicated=launch.HubSlot("room.q2ded.server", "old", 0, "q2dm1"))
+        first = launch.reconcile_slots(current, [], lambda _row: "unused")
+        self.assertEqual(first[0].room_id, current[0].room_id)
+        self.assertFalse(first[0].send)
+        second = launch.reconcile_slots(first, [], lambda _row: "unused")
+        self.assertEqual(second[0], launch.HubSlot())
+
     def test_ready_rooms_excludes_not_ready_rooms(self):
         not_ready = room("room.q2.not-ready.1", "1")
         not_ready["roomReady"] = False

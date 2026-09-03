@@ -463,7 +463,10 @@ def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
             else:
                 updated.append(HubSlot(slot.room_id, slot.config, 0, slot.map_name or map_name))
         elif slot.misses < 1:
-            updated.append(HubSlot(slot.room_id, slot.config, slot.misses + 1, slot.map_name))
+            updated.append(HubSlot(
+                slot.room_id, slot.config, slot.misses + 1, slot.map_name,
+                send=_slot_kind(index) != "q2ded",
+            ))
         else:
             updated.append(HubSlot())
 
