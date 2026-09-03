@@ -81,9 +81,34 @@ def room(room_id="room.q2.abc.123", owner="123", map_name="q2dm1"):
     }
 
 
+def dedicated_room(room_id="room.q2ded.server.1", map_name="q2dm1"):
+    return {
+        "room": room_id,
+        "owner": 0,
+        "players": 1,
+        "createSettings": {
+            "prefix": "q2ded",
+            "name": "Server",
+            "map": map_name,
+            "maxPlayers": 16,
+        },
+    }
+
+
+def slots5(q2a=None, q2b=None, dedicated=None):
+    slots = [launch.HubSlot() for _ in range(launch.HUB_MAX_ROOMS)]
+    if dedicated:
+        slots[0] = dedicated
+    if q2a:
+        slots[3] = q2a
+    if q2b:
+        slots[4] = q2b
+    return slots
+
+
 class LauncherTests(unittest.TestCase):
     def test_live_slots_keep_existing_room_and_fill_free_slot(self):
-        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         rows = [room("room.a", "1"), room("room.b", "2")]
 
         def make_config(row):
@@ -91,14 +116,14 @@ class LauncherTests(unittest.TestCase):
 
         updated = launch.reconcile_slots(slots, rows, make_config)
         self.assertEqual(
-            [(slot.room_id, slot.config) for slot in updated],
+            [(slot.room_id, slot.config) for slot in updated[3:]],
             [("room.a", "A"), ("room.b", "B")],
         )
 
     def test_one_missing_poll_does_not_remove_room(self):
-        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         updated = launch.reconcile_slots(slots, [], lambda _row: "unused")
-        self.assertEqual(updated[0], launch.HubSlot("room.a", "A", 1))
+        self.assertEqual(updated[3], launch.HubSlot("room.a", "A", 1))
 
     def test_ready_rooms_excludes_not_ready_rooms(self):
         not_ready = room("room.q2.not-ready.1", "1")
@@ -109,11 +134,11 @@ class LauncherTests(unittest.TestCase):
         not_ready = room("room.q2.not-ready.1", "1")
         not_ready["roomReady"] = False
         rows = launch.ready_rooms({"rooms": [not_ready]})
-        slots = [launch.HubSlot("room.q2.not-ready.1", "A", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.q2.not-ready.1", "A", 0))
         first = launch.reconcile_slots(slots, rows, lambda _row: "unused")
         second = launch.reconcile_slots(first, rows, lambda _row: "unused")
-        self.assertEqual(first[0], launch.HubSlot("room.q2.not-ready.1", "A", 1))
-        self.assertEqual(second[0], launch.HubSlot())
+        self.assertEqual(first[3], launch.HubSlot("room.q2.not-ready.1", "A", 1))
+        self.assertEqual(second[3], launch.HubSlot())
 
     def test_catalog_validation_checks_not_ready_q2_rows_and_duplicates(self):
         not_ready = room("room.q2.not-ready.1", "1")
@@ -127,12 +152,12 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(launch.validate_room_payload({"rooms": [not_ready, duplicate]}))
 
     def test_two_missing_polls_free_slot(self):
-        slots = [launch.HubSlot("room.a", "A", 1), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.a", "A", 1))
         updated = launch.reconcile_slots(slots, [], lambda _row: "unused")
-        self.assertEqual(updated[0], launch.HubSlot())
+        self.assertEqual(updated[3], launch.HubSlot())
 
     def test_catalog_failure_sends_no_commands_and_preserves_slots(self):
-        existing_slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        existing_slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         writer = mock.Mock()
 
         def fetch_raises():
@@ -145,7 +170,7 @@ class LauncherTests(unittest.TestCase):
         writer.assert_not_called()
 
     def test_successful_poll_writes_heartbeat_even_when_slots_do_not_change(self):
-        existing_slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        existing_slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         writer = mock.Mock()
         self.assertEqual(
             launch.poll_once(existing_slots, lambda: existing_slots, writer),
@@ -154,23 +179,23 @@ class LauncherTests(unittest.TestCase):
         writer.assert_called_once_with(existing_slots)
 
     def test_retained_room_is_not_removed_when_it_becomes_full(self):
-        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         full = room("room.a", "1")
         full["players"] = full["createSettings"]["maxPlayers"]
         updated = launch.reconcile_slots(slots, [full], lambda _row: "unused")
-        self.assertEqual(updated[0], launch.HubSlot("room.a", "A", 0))
+        self.assertEqual(updated[3], launch.HubSlot("room.a", "A", 0, "q2dm1"))
 
     def test_new_full_room_does_not_fill_free_slot(self):
         full = room("room.b", "2")
         full["players"] = full["createSettings"]["maxPlayers"]
-        slots = [launch.HubSlot(), launch.HubSlot()]
+        slots = slots5()
         self.assertEqual(
             launch.reconcile_slots(slots, [full], lambda _row: "unused"),
-            slots,
+            slots5(),
         )
 
     def test_three_rooms_fill_only_two_slots_without_evicting_retained_room(self):
-        slots = [launch.HubSlot("room.b", "B", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.b", "B", 0))
         rows = [room("room.a", "1"), room("room.b", "2"), room("room.c", "3")]
         updated = launch.reconcile_slots(
             slots,
@@ -178,13 +203,15 @@ class LauncherTests(unittest.TestCase):
             lambda row: row["room"].split(".")[-1].upper(),
         )
         self.assertEqual(
-            [(slot.room_id, slot.config) for slot in updated],
+            [(slot.room_id, slot.config) for slot in updated[3:]],
             [("room.b", "B"), ("room.a", "A")],
         )
 
     def test_slot_commands_are_independent_and_bounded(self):
         self.assertEqual(launch.encode_slot(0, launch.HubSlot()), "0 -\n")
-        self.assertEqual(launch.encode_slot(1, launch.HubSlot()), "1 -\n")
+        self.assertEqual(launch.encode_slot(4, launch.HubSlot()), "4 -\n")
+        with self.assertRaises(launch.LaunchError):
+            launch.encode_slot(5, launch.HubSlot())
         self.assertEqual(
             launch.encode_slot(0, launch.HubSlot("room.a", "{\"map\":\"q2dm1\"}")),
             '0 room.a {"map":"q2dm1"}\n',
@@ -196,7 +223,7 @@ class LauncherTests(unittest.TestCase):
             )
 
     def test_oversized_new_config_does_not_disturb_retained_room(self):
-        slots = [launch.HubSlot("room.a", "A", 0), launch.HubSlot()]
+        slots = slots5(q2a=launch.HubSlot("room.a", "A", 0))
         rows = [room("room.a", "1"), room("room.b", "2")]
 
         def make_config(row):
@@ -204,7 +231,7 @@ class LauncherTests(unittest.TestCase):
 
         self.assertEqual(
             launch.reconcile_slots(slots, rows, make_config),
-            [launch.HubSlot("room.a", "A", 0), launch.HubSlot()],
+            slots5(q2a=launch.HubSlot("room.a", "A", 0, "q2dm1")),
         )
 
     def test_refresh_does_not_fetch_rtc_or_check_content_without_free_slot(self):
@@ -219,7 +246,10 @@ class LauncherTests(unittest.TestCase):
             endpoints.append(endpoint)
             return replies[endpoint]
 
-        slots = [launch.HubSlot("room.q2.a.1", "A"), launch.HubSlot("room.q2.b.2", "B")]
+        slots = slots5(
+            q2a=launch.HubSlot("room.q2.a.1", "A", 0, "q2dm1"),
+            q2b=launch.HubSlot("room.q2.b.2", "B", 0, "q2dm1"),
+        )
         with mock.patch.object(launch, "content_ready") as checked:
             updated = launch.refresh_slots(slots, "/games/Q2PRO-X.exe", fetch=fetch)
         self.assertEqual(updated, slots)
@@ -239,10 +269,10 @@ class LauncherTests(unittest.TestCase):
             endpoints.append(endpoint)
             return replies[endpoint]
 
-        slots = [launch.HubSlot(), launch.HubSlot()]
+        slots = slots5()
         with mock.patch.object(launch, "content_ready", return_value=True) as checked:
             updated = launch.refresh_slots(slots, "/games/Q2PRO-X.exe", fetch=fetch)
-        self.assertEqual([slot.room_id for slot in updated], [selected["room"], ""])
+        self.assertEqual([slot.room_id for slot in updated[3:]], [selected["room"], ""])
         self.assertEqual(
             endpoints,
             [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT, launch.RTC_ENDPOINT],
@@ -469,6 +499,64 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(launch.LaunchError):
             launch.make_room_config(selected, {"aliases": []}, rtc)
 
+    def test_dedicated_room_uses_exact_alias_and_all_deduplicated_ice(self):
+        selected = dedicated_room()
+        duplicate = {"urls": ["stun:shared.example.invalid"]}
+        rtc = [
+            {"domain": "a.example.invalid", "iceservers": [duplicate, {"urls": ["turn:a.example.invalid"], "username": "u", "credential": "c"}]},
+            {"domain": "b.example.invalid", "iceservers": [dict(duplicate), {"urls": ["stun:b.example.invalid"]}]},
+        ]
+        config = launch.make_room_config(selected, {"aliases": [selected["room"]]}, rtc)
+        self.assertEqual(config["alias"], selected["room"])
+        self.assertEqual(config["iceServers"], [rtc[0]["iceservers"][0], rtc[0]["iceservers"][1], rtc[1]["iceservers"][1]])
+        self.assertFalse(config["ordered"])
+        self.assertEqual(config["game"], "3zb2")
+
+    def test_dedicated_slots_are_isolated_from_q2_slots(self):
+        rows = [dedicated_room(f"room.q2ded.server.{i}") for i in range(4)] + [
+            room(f"room.q2.client.{i}", str(i)) for i in range(3)
+        ]
+        updated = launch.reconcile_slots(
+            slots5(), rows, lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]}
+        )
+        self.assertEqual([slot.room_id for slot in updated[:3]], [row["room"] for row in rows[:3]])
+        self.assertEqual([slot.room_id for slot in updated[3:]], [row["room"] for row in rows[4:6]])
+
+    def test_retained_dedicated_refreshes_config_and_rechecks_changed_map(self):
+        selected = dedicated_room(map_name="q2dm2")
+        old = launch.HubSlot(selected["room"], '{"map":"q2dm1"}', 0, "q2dm1")
+        checked = mock.Mock(return_value=True)
+        updated = launch.reconcile_slots(
+            slots5(dedicated=old),
+            [selected],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+            checked,
+        )
+        checked.assert_called_once_with(selected)
+        self.assertEqual(updated[0].map_name, "q2dm2")
+        self.assertIn('"q2dm2"', updated[0].config)
+
+        checked.return_value = False
+        removed = launch.reconcile_slots(slots5(dedicated=old), [selected], lambda _row: "unused", checked)
+        self.assertEqual(removed[0], launch.HubSlot())
+
+    def test_failed_dedicated_rtc_refresh_preserves_live_slots_and_sends_nothing(self):
+        selected = dedicated_room()
+        current = slots5(dedicated=launch.HubSlot(selected["room"], "old", 0, "q2dm1"))
+        replies = {
+            launch.ROOM_ENDPOINT: {"rooms": [selected]},
+            launch.LOOKUP_ENDPOINT: {"aliases": [selected["room"]]},
+            launch.RTC_ENDPOINT: [],
+        }
+        writer = mock.Mock()
+        result = launch.poll_once(
+            current,
+            lambda: launch.refresh_slots(current, "/games/Q2PRO-X.exe", fetch=lambda endpoint: replies[endpoint]),
+            writer,
+        )
+        self.assertEqual(result, current)
+        writer.assert_not_called()
+
     def test_room_config_rejects_alias_mismatch_hostname_and_ordered_rtc(self):
         selected = room()
         with self.assertRaises(launch.LaunchError):
@@ -542,7 +630,7 @@ class LauncherTests(unittest.TestCase):
         args, kwargs = calls[0]
         self.assertNotIn("+connect", args)
         self.assertNotIn("+connect", kwargs["process"].stdin.payload)
-        self.assertEqual(kwargs["process"].stdin.payload.count("\n"), 2)
+        self.assertEqual(kwargs["process"].stdin.payload.count("\n"), 5)
 
     def test_hub_command_keeps_room_data_out_of_argv(self):
         config = {
@@ -599,7 +687,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--legacy-gateway", args)
         self.assertEqual(args[args.index("--game"):args.index("--game") + 2], ["--game", "3zb2"])
         self.assertNotIn("secret", args)
-        line = kwargs["process"].stdin.payload.splitlines()[0]
+        line = kwargs["process"].stdin.payload.splitlines()[3]
         self.assertEqual(json.loads(line.split(" ", 2)[2])["iceServers"][0]["credential"], "secret")
         self.assertNotIn("shell", kwargs)
 
@@ -671,7 +759,7 @@ class LauncherTests(unittest.TestCase):
             processes.append(process)
             return process
 
-        slots = [launch.HubSlot(), launch.HubSlot()]
+        slots = slots5()
         rc = launch.run_hub(
             slots,
             "/games/Q2PRO-X.exe",
@@ -684,7 +772,10 @@ class LauncherTests(unittest.TestCase):
             poll_interval=0,
         )
         self.assertEqual(rc, 74)
-        self.assertEqual(processes[0].stdin.payload, "0 -\n1 -\n0 -\n1 -\n")
+        self.assertEqual(
+            processes[0].stdin.payload,
+            "0 -\n1 -\n2 -\n3 -\n4 -\n0 -\n1 -\n2 -\n3 -\n4 -\n",
+        )
 
     def test_hub_snapshot_takes_first_two_compatible_rooms_without_selection(self):
         rows = [room("room.q2.one.1", "1", "q2dm1"),
@@ -703,7 +794,7 @@ class LauncherTests(unittest.TestCase):
         with mock.patch.object(launch, "content_ready", return_value=False) as checked:
             with self.assertRaises(launch.LaunchError):
                 launch.make_hub_configs({"rooms": rows}, lookup, rtc, "/games/Q2PRO-X.exe")
-        self.assertEqual(checked.call_count, launch.HUB_MAX_CONTENT_CHECKS)
+        self.assertEqual(checked.call_count, launch.HUB_Q2_SLOTS * launch.HUB_CANDIDATES_PER_SLOT)
 
     def test_path_store_persists_only_q2_path(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as game_tmp:

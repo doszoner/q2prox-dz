@@ -74,7 +74,7 @@ function Write-Q2DzHubSlots {
     [Parameter(Mandatory = $true)]$Writer,
     [Parameter(Mandatory = $true)][object[]]$Slots
   )
-  if ($Slots.Count -ne 2) { throw 'hub requires exactly two slots' }
+  if ($Slots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
   try {
     for ($index = 0; $index -lt $Slots.Count; $index++) {
       $Writer.Write((ConvertTo-Q2DzHubCommand $index $Slots[$index]))
@@ -105,26 +105,36 @@ function New-Q2DzRoomConfig {
     [Parameter(Mandatory = $true)]$LookupPayload,
     [Parameter(Mandatory = $true)]$RtcPayload
   )
-  if (-not (Test-Q2DzRoomRow $Room) -or -not $Room.roomReady -or
+  if (-not (Test-Q2DzRoomRow $Room) -or ((Get-Q2DzRoomKind $Room) -ceq 'q2' -and -not $Room.roomReady) -or
       $Room.players -ge $Room.createSettings.maxPlayers) {
     throw 'The selected room is no longer available'
   }
   if (-not (Test-Q2DzAliasPayload $LookupPayload)) { throw 'alias lookup has an invalid schema' }
-  $alias = 'q2.{0}' -f ([string]$Room.owner)
+  $alias = Get-Q2DzRoomAlias $Room
   if ($LookupPayload.aliases -cnotcontains $alias) { throw 'selected room alias is no longer registered' }
   if (-not (Test-Q2DzRtcPayload $RtcPayload)) { throw 'RTC configuration has an invalid schema' }
-  $matches = @($RtcPayload | Where-Object { $_.domain -ceq $Room.rtcServer })
-  if ($matches.Count -ne 1) { throw 'fresh RTC configuration is unavailable' }
+  if ((Get-Q2DzRoomKind $Room) -ceq 'q2ded') {
+    $iceServers = @(Get-Q2DzDedicatedIceServers $RtcPayload)
+  } else {
+    $matches = @($RtcPayload | Where-Object { $_.domain -ceq $Room.rtcServer })
+    if ($matches.Count -ne 1) { throw 'fresh RTC configuration is unavailable' }
+    $iceServers = @($matches[0].iceservers)
+  }
   $config = [ordered]@{
     version = 1
     roomId = $Room.room
     alias = $alias
     ordered = $Q2DZ_ORDERED
-    iceServers = $matches[0].iceservers
+    iceServers = $iceServers
     map = $Room.createSettings.map
     game = $Q2DZ_GAME
   }
-  return ($config | ConvertTo-Json -Depth 8 -Compress)
+  $json = $config | ConvertTo-Json -Depth 8 -Compress
+  if ((Get-Q2DzRoomKind $Room) -ceq 'q2ded' -and
+      [Text.Encoding]::UTF8.GetByteCount($json) -gt $Q2DZ_MAX_GATEWAY_CONFIG_BYTES) {
+    throw 'dedicated room configuration exceeds 65535 bytes'
+  }
+  return $json
 }
 
 function Get-Q2DzLiveHubSlots {
@@ -139,7 +149,12 @@ function Get-Q2DzLiveHubSlots {
   $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
   $readyRows = @(Get-Q2DzReadyRooms $catalog)
   $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
-  $rtcState = [pscustomobject]@{ Fetched = $false; Rows = $null }
+  $hasDedicated = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -ceq 'q2ded' }).Count -gt 0
+  $rtcState = [pscustomobject]@{ Fetched = $hasDedicated; Rows = $null }
+  if ($hasDedicated) {
+    $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
+    Get-Q2DzDedicatedIceServers $rtcState.Rows | Out-Null
+  }
   $check = if ($RunContentCheck) { $RunContentCheck } else {
     {
       param($Path, $Map, $Root)
@@ -149,17 +164,18 @@ function Get-Q2DzLiveHubSlots {
   }
   $makeConfig = {
     param($row)
-    $root = Split-Path -Parent $Q2Path
-    if (-not (& $check $ContentCheckPath ([string]$row.createSettings.map) $root)) {
-      throw 'room map is not available locally'
-    }
     if (-not $rtcState.Fetched) {
       $rtcState.Fetched = $true
       $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
     }
     New-Q2DzRoomConfig -Room $row -LookupPayload $lookup -RtcPayload $rtcState.Rows
   }
-  return @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig)
+  $mapAvailable = {
+    param($row)
+    $root = Split-Path -Parent $Q2Path
+    return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
+  }
+  return @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable)
 }
 
 function Invoke-Q2DzHub {
@@ -172,7 +188,7 @@ function Invoke-Q2DzHub {
     [scriptblock]$Refresh = $null,
     [double]$PollIntervalSeconds = $HUB_POLL_SECONDS
   )
-  if ($InitialSlots.Count -ne 2) { throw 'hub requires exactly two slots' }
+  if ($InitialSlots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
   $owner = if ($StartCoordinator) {
     & $StartCoordinator $CoordinatorPath $CoordinatorArguments
   } else {
@@ -195,7 +211,7 @@ function Invoke-Q2DzHub {
       }
       try {
         $updated = @(& $refreshFn $slots)
-        if ($updated.Count -ne 2) { throw 'hub refresh returned an invalid slot count' }
+        if ($updated.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub refresh returned an invalid slot count' }
       } catch {
         $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
         continue
@@ -272,11 +288,11 @@ function Start-Q2DzLauncher {
     Set-Content -LiteralPath $q2PathFile -Value $q2 -Encoding UTF8
   }
 
-  $slots = @((New-Q2DzHubSlot), (New-Q2DzHubSlot))
+  $slots = @(1..$Q2DZ_HUB_MAX_ROOMS | ForEach-Object { New-Q2DzHubSlot })
   try {
     $slots = @(Get-Q2DzLiveHubSlots -Slots $slots -Q2Path $q2 -ContentCheckPath $contentCheck)
   } catch {
-    $slots = @((New-Q2DzHubSlot), (New-Q2DzHubSlot))
+    $slots = @(1..$Q2DZ_HUB_MAX_ROOMS | ForEach-Object { New-Q2DzHubSlot })
   }
   $refresh = {
     param($currentSlots)

@@ -253,8 +253,16 @@ $lookupPayload = [pscustomobject]@{ aliases = @('q2.1') }
 # checker is involved.  They describe the bounded state transitions before
 # the launcher starts using them.
 $slot = {
-  param([string]$RoomId = '', [string]$Config = '', [int]$Misses = 0)
-  [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses }
+  param([string]$RoomId = '', [string]$Config = '', [int]$Misses = 0, [string]$MapName = '')
+  New-Q2DzHubSlot $RoomId $Config $Misses $MapName
+}
+$q2Slots = {
+  param($First = $null, $Second = $null, $Dedicated = $null)
+  @(
+    $(if ($Dedicated) { $Dedicated } else { & $slot }), (& $slot), (& $slot),
+    $(if ($First) { $First } else { & $slot }),
+    $(if ($Second) { $Second } else { & $slot })
+  )
 }
 $roomB = [pscustomobject]@{
   room = 'room.q2.test.2'; owner = '2'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
@@ -271,39 +279,82 @@ $makeConfig = {
   if ($row.room -eq $room.room) { return 'A' }
   return 'B'
 }
-$planned = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows $readyRows -MakeConfig $makeConfig
-Assert-Equal $room.room $planned[0].RoomId 'existing room is retained'
-Assert-Equal 'A' $planned[0].Config 'existing room keeps its original config'
-Assert-Equal $roomB.room $planned[1].RoomId 'free slot is filled from ready rows'
-Assert-Equal 'B' $planned[1].Config 'new room receives its compact config'
+$planned = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows $readyRows -MakeConfig $makeConfig
+Assert-Equal $room.room $planned[3].RoomId 'existing room is retained'
+Assert-Equal 'A' $planned[3].Config 'existing room keeps its original config'
+Assert-Equal $roomB.room $planned[4].RoomId 'free slot is filled from ready rows'
+Assert-Equal 'B' $planned[4].Config 'new room receives its compact config'
 
-$oneMiss = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @() -MakeConfig $makeConfig
-Assert-Equal $room.room $oneMiss[0].RoomId 'one successful missing poll retains a room'
-Assert-Equal 1 $oneMiss[0].Misses 'one successful missing poll increments misses'
-$twoMisses = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 1), (& $slot)) -Rows @() -MakeConfig $makeConfig
-Assert-Equal '' $twoMisses[0].RoomId 'two successful missing polls free a slot'
+$oneMiss = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @() -MakeConfig $makeConfig
+Assert-Equal $room.room $oneMiss[3].RoomId 'one successful missing poll retains a room'
+Assert-Equal 1 $oneMiss[3].Misses 'one successful missing poll increments misses'
+$twoMisses = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 1)) -Rows @() -MakeConfig $makeConfig
+Assert-Equal '' $twoMisses[3].RoomId 'two successful missing polls free a slot'
 
 $fullRoom = $room | Select-Object *
 $fullRoom.players = $fullRoom.createSettings.maxPlayers
-$retainedFull = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @($fullRoom) -MakeConfig $makeConfig
-Assert-Equal $room.room $retainedFull[0].RoomId 'retained room is not removed when full'
-$newFull = Update-Q2DzHubSlots -Slots @((& $slot), (& $slot)) -Rows @($fullRoom) -MakeConfig $makeConfig
-Assert-Equal '' $newFull[0].RoomId 'new full room does not fill a free slot'
+$retainedFull = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @($fullRoom) -MakeConfig $makeConfig
+Assert-Equal $room.room $retainedFull[3].RoomId 'retained room is not removed when full'
+$newFull = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows @($fullRoom) -MakeConfig $makeConfig
+Assert-Equal '' $newFull[3].RoomId 'new full room does not fill a free slot'
 
 $oversizedConfig = { param($row) if ($row.room -eq $roomB.room) { return ('x' * (256KB)) }; return 'A' }
-$oversized = Update-Q2DzHubSlots -Slots @((& $slot $room.room 'A' 0), (& $slot)) -Rows @($room, $roomB) -MakeConfig $oversizedConfig
-Assert-Equal $room.room $oversized[0].RoomId 'oversized candidate does not disturb retained room'
-Assert-Equal '' $oversized[1].RoomId 'oversized candidate is skipped locally'
+$oversized = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @($room, $roomB) -MakeConfig $oversizedConfig
+Assert-Equal $room.room $oversized[3].RoomId 'oversized candidate does not disturb retained room'
+Assert-Equal '' $oversized[4].RoomId 'oversized candidate is skipped locally'
 $threeRows = @($room, $roomB, ($roomB | Select-Object *))
 $threeRows[2].room = 'room.q2.test.3'; $threeRows[2].owner = '3'
 $threeRows[2].createSettings.name = 'Third'
-$threeSlots = Update-Q2DzHubSlots -Slots @((& $slot), (& $slot)) -Rows $threeRows -MakeConfig { param($row) return $row.room }
+$threeSlots = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows $threeRows -MakeConfig { param($row) return $row.room }
 Assert-Equal 2 (@($threeSlots | Where-Object { $_.RoomId })).Count 'hub never admits more than two rooms'
 
 Assert-Equal "0 -`n" (ConvertTo-Q2DzHubCommand 0 (& $slot)) 'empty slot command is independent and newline terminated'
 Assert-Equal "1 -`n" (ConvertTo-Q2DzHubCommand 1 (& $slot)) 'second empty slot command is independent and newline terminated'
-Assert-Throws { ConvertTo-Q2DzHubCommand 2 (& $slot) } 'third hub slot is rejected'
+Assert-Equal "4 -`n" (ConvertTo-Q2DzHubCommand 4 (& $slot)) 'fifth empty slot is accepted'
+Assert-Throws { ConvertTo-Q2DzHubCommand 5 (& $slot) } 'sixth hub slot is rejected'
 Assert-Throws { ConvertTo-Q2DzHubCommand 0 (& $slot 'room.q2.large' ('x' * (256KB))) } 'oversized hub command is rejected'
+
+$dedicated = [pscustomobject]@{
+  room = 'room.q2ded.server.1'; owner = 0; players = 1
+  createSettings = [pscustomobject]@{ prefix = 'q2ded'; name = 'Server'; map = 'q2dm1'; maxPlayers = 16 }
+}
+$dedicatedLookup = [pscustomobject]@{ aliases = @($dedicated.room) }
+$dedicatedRtc = @(
+  [pscustomobject]@{ domain = 'a.example.invalid'; iceservers = @(
+    [pscustomobject]@{ urls = @('stun:shared.example.invalid') },
+    [pscustomobject]@{ urls = @('turn:a.example.invalid'); username = 'u'; credential = 'c' }
+  ) },
+  [pscustomobject]@{ domain = 'b.example.invalid'; iceservers = @(
+    [pscustomobject]@{ urls = @('stun:shared.example.invalid') },
+    [pscustomobject]@{ urls = @('stun:b.example.invalid') }
+  ) }
+)
+$dedicatedIce = @(Get-Q2DzDedicatedIceServers $dedicatedRtc)
+Assert-Equal $dedicated.room (Get-Q2DzRoomAlias $dedicated) 'dedicated room uses its exact room alias'
+Assert-Equal 3 $dedicatedIce.Count 'dedicated room flattens and stably deduplicates all RTC rows'
+Assert-Equal 'stun:shared.example.invalid' $dedicatedIce[0].urls[0] 'dedicated ICE order keeps the first occurrence'
+
+$dedicatedRows = @($dedicated)
+foreach ($number in 2..4) {
+  $copy = $dedicated | Select-Object *
+  $copy.room = "room.q2ded.server.$number"
+  $copy.createSettings = $dedicated.createSettings | Select-Object *
+  $copy.createSettings.name = "Server $number"
+  $dedicatedRows += $copy
+}
+$mixedPlan = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows @($dedicatedRows + @($room,$roomB)) `
+  -MakeConfig { param($row) return ($row.room | ConvertTo-Json -Compress) }
+Assert-Equal 3 @($mixedPlan[0..2] | Where-Object { $_.RoomId }).Count 'dedicated pool is capped at three slots'
+Assert-Equal 2 @($mixedPlan[3..4] | Where-Object { $_.RoomId }).Count 'legacy q2 pool keeps two slots'
+
+$oldDedicated = & $slot $dedicated.room '{"map":"q2dm0"}' 0 'q2dm0'
+$mapChecks = 0
+$changedMap = Update-Q2DzHubSlots -Slots @(& $q2Slots $null $null $oldDedicated) -Rows @($dedicated) `
+  -MakeConfig { param($row) return ('{"map":"' + $row.createSettings.map + '"}') } `
+  -MapAvailable { param($row) $script:mapChecks++; return $true }
+Assert-Equal 1 $mapChecks 'dedicated map change is checked once'
+Assert-Equal 'q2dm1' $changedMap[0].MapName 'dedicated map state is refreshed'
+Assert-True $changedMap[0].Config.Contains('q2dm1') 'dedicated config is refreshed without replacing the slot'
 
 $unsupportedProfileRoom = [pscustomobject]@{
   room = 'room.q2.unsupported-profile.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'

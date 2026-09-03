@@ -84,8 +84,27 @@ function New-FakeHubProcess {
 
 . (Join-Path $PSScriptRoot '..\q2dz-launch.ps1')
 
+$dedicatedRoom = [pscustomobject]@{
+  room = 'room.q2ded.server.1'; owner = 0; players = 1
+  createSettings = [pscustomobject]@{ prefix = 'q2ded'; name = 'Server'; map = 'q2dm1'; maxPlayers = 16 }
+}
+$dedicatedRtc = @(
+  [pscustomobject]@{ domain = 'a.example.invalid'; iceservers = @([pscustomobject]@{ urls = @('stun:shared.example.invalid') }) },
+  [pscustomobject]@{ domain = 'b.example.invalid'; iceservers = @(
+    [pscustomobject]@{ urls = @('stun:shared.example.invalid') },
+    [pscustomobject]@{ urls = @('stun:b.example.invalid') }
+  ) }
+)
+$dedicatedJson = New-Q2DzRoomConfig -Room $dedicatedRoom `
+  -LookupPayload ([pscustomobject]@{ aliases = @($dedicatedRoom.room) }) -RtcPayload $dedicatedRtc
+$dedicatedConfig = $dedicatedJson | ConvertFrom-Json
+Assert ($dedicatedConfig.alias -ceq $dedicatedRoom.room) 'dedicated config uses the exact room alias'
+Assert (@($dedicatedConfig.iceServers).Count -eq 2) 'dedicated config contains stable deduplicated ICE entries'
+Assert ($dedicatedConfig.game -ceq '3zb2' -and -not $dedicatedConfig.ordered) 'dedicated config keeps local game invariants'
+
 $initial = @(
-  (New-Q2DzHubSlot 'room.q2.a' '{"roomId":"room.q2.a"}')
+  (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot),
+  (New-Q2DzHubSlot 'room.q2.a' '{"roomId":"room.q2.a"}'),
   (New-Q2DzHubSlot)
 )
 
@@ -99,7 +118,8 @@ $refresh = {
   param($slots)
   $script:refreshes++
   return @(
-    (New-Q2DzHubSlot 'room.q2.a' $slots[0].Config)
+    (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot),
+    (New-Q2DzHubSlot 'room.q2.a' $slots[3].Config),
     (New-Q2DzHubSlot 'room.q2.b' '{"roomId":"room.q2.b"}')
   )
 }
@@ -109,11 +129,11 @@ Assert ($result -eq 0) 'normal coordinator exit must be returned'
 Assert ($refreshes -eq 1) 'one successful poll must be performed'
 Assert ($writer.Disposed) 'launcher cleanup must close coordinator stdin'
 $lines = $writer.Text.ToString().Split("`n", [StringSplitOptions]::RemoveEmptyEntries)
-Assert ($lines.Count -eq 4) "expected two initial and two heartbeat commands, got $($lines.Count)"
-Assert ($lines[0].StartsWith('0 room.q2.a ')) 'slot zero command is independent'
-Assert ($lines[1] -eq "1 -") 'empty slot command is independent'
-Assert ($lines[2].StartsWith('0 room.q2.a ')) 'heartbeat keeps slot zero'
-Assert ($lines[3].StartsWith('1 room.q2.b ')) 'heartbeat fills slot one'
+Assert ($lines.Count -eq 10) "expected five initial and five heartbeat commands, got $($lines.Count)"
+Assert ($lines[3].StartsWith('3 room.q2.a ')) 'legacy room uses slot three'
+Assert ($lines[4] -eq "4 -") 'fifth slot command is independent'
+Assert ($lines[8].StartsWith('3 room.q2.a ')) 'heartbeat keeps legacy slot three'
+Assert ($lines[9].StartsWith('4 room.q2.b ')) 'heartbeat fills legacy slot four'
 
 # A catalog failure retains state and sends no heartbeat commands.
 $process = New-FakeHubProcess -ExitAfterWaits 1
@@ -123,7 +143,7 @@ $result = Invoke-Q2DzHub -InitialSlots $initial -Q2Path 'Q2PRO-X.exe' -Coordinat
   -CoordinatorArguments @() -StartCoordinator { $owner } -Refresh { throw 'catalog unavailable' } -PollIntervalSeconds 0
 Assert ($result -eq 0) 'catalog failure must not change coordinator exit'
 $lines = $writer.Text.ToString().Split("`n", [StringSplitOptions]::RemoveEmptyEntries)
-Assert ($lines.Count -eq 2) 'catalog failure must not send destructive heartbeat'
+Assert ($lines.Count -eq 5) 'catalog failure must not send destructive heartbeat'
 
 # Exit 74 before reading stdin and immediately after the first command must
 # survive the launcher, including the broken-pipe path.
@@ -195,7 +215,10 @@ try {
   )
   $utf8Canary = -join [char[]](0x0442, 0x0435, 0x0441, 0x0442)
   $pipeConfig = '{"name":"' + $utf8Canary + '","map":"q2dm1"}'
-  $pipeSlots = @((New-Q2DzHubSlot 'room.q2.pipe' $pipeConfig), (New-Q2DzHubSlot))
+  $pipeSlots = @(
+    (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot),
+    (New-Q2DzHubSlot 'room.q2.pipe' $pipeConfig), (New-Q2DzHubSlot)
+  )
   $pipeCode = Write-Q2DzHubSlots -Process $pipeOwner.Process -Writer $pipeOwner.Writer -Slots $pipeSlots
   Assert ($null -eq $pipeCode) 'live child remains running until stdin EOF'
   $pipeOwner.Writer.Dispose()
@@ -206,7 +229,7 @@ try {
   $capturedBytes = [IO.File]::ReadAllBytes($capturePath)
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
   $capturedText = $strictUtf8.GetString($capturedBytes)
-  $expectedText = (ConvertTo-Q2DzHubCommand 0 $pipeSlots[0]) + (ConvertTo-Q2DzHubCommand 1 $pipeSlots[1])
+  $expectedText = -join @(0..4 | ForEach-Object { ConvertTo-Q2DzHubCommand $_ $pipeSlots[$_] })
   Assert ($capturedText -ceq $expectedText) 'live child received exact independent UTF-8 slot commands'
   Assert ($capturedBytes.Length -lt 3 -or
     $capturedBytes[0] -ne 0xEF -or $capturedBytes[1] -ne 0xBB -or $capturedBytes[2] -ne 0xBF) 'live child input has no UTF-8 BOM'

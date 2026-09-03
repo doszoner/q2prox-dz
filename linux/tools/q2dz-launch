@@ -28,13 +28,16 @@ GAME = "3zb2"
 FETCH_TIMEOUT = 15
 MAX_BODY = 2 * 1024 * 1024
 ROOM_CLOSED_EXIT = 73
-HUB_MAX_ROOMS = 2
+HUB_DEDICATED_SLOTS = 3
+HUB_Q2_SLOTS = 2
+HUB_MAX_ROOMS = HUB_DEDICATED_SLOTS + HUB_Q2_SLOTS
 MAX_HUB_COMMAND_BYTES = 256 * 1024
+MAX_GATEWAY_CONFIG_BYTES = 65535
 HUB_POLL_SECONDS = 15.0
 # Keep content checks bounded even when the public catalog is large. Four
 # candidates per slot is enough to skip missing maps without spawning an
 # unbounded number of helper processes.
-HUB_MAX_CONTENT_CHECKS = HUB_MAX_ROOMS * 4
+HUB_CANDIDATES_PER_SLOT = 4
 _AUTO = object()
 MAX_TOKEN = 255
 MAX_OWNER = 250
@@ -60,6 +63,7 @@ class HubSlot:
     room_id: str = ""
     config: str = ""
     misses: int = 0
+    map_name: str = ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -278,8 +282,11 @@ def validate_rtc_payload(payload):
 
 
 def validate_alias_payload(payload):
-    return isinstance(payload, dict) and isinstance(payload.get("aliases"), list) and all(
-        _safe_token(alias) for alias in payload["aliases"]
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("aliases"), list)
+        and all(_safe_token(alias) for alias in payload["aliases"])
+        and len(payload["aliases"]) == len(set(payload["aliases"]))
     )
 
 
@@ -287,23 +294,27 @@ def _strict_room(row):
     if not isinstance(row, dict):
         return False
     settings = row.get("createSettings")
-    if not isinstance(settings, dict) or settings.get("prefix") != "q2":
+    if not isinstance(settings, dict) or settings.get("prefix") not in ("q2", "q2ded"):
         return False
+    kind = settings["prefix"]
     if any(field in settings and settings[field] != GAME for field in ("game", "profile")):
         return False
     if "ordered" in settings and settings["ordered"] is not False:
         return False
     if not _safe_token(row.get("room")):
         return False
-    owner = row.get("owner")
-    if isinstance(owner, bool) or not isinstance(owner, (str, int)):
-        return False
-    if isinstance(owner, str):
-        if not _safe_token(owner, MAX_OWNER):
+    if kind == "q2":
+        owner = row.get("owner")
+        if isinstance(owner, bool) or not isinstance(owner, (str, int)):
             return False
-    elif not 0 <= owner <= MAX_JSON_SAFE_INTEGER:
-        return False
-    if not isinstance(row.get("roomReady"), bool) or not _hostname(row.get("rtcServer")):
+        if isinstance(owner, str):
+            if not _safe_token(owner, MAX_OWNER):
+                return False
+        elif not 0 <= owner <= MAX_JSON_SAFE_INTEGER:
+            return False
+        if not isinstance(row.get("roomReady"), bool) or not _hostname(row.get("rtcServer")):
+            return False
+    elif not row["room"].startswith("room.q2ded.") or len(row["room"]) <= len("room.q2ded."):
         return False
     if not _text(settings.get("name")):
         return False
@@ -323,21 +334,21 @@ def _strict_room(row):
 def validate_room_payload(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("rooms"), list):
         return False
-    q2_count = 0
+    supported_count = 0
     seen_rooms = set()
     for row in payload["rooms"]:
         if not isinstance(row, dict):
             continue
         settings = row.get("createSettings")
-        if not isinstance(settings, dict) or settings.get("prefix") != "q2":
+        if not isinstance(settings, dict) or settings.get("prefix") not in ("q2", "q2ded"):
             continue
-        q2_count += 1
+        supported_count += 1
         if not _strict_room(row):
             return False
         if row["room"] in seen_rooms:
             return False
         seen_rooms.add(row["room"])
-    return q2_count > 0
+    return supported_count > 0
 
 
 def ready_rooms(payload):
@@ -347,14 +358,14 @@ def ready_rooms(payload):
     room_ids = [row["room"] for row in strict_rows]
     if len(room_ids) != len(set(room_ids)):
         raise LaunchError("room catalog has duplicate room ids")
-    rows = [row for row in strict_rows if row["roomReady"]]
+    rows = [row for row in strict_rows if row["createSettings"]["prefix"] == "q2ded" or row["roomReady"]]
     return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
 
 
 def joinable_rooms(payload):
     return [
         row for row in ready_rooms(payload)
-        if row["roomReady"] and row["players"] < row["createSettings"]["maxPlayers"]
+        if row["players"] < row["createSettings"]["maxPlayers"]
     ]
 
 
@@ -362,7 +373,35 @@ def registered_rooms(rows, lookup):
     if not validate_alias_payload(lookup):
         raise LaunchError("alias lookup has an invalid schema")
     registered = set(lookup["aliases"])
-    return [row for row in rows if f"q2.{row['owner']}" in registered]
+    return [row for row in rows if _room_alias(row) in registered]
+
+
+def _room_kind(row):
+    return row["createSettings"]["prefix"]
+
+
+def _room_alias(row):
+    return row["room"] if _room_kind(row) == "q2ded" else f"q2.{row['owner']}"
+
+
+def _slot_kind(index):
+    return "q2ded" if index < HUB_DEDICATED_SLOTS else "q2"
+
+
+def _dedicated_ice_servers(rtc_rows):
+    if not validate_rtc_payload(rtc_rows):
+        raise LaunchError("RTC configuration has an invalid schema")
+    result = []
+    seen = set()
+    for row in rtc_rows:
+        for server in row["iceservers"]:
+            key = json.dumps(server, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+            if key not in seen:
+                seen.add(key)
+                result.append(server)
+    if not 1 <= len(result) <= MAX_ICE_SERVERS:
+        raise LaunchError("dedicated RTC configuration exceeds the supported limit")
+    return result
 
 
 def _config_text(config):
@@ -398,44 +437,59 @@ def encode_slot(index, slot):
     return payload
 
 
-def reconcile_slots(slots, rows, make_config):
+def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
     """Retain known rooms and fill empty slots from ready registered rows."""
     if len(slots) != HUB_MAX_ROOMS:
-        raise LaunchError("hub requires exactly two slots")
+        raise LaunchError("hub requires exactly five slots")
     by_id = {row["room"]: row for row in rows}
     updated = []
-    for slot in slots:
+    for index, slot in enumerate(slots):
         if not slot.room_id:
             updated.append(HubSlot())
             continue
         row = by_id.get(slot.room_id)
-        if row is not None:
-            updated.append(HubSlot(slot.room_id, slot.config, 0))
+        if row is not None and _room_kind(row) == _slot_kind(index):
+            map_name = row["createSettings"]["map"]
+            if _room_kind(row) == "q2ded":
+                if slot.map_name and slot.map_name != map_name and not map_available(row):
+                    updated.append(HubSlot())
+                    continue
+                try:
+                    updated.append(HubSlot(slot.room_id, _config_text(make_config(row)), 0, map_name))
+                except LaunchError:
+                    updated.append(HubSlot())
+            else:
+                updated.append(HubSlot(slot.room_id, slot.config, 0, slot.map_name or map_name))
         elif slot.misses < 1:
-            updated.append(HubSlot(slot.room_id, slot.config, slot.misses + 1))
+            updated.append(HubSlot(slot.room_id, slot.config, slot.misses + 1, slot.map_name))
         else:
             updated.append(HubSlot())
 
     active_ids = {slot.room_id for slot in updated if slot.room_id}
-    attempted = 0
-    for row in rows:
-        if attempted >= HUB_MAX_CONTENT_CHECKS:
-            break
-        room_id = row["room"]
-        if room_id in active_ids or row["players"] >= row["createSettings"]["maxPlayers"]:
-            continue
-        empty_index = next((index for index, slot in enumerate(updated) if not slot.room_id), None)
-        if empty_index is None:
-            break
-        attempted += 1
-        try:
-            config_text = _config_text(make_config(row))
-            candidate = HubSlot(room_id, config_text, 0)
-            encode_slot(empty_index, candidate)
-        except LaunchError:
-            continue
-        updated[empty_index] = candidate
-        active_ids.add(room_id)
+    for kind, indices in (("q2ded", range(0, HUB_DEDICATED_SLOTS)),
+                          ("q2", range(HUB_DEDICATED_SLOTS, HUB_MAX_ROOMS))):
+        attempted = 0
+        limit = len(indices) * HUB_CANDIDATES_PER_SLOT
+        for row in (candidate for candidate in rows if _room_kind(candidate) == kind):
+            if attempted >= limit:
+                break
+            room_id = row["room"]
+            if room_id in active_ids or row["players"] >= row["createSettings"]["maxPlayers"]:
+                continue
+            empty_index = next((index for index in indices if not updated[index].room_id), None)
+            if empty_index is None:
+                break
+            attempted += 1
+            if not map_available(row):
+                continue
+            try:
+                config_text = _config_text(make_config(row))
+                candidate = HubSlot(room_id, config_text, 0, row["createSettings"]["map"])
+                encode_slot(empty_index, candidate)
+            except LaunchError:
+                continue
+            updated[empty_index] = candidate
+            active_ids.add(room_id)
     return updated
 
 
@@ -459,31 +513,37 @@ def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subpr
 
 
 def make_room_config(selected, lookup, rtc_rows):
-    if not _strict_room(selected) or selected.get("roomReady") is not True or selected["players"] >= selected["createSettings"]["maxPlayers"]:
+    if not _strict_room(selected) or (selected["createSettings"]["prefix"] == "q2" and selected.get("roomReady") is not True) or selected["players"] >= selected["createSettings"]["maxPlayers"]:
         raise LaunchError("The selected room is no longer available")
-    owner = str(selected.get("owner", ""))
-    alias = f"q2.{owner}"
-    if not re.fullmatch(r"q2\.[A-Za-z0-9._-]{1,250}", alias) or len(alias) > MAX_TOKEN:
+    alias = _room_alias(selected)
+    if not _safe_token(alias) or (not alias.startswith("q2.") and not alias.startswith("room.q2ded.")):
         raise LaunchError("selected room has no safe Q2 alias")
     if not validate_alias_payload(lookup) or alias not in lookup["aliases"]:
         raise LaunchError("selected room alias is no longer registered")
     if not validate_rtc_payload(rtc_rows):
         raise LaunchError("RTC configuration has an invalid schema")
-    domain = selected["rtcServer"]
-    matches = [row for row in rtc_rows if row["domain"] == domain]
-    if len(matches) != 1:
-        raise LaunchError("fresh RTC configuration is unavailable")
-    rtc = matches[0]
-    return {
+    if _room_kind(selected) == "q2ded":
+        ice_servers = _dedicated_ice_servers(rtc_rows)
+    else:
+        if not validate_rtc_payload(rtc_rows):
+            raise LaunchError("RTC configuration has an invalid schema")
+        matches = [row for row in rtc_rows if row["domain"] == selected["rtcServer"]]
+        if len(matches) != 1:
+            raise LaunchError("fresh RTC configuration is unavailable")
+        ice_servers = matches[0]["iceservers"]
+    config = {
         "version": 1,
         "roomId": selected["room"],
         "alias": alias,
         "signalingUrl": SIGNALING_URL,
         "ordered": False,
-        "iceServers": rtc["iceservers"],
+        "iceServers": ice_servers,
         "map": selected["createSettings"]["map"],
         "game": GAME,
     }
+    if _room_kind(selected) == "q2ded" and len(_config_text(config).encode("utf-8")) > MAX_GATEWAY_CONFIG_BYTES:
+        raise LaunchError("dedicated room configuration exceeds 65535 bytes")
+    return config
 
 
 def _config_dir():
@@ -651,14 +711,22 @@ def write_slots(process, slots):
 
 
 def _initial_slots(configs):
-    slots = [HubSlot(), HubSlot()]
-    for index, config in enumerate(configs[:HUB_MAX_ROOMS]):
+    slots = [HubSlot() for _ in range(HUB_MAX_ROOMS)]
+    for config in configs[:HUB_MAX_ROOMS]:
         if isinstance(config, HubSlot):
+            kind = "q2ded" if config.room_id.startswith("room.q2ded.") else "q2"
+            index = next((i for i in range(HUB_MAX_ROOMS) if _slot_kind(i) == kind and not slots[i].room_id), None)
+            if index is None:
+                raise LaunchError(f"hub has no free {kind} slot")
             slots[index] = dataclasses.replace(config)
             continue
         if not isinstance(config, dict) or not isinstance(config.get("roomId"), str) or not config["roomId"]:
             raise LaunchError("hub room configuration has no room id")
-        slots[index] = HubSlot(config["roomId"], _config_text(config), 0)
+        kind = "q2ded" if config["roomId"].startswith("room.q2ded.") else "q2"
+        index = next((i for i in range(HUB_MAX_ROOMS) if _slot_kind(i) == kind and not slots[i].room_id), None)
+        if index is None:
+            raise LaunchError(f"hub has no free {kind} slot")
+        slots[index] = HubSlot(config["roomId"], _config_text(config), 0, str(config.get("map", "")))
     return slots
 
 
@@ -667,27 +735,29 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
     catalog = fetch(ROOM_ENDPOINT)
     lookup = fetch(LOOKUP_ENDPOINT)
     rows = registered_rooms(ready_rooms(catalog), lookup)
-    rtc_rows = None
-    rtc_attempted = False
+    needs_dedicated_rtc = any(_room_kind(row) == "q2ded" for row in rows)
+    rtc_rows = fetch(RTC_ENDPOINT) if needs_dedicated_rtc else None
+    if needs_dedicated_rtc:
+        _dedicated_ice_servers(rtc_rows)
 
     def make_config(row):
-        nonlocal rtc_rows, rtc_attempted
-        if not content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner):
-            raise LaunchError("room map is not available locally")
-        if not rtc_attempted:
-            rtc_attempted = True
-            rtc_rows = fetch(RTC_ENDPOINT)
+        nonlocal rtc_rows
         if rtc_rows is None:
-            raise LaunchError("fresh RTC configuration is unavailable")
+            rtc_rows = fetch(RTC_ENDPOINT)
         return make_room_config(row, lookup, rtc_rows)
 
-    return reconcile_slots(slots, rows, make_config)
+    return reconcile_slots(
+        slots,
+        rows,
+        make_config,
+        lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
+    )
 
 
 def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
             runner=None, popen=None, refresh=None, poll_interval=HUB_POLL_SECONDS):
     if len(configs) > HUB_MAX_ROOMS:
-        raise LaunchError("Q2PRO-X hub accepts one or two rooms")
+        raise LaunchError("Q2PRO-X hub accepts up to five rooms")
     args = [
         str(session),
         "--gateway", str(managed),
@@ -744,18 +814,21 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
 def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
     rows = registered_rooms(joinable_rooms(catalog), lookup)
     configs = []
-    for row in rows[:HUB_MAX_CONTENT_CHECKS]:
-        if not content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner):
-            continue
-        try:
-            config = make_room_config(row, lookup, rtc_rows)
-        except LaunchError:
-            continue
-        config = dict(config)
-        config["roomId"] = row["room"]
-        configs.append(config)
-        if len(configs) == HUB_MAX_ROOMS:
-            break
+    for kind, capacity in (("q2ded", HUB_DEDICATED_SLOTS), ("q2", HUB_Q2_SLOTS)):
+        attempted = 0
+        accepted = 0
+        for row in (candidate for candidate in rows if _room_kind(candidate) == kind):
+            if attempted >= capacity * HUB_CANDIDATES_PER_SLOT or accepted >= capacity:
+                break
+            attempted += 1
+            if not content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner):
+                continue
+            try:
+                config = make_room_config(row, lookup, rtc_rows)
+            except LaunchError:
+                continue
+            configs.append(dict(config))
+            accepted += 1
     if not configs:
         raise LaunchError("There are no compatible Dos.Zone rooms for this Q2PRO-X installation.")
     return configs
@@ -764,7 +837,7 @@ def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--help"]:
-        print("Usage: q2dz-launch [--select-q2]\nOpen Q2PRO-X's Dos.Zone browser with up to two compatible rooms through Wine.")
+        print("Usage: q2dz-launch [--select-q2]\nOpen Q2PRO-X's Dos.Zone browser with up to five compatible servers through Wine.")
         return 0
     if argv == ["--select-q2"]:
         return 0 if select_q2_path() else 3
@@ -776,7 +849,7 @@ def main(argv=None):
         if not q2_path:
             return 3
         paths = _installed_paths()
-        slots = [HubSlot(), HubSlot()]
+        slots = [HubSlot() for _ in range(HUB_MAX_ROOMS)]
         slots = poll_once(
             slots,
             lambda: refresh_slots(slots, q2_path),
