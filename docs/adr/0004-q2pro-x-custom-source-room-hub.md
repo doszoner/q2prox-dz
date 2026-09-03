@@ -46,7 +46,9 @@ maintainer не потребовались. Следовательно, базо
 Целевое пользовательское подключение реализуется только через launcher-owned
 **room hub** и вкладку `Custom` Q2PRO-X. Отдельный picker и single-room ветка
 координатора удаляются, чтобы не поддерживать два интерфейса и два lifecycle.
-Кандидат `1.0.0-rc12` сохраняет прежний transport backend и gateway. До
+Кандидат `1.0.0-rc13` сохраняет прежний transport backend и gateway и добавляет
+совместимые `q2ded`-строки по
+[зафиксированному контракту](../design/2026-09-03-dedicated-server-support.md). До
 прохождения live-hub gates он остаётся кандидатом для проверки, а не готовой
 поставкой.
 
@@ -55,7 +57,7 @@ maintainer не потребовались. Следовательно, базо
 1. Пользователь запускает `Q2PRO-X — Dos.Zone` без предварительного picker.
 2. Room hub получает готовые публичные Quake II комнаты и свежие RTC данные
    через те же Dos.Zone endpoints, которые уже использует launcher, и каждые
-   15 секунд обновляет состояние двух слотов.
+   15 секунд обновляет состояние пяти слотов: три `q2ded` и два `q2`.
 3. Hub проверяет локальное наличие карты и для каждой совместимой комнаты
    поднимает отдельный gateway на уникальном
    `127.0.0.1:<udp-port>`.
@@ -70,8 +72,8 @@ maintainer не потребовались. Следовательно, базо
 
 ```text
 Q2PRO-X Custom source
-  Room A -> 127.0.0.1:31001 -> gateway -> Dos.Zone Room A
-  Room B -> 127.0.0.1:31002 -> gateway -> Dos.Zone Room B
+  Dedicated A -> 127.0.0.1:31001 -> gateway -> Dos.Zone Dedicated A
+  Room A      -> 127.0.0.1:31004 -> gateway -> Dos.Zone Room A
 ```
 
 Hub отдаёт Q2PRO-X только loopback endpoints. Он не генерирует synthetic
@@ -93,15 +95,16 @@ Hub поднимает один локальный HTTP-источник тол�
 +set cl_serverbrowser_custom_source http://127.0.0.1:<source-port>/servers
 ```
 
-`GET /servers` возвращает `200 OK` и тело из нуля, одной или двух строк вида
+`GET /servers` возвращает `200 OK` и тело из не более чем пяти строк вида
 `127.0.0.1:<udp-port>`. В тело попадают только готовые, нетерминальные шлюзы;
 учётные данные и внешние адреса Dos.Zone туда не попадают. Источник закрывает
 соединение после ответа и не пишет данные на диск. Начальное состояние может
 быть пустым.
 
-Принятый live scope — от нуля до двух ready-комнат — и правила переходов:
+Принятый live scope — до трёх `q2ded` и двух `q2` — и правила переходов:
 
-- одновременно принимается от нуля до двух готовых комнат;
+- слоты `0..2` принадлежат `q2ded`, слоты `3..4` — `q2`; виды не вытесняют
+  друг друга;
 - каталог опрашивается раз в 15 секунд;
 - слот удаляется после двух последовательных успешных опросов, в которых
   комната отсутствует;
@@ -110,13 +113,10 @@ Hub поднимает один локальный HTTP-источник тол�
 - существующий слот сохраняется для комнаты, даже если она заполнена, пока
   `roomReady` остаётся истинным;
 - новая переполненная комната не заполняет свободный слот;
-- сбой шлюза после readiness получает одну повторную попытку для того же
-  идентификатора комнаты;
-- смысловая ошибка или сбой до readiness помечает идентификатор комнаты как
-  недоступный без повторной попытки;
-- неудачная повторная попытка также помечает его недоступным до очистки или
-  замены другим идентификатором;
-- `ROOM_CLOSED` не запускает повторно тот же слот или идентификатор комнаты;
+- legacy `q2` сохраняет прежние правила отказа;
+- `q2ded` после `ROOM_CLOSED`, сбоя до readiness или terminal failure получает
+  не более двух recovery start за один slot binding; readiness не сбрасывает
+  этот бюджет;
 - источник обновляется только существующей кнопкой `Refresh` Q2PRO-X.
 
 ### Поток управления launcher–coordinator
@@ -125,8 +125,8 @@ Launcher оставляет `stdin` координатора открытым и
 построчные команды для слотов:
 
 ```text
-0 room.q2.owner.generation {compact room JSON}
-1 room.q2.owner.generation {compact room JSON}
+0 room.q2ded.server {compact room JSON}
+3 room.q2.owner.generation {compact room JSON}
 0 -
 ```
 
@@ -230,7 +230,7 @@ Q2PRO-X может сохранить несекретный loopback source ш�
 Общий контракт и одинаковое поведение на обеих платформах:
 
 - получение и валидация каталога Dos.Zone;
-- живое состояние двух слотов и соответствие room ID → loopback UDP endpoint;
+- живое состояние пяти слотов и соответствие room ID → loopback UDP endpoint;
 - стабильный loopback HTTP Custom source;
 - пятнадцатисекундный опрос каталога и правила удаления/повторной попытки;
 - правила readiness, refresh, room close и shutdown;
@@ -280,7 +280,7 @@ content checker. Несовместимая комната не показыва
   arguments, environment, CFG или постоянные файлы.
 - Fresh room configuration передаётся каждому gateway только через stdin.
 - В source нет room credentials и внешних адресов Dos.Zone — только loopback.
-- Hub ограничивает размер и схему внешнего каталога и готовит не более двух
+- Hub ограничивает размер и схему внешнего каталога и готовит не более пяти
   gateway.
 - Installer не занимает `adr0..adr15`, не создаёт `servers.lst` и не изменяет
   Favorites пользователя.
@@ -335,7 +335,7 @@ content checker. Несовместимая комната не показыва
 
 Компромиссы:
 
-- одновременно работает не более двух gateway;
+- одновременно работает не более пяти gateway (`3 q2ded + 2 q2`);
 - Windows может держать несколько WebView2 process trees;
 - room hub становится долгоживущим владельцем Q2 и gateways;
 - перед распространением нового live-hub candidate нужны exact runtime и
@@ -348,7 +348,7 @@ content checker. Несовместимая комната не показыва
    и Room B после обычного `Refresh`; Q2PRO-X не перезапускается, а diff
    normal-exit/crash профиля ограничен штатным autosave и несекретным
    loopback source.
-2. **Real status:** две комнаты одновременно показывают фактические hostname,
+2. **Real status:** dedicated и обычная комната одновременно показывают фактические hostname,
    mod, map, players и измеренный через transport ping без synthetic response;
    packet trace подтверждает один UDP source для `status` и `connect`.
 3. **Switch:** Q2 входит в Room A, выполняет `Disconnect`, затем входит в Room B
@@ -360,14 +360,14 @@ content checker. Несовместимая комната не показыва
    оставляют gateway, WebView2/Wine или session data.
 6. **Security:** source, args, env, CFG и redacted logs не содержат room/ICE
    credentials.
-7. **Resources:** Windows и Linux измерены при одной и двух ready-комнатах;
-   operational cap первой версии равен двум.
+7. **Resources:** Windows и Linux измерены при пяти ready endpoints;
+   operational cap первой версии равен `3+2`.
 8. **Packaging:** portable/setup/Linux package проходят smoke и live switch
    именно из заново распакованных release artifacts.
 
 До прохождения gates 1–8 этот ADR остаётся `Proposed`, а live-hub candidate не
 считается готовым к распространению. Текущие статусы и отделение компонентной
 проверки exact клиента от проверки поставки приведены в
-[`1.0.0-rc12 verification`](../verification/1.0.0-rc12.md). Rollback — это
+[`1.0.0-rc13 verification`](../verification/1.0.0-rc13.md). Rollback — это
 возврат к предыдущему проверенному архиву; gateways и transport backend при
 этом не меняются.

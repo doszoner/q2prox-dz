@@ -13,10 +13,10 @@ Use the ordinary Refresh button in Custom to see newly created or closed rooms.
 Do not edit Q2PRO-X CFG, Favorites or command-line arguments.
 ```
 
-Launcher опрашивает каталог примерно раз в 15 секунд и держит не более двух
-комнат. Новая комната появляется после очередного успешного опроса, закрытая —
+Launcher опрашивает каталог примерно раз в 15 секунд и держит до трёх dedicated-серверов и
+двух обычных комнат. Новый endpoint появляется после очередного успешного опроса, закрытый —
 после двух успешных опросов, в которых её уже нет. Заполненная активная
-комната сохраняется; третья не вытесняет уже выбранные две. Если каталог
+комната сохраняется; лишний endpoint не вытесняет уже занятый слот. Если каталог
 временно недоступен, текущие комнаты сохраняются.
 
 Запускатель не открывает меню Q2PRO-X принудительно: клиент использует свою
@@ -32,7 +32,7 @@ Launcher опрашивает каталог примерно раз в 15 се�
 
 ## Windows setup
 
-1. Скачайте `q2prox-dz-1.0.0-rc11-windows-x64-setup.zip` и полностью
+1. Скачайте `q2prox-dz-1.0.0-rc13-windows-x64-setup.zip` и полностью
    распакуйте его.
 2. Закройте уже запущенный Q2PRO-X и запустите `Install.cmd`.
 3. `Install.cmd` сам откроет первый запуск. Укажите в нём установленный
@@ -47,7 +47,7 @@ Q2PRO-X - Dos.Zone**.
 
 ## Windows portable
 
-1. Скачайте `q2prox-dz-1.0.0-rc11-windows-x64-portable.zip` и распакуйте его в
+1. Скачайте `q2prox-dz-1.0.0-rc13-windows-x64-portable.zip` и распакуйте его в
    отдельную папку.
 2. Закройте уже запущенный Q2PRO-X и запустите `Run.cmd`.
 3. При первом запуске укажите `Q2PRO-X.exe`.
@@ -68,8 +68,8 @@ Microsoft Evergreen Runtime x64:
 [linux/README.md](linux/README.md).
 
 ```bash
-tar -xzf q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc11
+tar -xzf q2prox-dz-1.0.0-rc13-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc13
 ./install.sh
 ```
 

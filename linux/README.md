@@ -6,7 +6,8 @@
 распакуйте release-архив и выполните
 `./install.sh`. Затем откройте **Q2PRO-X — Dos.Zone** из меню приложений или
 запустите `q2dz-launch`. При первом запуске укажите существующий
-`Q2PRO-X.exe`; launcher подготовит до двух комнат, не переключая меню Q2PRO-X
+`Q2PRO-X.exe`; launcher подготовит до трёх dedicated-серверов и двух обычных
+комнат, не переключая меню Q2PRO-X
 принудительно. Подробные требования и команды приведены ниже.
 
 Q2PRO-X сохраняет обычную настройку запуска. Если видна консоль, нажмите
@@ -51,8 +52,8 @@ registered the connected player. Historical rc6/rc7 results remain preserved
 in their own verification records and are not promoted to rc8 by inference.
 Exact rc8 package hashes and results are recorded in
 `docs/verification/1.0.0-rc8.md`; it remains the historical rollback release.
-The current rc11 candidate is fail-closed in
-`docs/verification/1.0.0-rc11.md`.
+The current rc13 candidate is fail-closed in
+`docs/verification/1.0.0-rc13.md`.
 
 If Q2PRO-X is not installed, get the current release from the official landing
 page: <https://q2pro-x.com/>. Install or update it separately, start it once
@@ -64,9 +65,9 @@ the game client.
 Keep the archive and its adjacent `.sha256` file in the same directory:
 
 ```bash
-sha256sum -c q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz.sha256
-tar -xzf q2prox-dz-1.0.0-rc11-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc11
+sha256sum -c q2prox-dz-1.0.0-rc13-linux-x86_64.tar.gz.sha256
+tar -xzf q2prox-dz-1.0.0-rc13-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc13
 ./install.sh
 ```
 
@@ -83,8 +84,8 @@ q2dz-launch
 
 On the first run, select the existing `Q2PRO-X.exe`. The launcher stores only
 that path. It validates the catalog, checks maps for a small bounded set of
-candidates, obtains fresh RTC configuration in memory, starts up to two
-independent local gateways, and launches Q2PRO-X only after real Quake II
+candidates, obtains fresh RTC configuration in memory, starts up to three
+dedicated and two ordinary local gateways, and launches Q2PRO-X only after real Quake II
 readiness round trips. There is no separate room picker or Join window. Room
 rows are shown by the ordinary Q2PRO-X `Custom` browser.
 
@@ -93,8 +94,8 @@ is open. Use `Refresh` in `Custom` to query the current loopback endpoints. A
 closed room is removed after two successful polls that no longer contain it;
 catalog errors retain the current rooms. To move between rooms, use Q2PRO-X's
 normal `Disconnect`, then select another row in `Custom`; Q2PRO-X itself does
-not need to restart. An active full room is retained and a third room does not
-evict either existing slot.
+not need to restart. Active full rooms are retained and the dedicated and
+ordinary room pools do not evict each other.
 
 After installing or moving Q2PRO-X, select the new executable with:
 

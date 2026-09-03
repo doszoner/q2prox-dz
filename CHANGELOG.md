@@ -11,6 +11,24 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc13] - 2026-09-03
+
+### Added
+
+- Dedicated-серверы Dos.Zone с каталогом `q2ded` теперь доступны рядом с
+  обычными комнатами во встроенной вкладке `Custom` Q2PRO-X.
+- Одновременно поддерживаются до трёх dedicated-серверов и до двух обычных
+  комнат; закрытие одного endpoint не завершает Q2PRO-X.
+
+### Changed
+
+- Dedicated-сервер получает не более двух автоматических попыток
+  восстановления за один запуск. После этого достаточно перезапустить
+  Q2PRO-X — Dos.Zone.
+- Для dedicated-серверов используются точный зарегистрированный alias и свежая
+  объединённая конфигурация Dos.Zone; игровые и секретные данные по-прежнему не
+  сохраняются в CFG, аргументах или постоянных файлах.
+
 ## [1.0.0-rc12] - 2026-08-31
 
 ### Fixed
@@ -141,7 +159,8 @@
 - Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
   PAK-файлы пользователя.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...HEAD
+[1.0.0-rc13]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...v1.0.0-rc13
 [1.0.0-rc12]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...v1.0.0-rc12
 [1.0.0-rc11]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...v1.0.0-rc11
 [1.0.0-rc10]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc9...v1.0.0-rc10

@@ -27,7 +27,8 @@ only targets used by the Start Menu shortcuts.
 The user extracts the release and double-clicks `Install.cmd`. It installs the
 add-on and immediately opens the first run, which asks for the existing
 `Q2PRO-X.exe`. Later launches fetch current public Dos.Zone Quake II rooms and
-start one managed session with up to two room gateways. Q2PRO-X's standard
+start one managed session with up to three dedicated and two ordinary room
+gateways. Q2PRO-X's standard
 Custom browser then displays the server name, map, players and ping. The game,
 PAKs, CFG and normal Q2PRO-X shortcut are not modified.
 

@@ -5,8 +5,8 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Текущий `1.0.0-rc12` получает PASS только из
-[`1.0.0-rc12`](verification/1.0.0-rc12.md), где должны быть зафиксированы
+rollback. Текущий `1.0.0-rc13` получает PASS только из
+[`1.0.0-rc13`](verification/1.0.0-rc13.md), где должны быть зафиксированы
 точные результаты компонентных, live и package gates.
 
 Пользователю следует публиковать только три canonical архива и соседние
@@ -32,7 +32,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc12
+  -OutputDir .\dist\windows-1.0.0-rc13
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -77,6 +77,8 @@ source is the public repository
 - закрытие комнаты и аварийное завершение не должны оставить orphan-процессы;
 - в hub-режиме закрытие одной комнаты не должно завершить Q2PRO-X или другой
   gateway; после этого должен пройти вход во вторую комнату;
+- одновременно должны быть проверены три `q2ded` и две `q2` строки; dedicated
+  использует точный alias и не более двух recovery start;
 - archive/args/env/logs не должны содержать room credentials;
 - должны быть опубликованы SHA-256 и все third-party licenses/notices.
 
@@ -84,5 +86,5 @@ Unsigned Windows candidates допустимы для корректностно
 закрытой alpha-группе с явным предупреждением. До широкого публичного выпуска
 необходимо выполнить Authenticode gate и заново проверить exact release archives.
 
-Пока эти условия не выполнены для конкретного rc12-архива, он остаётся
+Пока эти условия не выполнены для конкретного rc13-архива, он остаётся
 кандидатом для проверки и не считается готовой пользовательской поставкой.
