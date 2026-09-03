@@ -344,28 +344,30 @@ for _ in $(seq 1 160); do [ "$(<"$CASE/mark.legacy-attempts")" -gt "$b_attempts"
 wait_source_count 1
 stop_case 143
 
-# A dedicated binding gets exactly two recovery starts after ROOM_CLOSED.
-start_case dedicated-recovery 'room.q2ded.server=room-close-after-ack' sleep-no-probe
-send_room 0 room.q2ded.server room.q2ded.server
-wait_file "$CASE/mark.legacy-attempts"
-for expected in 2 3; do
-  for _ in $(seq 1 160); do
-    [ "$(<"$CASE/mark.legacy-attempts")" -ge "$((expected - 1))" ] &&
-      [ "$(grep -Fc 'reason=room-closed' "$CASE/output")" -ge "$((expected - 1))" ] && break
-    sleep 0.025
+# A dedicated binding gets exactly two recovery starts for every terminal
+# stage: pre-ready failure, post-ready failure and ROOM_CLOSED.
+for mode in early-exit-always exit-after-ack room-close-after-ack; do
+  start_case "dedicated-$mode" "room.q2ded.server=$mode" sleep-no-probe
+  send_room 0 room.q2ded.server room.q2ded.server
+  wait_file "$CASE/mark.legacy-attempts"
+  multiplier=1
+  [ "$mode" != early-exit-always ] || multiplier=3
+  for start in 1 2 3; do
+    expected=$((start * multiplier))
+    for _ in $(seq 1 240); do
+      attempts=$(<"$CASE/mark.legacy-attempts")
+      stops=$(grep -Fc 'HUB_GATEWAY_STOP reason=' "$CASE/output" || true)
+      [ "$attempts" -ge "$expected" ] && [ "$stops" -ge "$start" ] && break
+      sleep 0.025
+    done
+    [ "$(<"$CASE/mark.legacy-attempts")" = "$expected" ]
+    [ "$start" -eq 3 ] || send_room 0 room.q2ded.server room.q2ded.server
   done
   send_room 0 room.q2ded.server room.q2ded.server
-  for _ in $(seq 1 160); do [ "$(<"$CASE/mark.legacy-attempts")" -ge "$expected" ] && break; sleep 0.025; done
-  [ "$(<"$CASE/mark.legacy-attempts")" = "$expected" ]
+  sleep 0.1
+  [ "$(<"$CASE/mark.legacy-attempts")" = "$((3 * multiplier))" ]
+  stop_case 143
 done
-for _ in $(seq 1 160); do
-  [ "$(grep -Fc 'reason=room-closed' "$CASE/output")" -ge 3 ] && break
-  sleep 0.025
-done
-send_room 0 room.q2ded.server room.q2ded.server
-sleep 0.1
-[ "$(<"$CASE/mark.legacy-attempts")" = 3 ]
-stop_case 143
 
 # Malformed framing, oversized input, and EOF after partial input are fatal.
 start_case malformed

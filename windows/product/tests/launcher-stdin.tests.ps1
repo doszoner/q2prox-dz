@@ -95,12 +95,17 @@ $dedicatedRtc = @(
     [pscustomobject]@{ urls = @('stun:b.example.invalid') }
   ) }
 )
+$dedicatedLookup = [pscustomobject]@{ aliases = @($dedicatedRoom.room) }
 $dedicatedJson = New-Q2DzRoomConfig -Room $dedicatedRoom `
-  -LookupPayload ([pscustomobject]@{ aliases = @($dedicatedRoom.room) }) -RtcPayload $dedicatedRtc
+  -LookupPayload $dedicatedLookup -RtcPayload $dedicatedRtc
 $dedicatedConfig = $dedicatedJson | ConvertFrom-Json
 Assert ($dedicatedConfig.alias -ceq $dedicatedRoom.room) 'dedicated config uses the exact room alias'
 Assert (@($dedicatedConfig.iceServers).Count -eq 2) 'dedicated config contains stable deduplicated ICE entries'
 Assert ($dedicatedConfig.game -ceq '3zb2' -and -not $dedicatedConfig.ordered) 'dedicated config keeps local game invariants'
+$fullDedicated = $dedicatedRoom | Select-Object *
+$fullDedicated.players = $fullDedicated.createSettings.maxPlayers
+$fullDedicatedJson = New-Q2DzRoomConfig -Room $fullDedicated -LookupPayload $dedicatedLookup -RtcPayload $dedicatedRtc
+Assert (($fullDedicatedJson | ConvertFrom-Json).alias -ceq $dedicatedRoom.room) 'retained full dedicated config remains refreshable'
 
 $oversizedRtc = @([pscustomobject]@{
   domain = 'bulk.example.invalid'
@@ -131,8 +136,11 @@ $excessRtc = @(
     [pscustomobject]@{ urls = @("stun:s$_.example.invalid") }
   }) }
 )
-$emptySlots = @(0..4 | ForEach-Object { New-Q2DzHubSlot })
-$degraded = @(Get-Q2DzLiveHubSlots -Slots $emptySlots -Q2Path 'C:\Games\Q2PRO-X.exe' `
+$activeSlots = @(
+  (New-Q2DzHubSlot $dedicatedRoom.room 'old' 0 'q2dm1'),
+  (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot)
+)
+$degraded = @(Get-Q2DzLiveHubSlots -Slots $activeSlots -Q2Path 'C:\Games\Q2PRO-X.exe' `
   -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
     param($Endpoint)
     if ($Endpoint -ceq $Q2DZ_ROOM_ENDPOINT) { return [pscustomobject]@{ rooms = @($dedicatedRoom,$legacyRoom) } }
@@ -140,8 +148,16 @@ $degraded = @(Get-Q2DzLiveHubSlots -Slots $emptySlots -Q2Path 'C:\Games\Q2PRO-X.
     if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) { return $excessRtc }
     throw "unexpected endpoint: $Endpoint"
   } -RunContentCheck { return $true })
-Assert (@($degraded[0..2] | Where-Object { $_.RoomId }).Count -eq 0) 'excess aggregate ICE hides dedicated rooms'
+Assert ($degraded[0].RoomId -ceq $activeSlots[0].RoomId -and $degraded[0].Config -ceq 'old') 'excess aggregate ICE freezes active dedicated rooms'
 Assert ($degraded[3].RoomId -ceq $legacyRoom.room) 'excess aggregate ICE does not block legacy q2 reconcile'
+$degradedAgain = @(Get-Q2DzLiveHubSlots -Slots $degraded -Q2Path 'C:\Games\Q2PRO-X.exe' `
+  -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+    param($Endpoint)
+    if ($Endpoint -ceq $Q2DZ_ROOM_ENDPOINT) { return [pscustomobject]@{ rooms = @($dedicatedRoom,$legacyRoom) } }
+    if ($Endpoint -ceq $Q2DZ_LOOKUP_ENDPOINT) { return [pscustomobject]@{ aliases = @($dedicatedRoom.room,'q2.1') } }
+    if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) { return $excessRtc }
+  } -RunContentCheck { return $true })
+Assert ($degradedAgain[0].RoomId -ceq $activeSlots[0].RoomId) 'repeated excess aggregate ICE does not age out active dedicated rooms'
 
 $initial = @(
   (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot),

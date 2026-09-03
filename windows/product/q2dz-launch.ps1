@@ -105,8 +105,7 @@ function New-Q2DzRoomConfig {
     [Parameter(Mandatory = $true)]$LookupPayload,
     [Parameter(Mandatory = $true)]$RtcPayload
   )
-  if (-not (Test-Q2DzRoomRow $Room) -or ((Get-Q2DzRoomKind $Room) -ceq 'q2' -and -not $Room.roomReady) -or
-      $Room.players -ge $Room.createSettings.maxPlayers) {
+  if (-not (Test-Q2DzRoomRow $Room) -or ((Get-Q2DzRoomKind $Room) -ceq 'q2' -and -not $Room.roomReady)) {
     throw 'The selected room is no longer available'
   }
   if (-not (Test-Q2DzAliasPayload $LookupPayload)) { throw 'alias lookup has an invalid schema' }
@@ -150,6 +149,7 @@ function Get-Q2DzLiveHubSlots {
   $readyRows = @(Get-Q2DzReadyRooms $catalog)
   $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
   $hasDedicated = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -ceq 'q2ded' }).Count -gt 0
+  $freezeDedicated = $false
   $rtcState = [pscustomobject]@{ Fetched = $hasDedicated; Rows = $null }
   if ($hasDedicated) {
     $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
@@ -157,6 +157,7 @@ function Get-Q2DzLiveHubSlots {
     try {
       Get-Q2DzDedicatedIceServers $rtcState.Rows | Out-Null
     } catch {
+      $freezeDedicated = $true
       $registeredReady = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -cne 'q2ded' })
     }
   }
@@ -180,7 +181,11 @@ function Get-Q2DzLiveHubSlots {
     $root = Split-Path -Parent $Q2Path
     return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
   }
-  return @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable)
+  $updated = @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable)
+  if ($freezeDedicated) {
+    foreach ($index in 0..($Q2DZ_HUB_DEDICATED_SLOTS - 1)) { $updated[$index] = $Slots[$index] }
+  }
+  return $updated
 }
 
 function Invoke-Q2DzHub {

@@ -450,10 +450,11 @@ def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
         row = by_id.get(slot.room_id)
         if row is not None and _room_kind(row) == _slot_kind(index):
             map_name = row["createSettings"]["map"]
-            if _room_kind(row) == "q2ded":
-                if slot.map_name and slot.map_name != map_name and not map_available(row):
-                    updated.append(HubSlot())
-                    continue
+            map_changed = bool(slot.map_name and slot.map_name != map_name)
+            if map_changed and not map_available(row):
+                updated.append(HubSlot())
+                continue
+            if _room_kind(row) == "q2ded" or map_changed:
                 try:
                     updated.append(HubSlot(slot.room_id, _config_text(make_config(row)), 0, map_name))
                 except LaunchError:
@@ -513,7 +514,7 @@ def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subpr
 
 
 def make_room_config(selected, lookup, rtc_rows):
-    if not _strict_room(selected) or (selected["createSettings"]["prefix"] == "q2" and selected.get("roomReady") is not True) or selected["players"] >= selected["createSettings"]["maxPlayers"]:
+    if not _strict_room(selected) or (selected["createSettings"]["prefix"] == "q2" and selected.get("roomReady") is not True):
         raise LaunchError("The selected room is no longer available")
     alias = _room_alias(selected)
     if not _safe_token(alias) or (not alias.startswith("q2.") and not alias.startswith("room.q2ded.")):
@@ -736,6 +737,7 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
     lookup = fetch(LOOKUP_ENDPOINT)
     rows = registered_rooms(ready_rooms(catalog), lookup)
     needs_dedicated_rtc = any(_room_kind(row) == "q2ded" for row in rows)
+    freeze_dedicated = False
     rtc_rows = fetch(RTC_ENDPOINT) if needs_dedicated_rtc else None
     if needs_dedicated_rtc:
         if not validate_rtc_payload(rtc_rows):
@@ -743,6 +745,7 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
         try:
             _dedicated_ice_servers(rtc_rows)
         except LaunchError:
+            freeze_dedicated = True
             rows = [row for row in rows if _room_kind(row) != "q2ded"]
 
     def make_config(row):
@@ -751,12 +754,15 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
             rtc_rows = fetch(RTC_ENDPOINT)
         return make_room_config(row, lookup, rtc_rows)
 
-    return reconcile_slots(
+    updated = reconcile_slots(
         slots,
         rows,
         make_config,
         lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
     )
+    if freeze_dedicated:
+        updated[:HUB_DEDICATED_SLOTS] = slots[:HUB_DEDICATED_SLOTS]
+    return updated
 
 
 def run_hub(configs, q2_path, *, session, managed, legacy, adapter,

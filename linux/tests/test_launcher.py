@@ -542,14 +542,22 @@ class LauncherTests(unittest.TestCase):
             launch.LOOKUP_ENDPOINT: {"aliases": [dedicated["room"], "q2.123"]},
             launch.RTC_ENDPOINT: rtc,
         }
+        current = slots5(dedicated=launch.HubSlot(dedicated["room"], "old", 0, "q2dm1"))
         updated = launch.refresh_slots(
-            slots5(), "/games/Q2PRO-X.exe",
+            current, "/games/Q2PRO-X.exe",
             fetch=lambda endpoint: replies[endpoint],
             content_checker="/fake/content-check",
             runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
         )
-        self.assertEqual([slot.room_id for slot in updated[:3]], ["", "", ""])
+        self.assertEqual(updated[0], current[0])
         self.assertEqual(updated[3].room_id, legacy["room"])
+        repeated = launch.refresh_slots(
+            updated, "/games/Q2PRO-X.exe",
+            fetch=lambda endpoint: replies[endpoint],
+            content_checker="/fake/content-check",
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+        )
+        self.assertEqual(repeated[0], current[0])
 
     def test_dedicated_config_rejects_oversized_json(self):
         selected = dedicated_room()
@@ -588,6 +596,28 @@ class LauncherTests(unittest.TestCase):
         checked.return_value = False
         removed = launch.reconcile_slots(slots5(dedicated=old), [selected], lambda _row: "unused", checked)
         self.assertEqual(removed[0], launch.HubSlot())
+
+    def test_retained_full_dedicated_refreshes_and_q2_map_change_is_rechecked(self):
+        dedicated = dedicated_room()
+        dedicated["players"] = dedicated["createSettings"]["maxPlayers"]
+        config = launch.make_room_config(
+            dedicated,
+            {"aliases": [dedicated["room"]]},
+            [{"domain": "a.example.invalid", "iceservers": [{"urls": ["stun:a.example.invalid"]}]}],
+        )
+        self.assertEqual(config["alias"], dedicated["room"])
+
+        legacy = room(map_name="q2dm2")
+        old = launch.HubSlot(legacy["room"], '{"map":"q2dm1"}', 0, "q2dm1")
+        checked = mock.Mock(return_value=True)
+        updated = launch.reconcile_slots(
+            slots5(q2a=old), [legacy],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+            checked,
+        )
+        checked.assert_called_once_with(legacy)
+        self.assertEqual(updated[3].map_name, "q2dm2")
+        self.assertIn('"q2dm2"', updated[3].config)
 
     def test_failed_dedicated_rtc_refresh_preserves_live_slots_and_sends_nothing(self):
         selected = dedicated_room()

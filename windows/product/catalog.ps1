@@ -429,12 +429,12 @@ function Update-Q2DzHubSlots {
     }
     if ($null -ne $retained -and (Get-Q2DzRoomKind $retained) -ceq (Get-Q2DzSlotKind $slotIndex)) {
       $map = [string]$retained.createSettings.map
-      if ((Get-Q2DzRoomKind $retained) -ceq 'q2ded') {
-        if (-not [string]::IsNullOrEmpty([string]$slot.MapName) -and $slot.MapName -cne $map -and
-            -not (& $MapAvailable $retained)) {
-          $updated += New-Q2DzHubSlot
-          continue
-        }
+      $mapChanged = -not [string]::IsNullOrEmpty([string]$slot.MapName) -and $slot.MapName -cne $map
+      if ($mapChanged -and -not (& $MapAvailable $retained)) {
+        $updated += New-Q2DzHubSlot
+        continue
+      }
+      if ((Get-Q2DzRoomKind $retained) -ceq 'q2ded' -or $mapChanged) {
         try {
           $values = @(& $MakeConfig $retained)
           if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }

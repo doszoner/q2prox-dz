@@ -373,6 +373,17 @@ Assert-Equal 1 $mapChecks 'dedicated map change is checked once'
 Assert-Equal 'q2dm1' $changedMap[0].MapName 'dedicated map state is refreshed'
 Assert-True $changedMap[0].Config.Contains('q2dm1') 'dedicated config is refreshed without replacing the slot'
 
+$legacyChangedMap = $room | Select-Object *
+$legacyChangedMap.createSettings = $room.createSettings | Select-Object *
+$legacyChangedMap.createSettings.map = 'q2dm2'
+$legacyMapChecks = 0
+$legacyMap = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room '{"map":"q2dm1"}' 0 'q2dm1')) `
+  -Rows @($legacyChangedMap) -MakeConfig { param($row) return ('{"map":"' + $row.createSettings.map + '"}') } `
+  -MapAvailable { param($row) $script:legacyMapChecks++; return $true }
+Assert-Equal 1 $legacyMapChecks 'legacy q2 map change is checked once'
+Assert-Equal 'q2dm2' $legacyMap[3].MapName 'legacy q2 map state is refreshed'
+Assert-True $legacyMap[3].Config.Contains('q2dm2') 'legacy q2 config follows the changed map'
+
 $unsupportedProfileRoom = [pscustomobject]@{
   room = 'room.q2.unsupported-profile.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
   createSettings = [pscustomobject]@{ prefix = 'q2'; profile = 'baseq2'; name = 'Unsupported'; map = 'q2dm1'; maxPlayers = 16 }

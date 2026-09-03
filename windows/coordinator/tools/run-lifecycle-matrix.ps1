@@ -129,6 +129,14 @@ function Assert-ProcessAlive([int]$processId, [string]$label) {
     throw "$label process $processId is not alive"
   }
 }
+function Wait-ProcessGone([int]$processId, [int]$timeoutMs = 10000) {
+  $deadline = [Environment]::TickCount + $timeoutMs
+  do {
+    if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { return $true }
+    Start-Sleep -Milliseconds 50
+  } while ([Environment]::TickCount -lt $deadline)
+  return $false
+}
 function Assert-NoOrphans([string]$dir) {
   Start-Sleep -Milliseconds 700
   foreach ($pidFile in @(Get-ChildItem $dir -Filter '*.pid' -File -ErrorAction SilentlyContinue)) {
@@ -190,33 +198,35 @@ try {
   if ([int](Get-Content (Marker $case.Dir 'q2.pid')) -ne $q2Pid) { throw 'slot update restarted Q2' }
   Stop-Case $case
 
-  # A dedicated binding gets exactly two recovery starts after ROOM_CLOSED.
-  $case = Start-Case 'dedicated-recovery' 'normal' 'normal' 'long-running' 'room-close-after-ready'
-  if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw 'dedicated recovery did not start Q2' }
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
-  $dedicatedId = 'room.q2ded.server'
-  $pidPath = Join-Path $case.Dir "gateway-$dedicatedId.pid"
-  Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
-  if (-not (Wait-Path $pidPath)) { throw 'dedicated initial gateway did not start' }
-  $previousPid = [int](Get-Content $pidPath)
-  foreach ($recovery in 1..2) {
-    if (-not (Wait-SourceCount $source 0)) { throw "dedicated attempt $recovery did not close" }
+  # A dedicated binding gets exactly two recovery starts for every terminal
+  # stage: pre-ready protocol failure, post-ready exit and ROOM_CLOSED.
+  foreach ($mode in @('malformed-ready','exit-after-ready','room-close-after-ready')) {
+    $case = Start-Case "dedicated-$mode" 'normal' 'normal' 'long-running' $mode
+    if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw "$mode did not start Q2" }
+    $dedicatedId = 'room.q2ded.server'
+    $pidPath = Join-Path $case.Dir "gateway-$dedicatedId.pid"
     Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
-    $deadline = [Environment]::TickCount + 10000
-    do {
-      $currentPid = [int](Get-Content $pidPath)
-      if ($currentPid -ne $previousPid) { break }
-      Start-Sleep -Milliseconds 50
-    } while ([Environment]::TickCount -lt $deadline)
-    if ($currentPid -eq $previousPid) { throw "dedicated recovery $recovery did not start" }
-    $previousPid = $currentPid
+    if (-not (Wait-Path $pidPath)) { throw "$mode initial gateway did not start" }
+    $previousPid = [int](Get-Content $pidPath)
+    foreach ($recovery in 1..2) {
+      if (-not (Wait-ProcessGone $previousPid)) { throw "$mode attempt $recovery did not stop" }
+      Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
+      $deadline = [Environment]::TickCount + 10000
+      do {
+        $currentPid = [int](Get-Content $pidPath)
+        if ($currentPid -ne $previousPid) { break }
+        Start-Sleep -Milliseconds 50
+      } while ([Environment]::TickCount -lt $deadline)
+      if ($currentPid -eq $previousPid) { throw "$mode recovery $recovery did not start" }
+      $previousPid = $currentPid
+    }
+    if (-not (Wait-ProcessGone $previousPid)) { throw "$mode final attempt did not stop" }
+    Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
+    Start-Sleep -Milliseconds 500
+    if ([int](Get-Content $pidPath) -ne $previousPid) { throw "$mode tombstoned dedicated restarted" }
+    Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) "$mode Q2"
+    Stop-Case $case
   }
-  if (-not (Wait-SourceCount $source 0)) { throw 'dedicated final attempt did not close' }
-  Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
-  Start-Sleep -Milliseconds 500
-  if ([int](Get-Content $pidPath) -ne $previousPid) { throw 'tombstoned dedicated restarted' }
-  Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'dedicated recovery Q2'
-  Stop-Case $case
 
   # A burst of slot replacements must not starve a concurrently exiting Q2.
   # Each replacement of the never-ready fake gateway has a bounded 500 ms
