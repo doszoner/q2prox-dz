@@ -102,6 +102,47 @@ Assert ($dedicatedConfig.alias -ceq $dedicatedRoom.room) 'dedicated config uses 
 Assert (@($dedicatedConfig.iceServers).Count -eq 2) 'dedicated config contains stable deduplicated ICE entries'
 Assert ($dedicatedConfig.game -ceq '3zb2' -and -not $dedicatedConfig.ordered) 'dedicated config keeps local game invariants'
 
+$oversizedRtc = @([pscustomobject]@{
+  domain = 'bulk.example.invalid'
+  iceservers = @(0..2 | ForEach-Object {
+    $server = $_
+    [pscustomobject]@{ urls = @(0..15 | ForEach-Object {
+      "turn:s$server.example.invalid?x=$(('x' * 1600))$_"
+    }) }
+  })
+})
+$oversizedIce = @(Get-Q2DzDedicatedIceServers $oversizedRtc)
+Assert ($oversizedIce.Count -eq 3) 'oversized fixture passes RTC and aggregate limits'
+$oversizedThrown = $false
+try {
+  New-Q2DzRoomConfig -Room $dedicatedRoom -LookupPayload $dedicatedLookup -RtcPayload $oversizedRtc | Out-Null
+} catch { $oversizedThrown = $true }
+Assert $oversizedThrown 'dedicated compact config over 65535 bytes is rejected'
+
+$legacyRoom = [pscustomobject]@{
+  room = 'room.q2.client.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
+  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Client'; map = 'q2dm1'; maxPlayers = 16 }
+}
+$excessRtc = @(
+  [pscustomobject]@{ domain = 'lvc.example.invalid'; iceservers = @(
+    [pscustomobject]@{ urls = @('stun:legacy.example.invalid') }
+  ) },
+  [pscustomobject]@{ domain = 'bulk.example.invalid'; iceservers = @(0..15 | ForEach-Object {
+    [pscustomobject]@{ urls = @("stun:s$_.example.invalid") }
+  }) }
+)
+$emptySlots = @(0..4 | ForEach-Object { New-Q2DzHubSlot })
+$degraded = @(Get-Q2DzLiveHubSlots -Slots $emptySlots -Q2Path 'C:\Games\Q2PRO-X.exe' `
+  -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+    param($Endpoint)
+    if ($Endpoint -ceq $Q2DZ_ROOM_ENDPOINT) { return [pscustomobject]@{ rooms = @($dedicatedRoom,$legacyRoom) } }
+    if ($Endpoint -ceq $Q2DZ_LOOKUP_ENDPOINT) { return [pscustomobject]@{ aliases = @($dedicatedRoom.room,'q2.1') } }
+    if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) { return $excessRtc }
+    throw "unexpected endpoint: $Endpoint"
+  } -RunContentCheck { return $true })
+Assert (@($degraded[0..2] | Where-Object { $_.RoomId }).Count -eq 0) 'excess aggregate ICE hides dedicated rooms'
+Assert ($degraded[3].RoomId -ceq $legacyRoom.room) 'excess aggregate ICE does not block legacy q2 reconcile'
+
 $initial = @(
   (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot),
   (New-Q2DzHubSlot 'room.q2.a' '{"roomId":"room.q2.a"}'),

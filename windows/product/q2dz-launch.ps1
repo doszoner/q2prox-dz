@@ -153,7 +153,12 @@ function Get-Q2DzLiveHubSlots {
   $rtcState = [pscustomobject]@{ Fetched = $hasDedicated; Rows = $null }
   if ($hasDedicated) {
     $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
-    Get-Q2DzDedicatedIceServers $rtcState.Rows | Out-Null
+    if (-not (Test-Q2DzRtcPayload $rtcState.Rows)) { throw 'RTC configuration has an invalid schema' }
+    try {
+      Get-Q2DzDedicatedIceServers $rtcState.Rows | Out-Null
+    } catch {
+      $registeredReady = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -cne 'q2ded' })
+    }
   }
   $check = if ($RunContentCheck) { $RunContentCheck } else {
     {

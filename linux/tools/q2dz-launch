@@ -738,7 +738,12 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
     needs_dedicated_rtc = any(_room_kind(row) == "q2ded" for row in rows)
     rtc_rows = fetch(RTC_ENDPOINT) if needs_dedicated_rtc else None
     if needs_dedicated_rtc:
-        _dedicated_ice_servers(rtc_rows)
+        if not validate_rtc_payload(rtc_rows):
+            raise LaunchError("RTC configuration has an invalid schema")
+        try:
+            _dedicated_ice_servers(rtc_rows)
+        except LaunchError:
+            rows = [row for row in rows if _room_kind(row) != "q2ded"]
 
     def make_config(row):
         nonlocal rtc_rows

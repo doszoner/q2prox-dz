@@ -97,6 +97,17 @@ $cases = @(Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json)
 if ($cases.Count -eq 1 -and $cases[0] -is [array]) { $cases = @($cases[0]) }
 
 foreach ($case in $cases) {
+  if ($case.kind -eq 'dedicated-ice') {
+    $thrown = $false
+    $actualIce = @()
+    try { $actualIce = @(Get-Q2DzDedicatedIceServers @($case.payload)) } catch { $thrown = $true }
+    Assert-Equal ([bool]$case.valid) (-not $thrown) "shared case $($case.name)"
+    if ($case.valid) {
+      Assert-Equal ($case.expected.iceServers | ConvertTo-Json -Depth 8 -Compress) `
+        ($actualIce | ConvertTo-Json -Depth 8 -Compress) "shared ICE order $($case.name)"
+    }
+    continue
+  }
   switch ($case.kind) {
     'rooms' { $actual = Test-Q2DzRoomPayload $case.payload }
     'aliases' { $actual = Test-Q2DzAliasPayload $case.payload }
@@ -117,6 +128,12 @@ foreach ($case in $cases) {
     } catch { $selectionThrew = $true }
     if ($case.valid) {
       Assert-True $selectedFound "valid room case $($case.name) reaches selection"
+      if ($case.PSObject.Properties.Name -contains 'expected') {
+        $row = $case.payload.rooms[0]
+        Assert-Equal $case.expected.alias (Get-Q2DzRoomAlias $row) "shared alias $($case.name)"
+        $actualRange = @(0..4 | Where-Object { (Get-Q2DzSlotKind $_) -ceq (Get-Q2DzRoomKind $row) })
+        Assert-Equal ($case.expected.slotRange -join ',') (($actualRange[0],$actualRange[-1]) -join ',') "shared slots $($case.name)"
+      }
     } elseif (-not $selectionThrew) {
       Assert-Equal 0 $selectionCount "invalid room case $($case.name) does not reach selection"
     }

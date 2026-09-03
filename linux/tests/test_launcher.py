@@ -289,6 +289,15 @@ class LauncherTests(unittest.TestCase):
         }
         for case in CONTRACT_CASES:
             with self.subTest(case=case["name"]):
+                if case["kind"] == "dedicated-ice":
+                    try:
+                        ice_servers = launch._dedicated_ice_servers(case["payload"])
+                    except launch.LaunchError:
+                        self.assertFalse(case["valid"])
+                    else:
+                        self.assertTrue(case["valid"])
+                        self.assertEqual(ice_servers, case["expected"]["iceServers"])
+                    continue
                 self.assertEqual(
                     validators[case["kind"]](case["payload"]),
                     case["valid"],
@@ -301,6 +310,13 @@ class LauncherTests(unittest.TestCase):
                     if case["valid"]:
                         expected_room = case["payload"]["rooms"][0]["room"]
                         self.assertEqual([row["room"] for row in selected], [expected_room])
+                        if "expected" in case:
+                            row = case["payload"]["rooms"][0]
+                            self.assertEqual(launch._room_alias(row), case["expected"]["alias"])
+                            self.assertEqual(
+                                [i for i in range(launch.HUB_MAX_ROOMS) if launch._slot_kind(i) == launch._room_kind(row)],
+                                list(range(case["expected"]["slotRange"][0], case["expected"]["slotRange"][1] + 1)),
+                            )
                     else:
                         self.assertEqual(selected, [])
 
@@ -511,6 +527,39 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(config["iceServers"], [rtc[0]["iceservers"][0], rtc[0]["iceservers"][1], rtc[1]["iceservers"][1]])
         self.assertFalse(config["ordered"])
         self.assertEqual(config["game"], "3zb2")
+
+    def test_excess_dedicated_ice_does_not_block_q2_reconcile(self):
+        legacy = room()
+        dedicated = dedicated_room()
+        rtc = [
+            {"domain": "lvc.dos.zone", "iceservers": [{"urls": ["stun:legacy.example.invalid"]}]},
+            {"domain": "bulk.example.invalid", "iceservers": [
+                {"urls": [f"stun:s{i}.example.invalid"]} for i in range(16)
+            ]},
+        ]
+        replies = {
+            launch.ROOM_ENDPOINT: {"rooms": [dedicated, legacy]},
+            launch.LOOKUP_ENDPOINT: {"aliases": [dedicated["room"], "q2.123"]},
+            launch.RTC_ENDPOINT: rtc,
+        }
+        updated = launch.refresh_slots(
+            slots5(), "/games/Q2PRO-X.exe",
+            fetch=lambda endpoint: replies[endpoint],
+            content_checker="/fake/content-check",
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+        )
+        self.assertEqual([slot.room_id for slot in updated[:3]], ["", "", ""])
+        self.assertEqual(updated[3].room_id, legacy["room"])
+
+    def test_dedicated_config_rejects_oversized_json(self):
+        selected = dedicated_room()
+        rtc = [{"domain": "a.example.invalid", "iceservers": [
+            {"urls": [f"turn:s{i}.example.invalid?x={'x' * 1600}{j}" for j in range(16)]}
+            for i in range(3)
+        ]}]
+        self.assertEqual(len(launch._dedicated_ice_servers(rtc)), 3)
+        with self.assertRaises(launch.LaunchError):
+            launch.make_room_config(selected, {"aliases": [selected["room"]]}, rtc)
 
     def test_dedicated_slots_are_isolated_from_q2_slots(self):
         rows = [dedicated_room(f"room.q2ded.server.{i}") for i in range(4)] + [

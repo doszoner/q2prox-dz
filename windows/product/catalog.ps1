@@ -320,6 +320,21 @@ function Get-Q2DzRoomAlias {
 }
 function Get-Q2DzSlotKind { param([int]$Index) if ($Index -lt 3) { return 'q2ded' }; return 'q2' }
 
+function ConvertTo-Q2DzCanonicalJsonValue {
+  param($Value)
+  if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return $Value }
+  if ($Value -is [array]) {
+    $items = @($Value | ForEach-Object { ConvertTo-Q2DzCanonicalJsonValue $_ })
+    Write-Output -NoEnumerate $items
+    return
+  }
+  $result = [ordered]@{}
+  foreach ($property in @($Value.PSObject.Properties | Sort-Object Name)) {
+    $result[$property.Name] = ConvertTo-Q2DzCanonicalJsonValue $property.Value
+  }
+  return $result
+}
+
 function Get-Q2DzDedicatedIceServers {
   param([Parameter(Mandatory = $true)]$RtcPayload)
   if (-not (Test-Q2DzRtcPayload $RtcPayload)) { throw 'RTC configuration has an invalid schema' }
@@ -327,7 +342,7 @@ function Get-Q2DzDedicatedIceServers {
   $seen = @()
   foreach ($row in @($RtcPayload)) {
     foreach ($server in @($row.iceservers)) {
-      $key = $server | ConvertTo-Json -Depth 8 -Compress
+      $key = ConvertTo-Q2DzCanonicalJsonValue $server | ConvertTo-Json -Depth 8 -Compress
       if ($seen -cnotcontains $key) {
         $seen += $key
         $result += $server
