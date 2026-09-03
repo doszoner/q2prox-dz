@@ -337,6 +337,7 @@ def validate_room_payload(payload):
         return False
     supported_count = 0
     seen_rooms = set()
+    seen_aliases = set()
     for row in payload["rooms"]:
         if not isinstance(row, dict):
             continue
@@ -349,6 +350,10 @@ def validate_room_payload(payload):
         if row["room"] in seen_rooms:
             return False
         seen_rooms.add(row["room"])
+        alias = _room_alias(row)
+        if alias in seen_aliases:
+            return False
+        seen_aliases.add(alias)
     return supported_count > 0
 
 
@@ -359,6 +364,9 @@ def ready_rooms(payload):
     room_ids = [row["room"] for row in strict_rows]
     if len(room_ids) != len(set(room_ids)):
         raise LaunchError("room catalog has duplicate room ids")
+    aliases = [_room_alias(row) for row in strict_rows]
+    if len(aliases) != len(set(aliases)):
+        raise LaunchError("room catalog has duplicate Q2 aliases")
     rows = [row for row in strict_rows if row["createSettings"]["prefix"] == "q2ded" or row["roomReady"]]
     return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
 
@@ -748,11 +756,12 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
     if needs_dedicated_rtc:
         if not validate_rtc_payload(rtc_rows):
             raise LaunchError("RTC configuration has an invalid schema")
-        try:
-            _dedicated_ice_servers(rtc_rows)
-        except LaunchError:
-            freeze_dedicated = True
-            rows = [row for row in rows if _room_kind(row) != "q2ded"]
+        else:
+            try:
+                _dedicated_ice_servers(rtc_rows)
+            except LaunchError:
+                freeze_dedicated = True
+                rows = [row for row in rows if _room_kind(row) != "q2ded"]
 
     def make_config(row):
         nonlocal rtc_rows

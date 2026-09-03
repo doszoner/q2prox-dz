@@ -22,7 +22,7 @@ errors. Sensitive values are never permitted in stdout.
 The gateway may emit `TRANSPORT_READY` only after all of the following:
 
 1. fresh ICE was applied before P2P startup;
-2. alias resolution selected the requested `q2.<id>` peer;
+2. alias resolution selected the requested `q2.<id>` or `room.q2ded.<id>` peer;
 3. WebRTC DataChannel is open;
 4. a Quake II OOB `ping\n` datagram sent over logical channel 0 returned an
    OOB `ack` from the browser listen-server;

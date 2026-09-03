@@ -496,7 +496,7 @@ $duplicateRoom = [pscustomobject]@{
 }
 Assert-Throws { Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($room, $duplicateRoom) }) } 'duplicate room ids must not reach selection'
 $caseRoom = [pscustomobject]@{
-  room = 'ROOM.Q2.TEST.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
+  room = 'ROOM.Q2.TEST.1'; owner = '9'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
   createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Case variant'; map = 'q2dm1'; maxPlayers = 16 }
 }
 Assert-Equal 2 (@(Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($room, $caseRoom) }))).Count 'room ids differing only by case are distinct'

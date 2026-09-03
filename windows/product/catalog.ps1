@@ -365,10 +365,14 @@ function Get-Q2DzReadyRooms {
   if ($Value.rooms -isnot [array]) { throw 'room catalog has an invalid schema' }
   $result = @()
   $seenRooms = @()
+  $seenAliases = @()
   foreach ($row in @($Value.rooms)) {
     if (-not (Test-Q2DzRoomRow $row)) { continue }
     if ($seenRooms -ccontains [string]$row.room) { throw 'room catalog has duplicate room ids' }
     $seenRooms += [string]$row.room
+    $alias = Get-Q2DzRoomAlias $row
+    if ($seenAliases -ccontains $alias) { throw 'room catalog has duplicate Q2 aliases' }
+    $seenAliases += $alias
     if ((Get-Q2DzRoomKind $row) -ceq 'q2ded' -or $row.roomReady) { $result += $row }
   }
   return @($result | Sort-Object `
@@ -498,6 +502,7 @@ function Test-Q2DzRoomPayload {
   $rows = @($Value.rooms)
   $supportedCount = 0
   $seenRooms = @()
+  $seenAliases = @()
   foreach ($row in $rows) {
     if ($null -eq $row -or $null -eq $row.PSObject) { continue }
     if ($null -ne $row.createSettings -and @('q2','q2ded') -ccontains [string]$row.createSettings.prefix) {
@@ -505,6 +510,9 @@ function Test-Q2DzRoomPayload {
       if (-not (Test-Q2DzRoomRow $row)) { return $false }
       if ($seenRooms -ccontains [string]$row.room) { return $false }
       $seenRooms += [string]$row.room
+      $alias = Get-Q2DzRoomAlias $row
+      if ($seenAliases -ccontains $alias) { return $false }
+      $seenAliases += $alias
     }
   }
   return $supportedCount -gt 0

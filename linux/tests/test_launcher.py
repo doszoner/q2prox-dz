@@ -426,8 +426,8 @@ class LauncherTests(unittest.TestCase):
         rows = [
             room(),
             {**room("room.q3.nope.1"), "createSettings": {"prefix": "q3", "name": "q3", "map": "q3dm1", "maxPlayers": 16}},
-            {**room("room.q2.full.2"), "players": 16},
-            {**room("room.q2.not-ready.3"), "roomReady": False},
+            {**room("room.q2.full.2", owner="2"), "players": 16},
+            {**room("room.q2.not-ready.3", owner="3"), "roomReady": False},
         ]
         self.assertEqual([r["room"] for r in launch.joinable_rooms({"rooms": rows})], ["room.q2.abc.123"])
 

@@ -33,7 +33,11 @@ Gateway stdin contains exactly one UTF-8 JSON object and then EOF. Maximum accep
 }
 ```
 
-The gateway must apply `iceServers` before transport initialization. It must keep the object in memory only and overwrite buffers after use. Player/statistics tokens are not part of this object.
+`alias` accepts either `q2.<identifier>` for a browser-hosted room or the exact
+`room.q2ded.<identifier>` alias for a dedicated server. The gateway must apply
+`iceServers` before transport initialization. It must keep the object in memory
+only and overwrite buffers after use. Player/statistics tokens are not part of
+this object.
 
 ## Owner lifetime
 

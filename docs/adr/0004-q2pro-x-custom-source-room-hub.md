@@ -276,8 +276,11 @@ content checker. Несовместимая комната не показыва
 ## Security invariants
 
 - UDP gateway слушают только `127.0.0.1`.
-- Room alias, ICE/TURN credentials, SDP и candidates не попадают в source,
-  arguments, environment, CFG или постоянные файлы.
+- ICE/TURN credentials, SDP и candidates не попадают в source, arguments,
+  environment, CFG или постоянные файлы. Linux compatibility gateway передаёт
+  публичный room alias закреплённому legacy transport через `--alias`; его
+  diagnostics проходят redaction перед выводом. Windows managed gateway получает
+  весь room config через stdin.
 - Fresh room configuration передаётся каждому gateway только через stdin.
 - В source нет room credentials и внешних адресов Dos.Zone — только loopback.
 - Hub ограничивает размер и схему внешнего каталога и готовит не более пяти

@@ -18,10 +18,11 @@ rollback. Текущий `1.0.0-rc13` получает PASS только из
 
 ## Публичная граница
 
-Текущее tracked public tree и package allowlists исключают `input/`, reviewer
-prompts, work plans, caches, raw VM evidence, логи, build directories и
-credentials. Локальные untracked/ignored материалы не входят в пользовательские
-архивы; отдельный staging framework для этого не нужен.
+Package allowlists исключают `input/`, reviewer prompts, work plans, caches,
+raw VM evidence, логи, build directories и credentials. Tracked public tree
+также исключает временные материалы; утверждённые implementation plans остаются
+в `docs/superpowers/plans/`. Локальные untracked/ignored материалы не входят в
+пользовательские архивы; отдельный staging framework для этого не нужен.
 
 ## Windows
 

@@ -68,6 +68,8 @@ static void test_protocol() {
     assert(q2dz::sanitize_log_line("a=fingerprint:sha-256 00:11") == "[q2dz] sensitive transport diagnostic suppressed");
     assert(q2dz::sanitize_log_line("My peer id is abc123") == "[q2dz] sensitive transport diagnostic suppressed");
     assert(q2dz::sanitize_log_line("GATEWAY_READY alias=room.q2ded.example") == "[q2dz] sensitive transport diagnostic suppressed");
+    assert(q2dz::sanitize_log_line("Alias lookup for \"room.q2ded.example\" timed out") == "[q2dz] sensitive transport diagnostic suppressed");
+    assert(q2dz::sanitize_log_line("AliasError: unable to resolve \"room.q2ded.example\"") == "[q2dz] sensitive transport diagnostic suppressed");
     assert(q2dz::sanitize_log_line("alias failed") == "alias failed");
     assert(gateway_error_exit_code("Connection to peer was closed") == 20);
     assert(gateway_error_exit_code("alias failed") == 2);

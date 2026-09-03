@@ -3,7 +3,7 @@
 - **Дата проверки:** 2026-09-03
 - **Время публикации отчёта:** `2026-09-03T14:40:05Z`
 - **Вердикт:** PASS
-- **Checkout:** `/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat`
+- **Checkout:** рабочее дерево ветки `feat/dedicated-compat`
 - **Ветка:** `feat/dedicated-compat`
 - **q2prox-dz baseline:** `947f3f8ff0db2c1e838b802340fff1cd2a780da9`
 - **Git identity:** `doszoner <doszoner@users.noreply.github.com>`

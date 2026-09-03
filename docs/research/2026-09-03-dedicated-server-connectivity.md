@@ -4,7 +4,7 @@
 
 Статус: исследование; код и production не изменялись.
 
-Все пути ниже относительны `/home/ssolovey/Projects/Q2/DosZone`. Live-вывод
+Все пути ниже относительны общего рабочего каталога проектов Q2. Live-вывод
 намеренно ограничен schema, alias/found и числом ICE servers. ICE/TURN URL,
 username, credential, SDP, candidates и PeerId не сохранялись и не выводились.
 
