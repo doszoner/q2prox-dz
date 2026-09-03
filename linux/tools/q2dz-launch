@@ -64,6 +64,7 @@ class HubSlot:
     config: str = ""
     misses: int = 0
     map_name: str = ""
+    send: bool = True
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -458,7 +459,7 @@ def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
                 try:
                     updated.append(HubSlot(slot.room_id, _config_text(make_config(row)), 0, map_name))
                 except LaunchError:
-                    updated.append(HubSlot())
+                    updated.append(dataclasses.replace(slot, send=False) if _room_kind(row) == "q2ded" else HubSlot())
             else:
                 updated.append(HubSlot(slot.room_id, slot.config, 0, slot.map_name or map_name))
         elif slot.misses < 1:
@@ -701,6 +702,8 @@ def wait_child(process, timeout=10.0):
 def write_slots(process, slots):
     try:
         for index, slot in enumerate(slots):
+            if not slot.send:
+                continue
             process.stdin.write(encode_slot(index, slot))
         process.stdin.flush()
         return None
@@ -761,7 +764,9 @@ def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=su
         lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
     )
     if freeze_dedicated:
-        updated[:HUB_DEDICATED_SLOTS] = slots[:HUB_DEDICATED_SLOTS]
+        updated[:HUB_DEDICATED_SLOTS] = [
+            dataclasses.replace(slot, send=False) for slot in slots[:HUB_DEDICATED_SLOTS]
+        ]
     return updated
 
 

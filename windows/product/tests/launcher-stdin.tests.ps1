@@ -123,6 +123,18 @@ try {
   New-Q2DzRoomConfig -Room $dedicatedRoom -LookupPayload $dedicatedLookup -RtcPayload $oversizedRtc | Out-Null
 } catch { $oversizedThrown = $true }
 Assert $oversizedThrown 'dedicated compact config over 65535 bytes is rejected'
+$oversizedSlots = @(
+  (New-Q2DzHubSlot $dedicatedRoom.room 'old' 0 'q2dm1'),
+  (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot), (New-Q2DzHubSlot)
+)
+$oversizedRetained = @(Get-Q2DzLiveHubSlots -Slots $oversizedSlots -Q2Path 'C:\Games\Q2PRO-X.exe' `
+  -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+    param($Endpoint)
+    if ($Endpoint -ceq $Q2DZ_ROOM_ENDPOINT) { return [pscustomobject]@{ rooms = @($dedicatedRoom) } }
+    if ($Endpoint -ceq $Q2DZ_LOOKUP_ENDPOINT) { return $dedicatedLookup }
+    if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) { return $oversizedRtc }
+  } -RunContentCheck { return $true })
+Assert ($oversizedRetained[0].RoomId -ceq $dedicatedRoom.room -and -not $oversizedRetained[0].Send) 'oversized config freezes the active dedicated slot'
 
 $legacyRoom = [pscustomobject]@{
   room = 'room.q2.client.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
@@ -150,6 +162,11 @@ $degraded = @(Get-Q2DzLiveHubSlots -Slots $activeSlots -Q2Path 'C:\Games\Q2PRO-X
   } -RunContentCheck { return $true })
 Assert ($degraded[0].RoomId -ceq $activeSlots[0].RoomId -and $degraded[0].Config -ceq 'old') 'excess aggregate ICE freezes active dedicated rooms'
 Assert ($degraded[3].RoomId -ceq $legacyRoom.room) 'excess aggregate ICE does not block legacy q2 reconcile'
+$degradedProcess = New-FakeHubProcess
+$degradedWriter = New-FakeHubWriter $degradedProcess
+Write-Q2DzHubSlots -Process $degradedProcess -Writer $degradedWriter -Slots $degraded | Out-Null
+$degradedLines = $degradedWriter.Text.ToString().Split("`n", [StringSplitOptions]::RemoveEmptyEntries)
+Assert ($degradedLines.Count -eq 2 -and $degradedLines[0].StartsWith('3 ')) 'RTC freeze sends only legacy q2 slot commands'
 $degradedAgain = @(Get-Q2DzLiveHubSlots -Slots $degraded -Q2Path 'C:\Games\Q2PRO-X.exe' `
   -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
     param($Endpoint)

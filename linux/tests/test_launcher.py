@@ -549,15 +549,21 @@ class LauncherTests(unittest.TestCase):
             content_checker="/fake/content-check",
             runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
         )
-        self.assertEqual(updated[0], current[0])
+        self.assertEqual((updated[0].room_id, updated[0].config), (current[0].room_id, current[0].config))
+        self.assertFalse(updated[0].send)
         self.assertEqual(updated[3].room_id, legacy["room"])
+        process = mock.Mock()
+        launch.write_slots(process, updated)
+        sent = [call.args[0] for call in process.stdin.write.call_args_list]
+        self.assertEqual([line.split(" ", 1)[0] for line in sent], ["3", "4"])
         repeated = launch.refresh_slots(
             updated, "/games/Q2PRO-X.exe",
             fetch=lambda endpoint: replies[endpoint],
             content_checker="/fake/content-check",
             runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
         )
-        self.assertEqual(repeated[0], current[0])
+        self.assertEqual((repeated[0].room_id, repeated[0].config), (current[0].room_id, current[0].config))
+        self.assertFalse(repeated[0].send)
 
     def test_dedicated_config_rejects_oversized_json(self):
         selected = dedicated_room()
@@ -568,6 +574,14 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(len(launch._dedicated_ice_servers(rtc)), 3)
         with self.assertRaises(launch.LaunchError):
             launch.make_room_config(selected, {"aliases": [selected["room"]]}, rtc)
+        old = launch.HubSlot(selected["room"], "old", 0, "q2dm1")
+        retained = launch.reconcile_slots(
+            slots5(dedicated=old), [selected],
+            lambda row: launch.make_room_config(row, {"aliases": [selected["room"]]}, rtc),
+        )
+        self.assertEqual(retained[0].room_id, selected["room"])
+        self.assertEqual(retained[0].config, "old")
+        self.assertFalse(retained[0].send)
 
     def test_dedicated_slots_are_isolated_from_q2_slots(self):
         rows = [dedicated_room(f"room.q2ded.server.{i}") for i in range(4)] + [

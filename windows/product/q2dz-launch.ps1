@@ -77,6 +77,7 @@ function Write-Q2DzHubSlots {
   if ($Slots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
   try {
     for ($index = 0; $index -lt $Slots.Count; $index++) {
+      if (-not $Slots[$index].Send) { continue }
       $Writer.Write((ConvertTo-Q2DzHubCommand $index $Slots[$index]))
     }
     $Writer.Flush()
@@ -183,7 +184,10 @@ function Get-Q2DzLiveHubSlots {
   }
   $updated = @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable)
   if ($freezeDedicated) {
-    foreach ($index in 0..($Q2DZ_HUB_DEDICATED_SLOTS - 1)) { $updated[$index] = $Slots[$index] }
+    foreach ($index in 0..($Q2DZ_HUB_DEDICATED_SLOTS - 1)) {
+      $slot = $Slots[$index]
+      $updated[$index] = New-Q2DzHubSlot $slot.RoomId $slot.Config $slot.Misses $slot.MapName $false
+    }
   }
   return $updated
 }
