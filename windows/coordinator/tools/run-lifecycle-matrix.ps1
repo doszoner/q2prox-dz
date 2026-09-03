@@ -10,6 +10,9 @@ $activeCase = $null
 New-Item -ItemType Directory -Force $root | Out-Null
 
 function Marker([string]$dir, [string]$name) { Join-Path $dir "$name.marker" }
+function Gateway-PidPath([string]$dir, [string]$roomId) {
+  Join-Path $dir ("gateway-" + ($roomId -replace '[^A-Za-z0-9_-]', '_') + '.pid')
+}
 function Wait-Path([string]$path, [bool]$present = $true, [int]$timeoutMs = 10000) {
   $deadline = [Environment]::TickCount + $timeoutMs
   do {
@@ -204,7 +207,7 @@ try {
     $case = Start-Case "dedicated-$mode" 'normal' 'normal' 'long-running' $mode
     if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw "$mode did not start Q2" }
     $dedicatedId = 'room.q2ded.server'
-    $pidPath = Join-Path $case.Dir "gateway-$dedicatedId.pid"
+    $pidPath = Gateway-PidPath $case.Dir $dedicatedId
     Send-Command $case.Process ("0 $dedicatedId " + (Room-Json $dedicatedId))
     if (-not (Wait-Path $pidPath)) { throw "$mode initial gateway did not start" }
     $previousPid = [int](Get-Content $pidPath)
