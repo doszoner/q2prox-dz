@@ -183,10 +183,11 @@ static std::string lower_copy(std::string_view input) {
 
 bool contains_sensitive_key(std::string_view text) {
     const auto lower = lower_copy(text);
-    constexpr std::array<std::string_view, 15> keys = {
+    constexpr std::array<std::string_view, 19> keys = {
         "credential", "password", "secret", "token", "authorization",
         "ice", "candidate", "sdp", "turn:", "turns:", "username",
-        "fingerprint", "local-description", "remote-description", "session-description"
+        "fingerprint", "local-description", "remote-description", "session-description",
+        "peer id", "peer_id", "peerid", "alias="
     };
     return std::any_of(keys.begin(), keys.end(), [&](std::string_view key) { return lower.find(key) != std::string::npos; });
 }

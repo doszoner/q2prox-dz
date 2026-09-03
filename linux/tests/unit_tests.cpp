@@ -66,6 +66,9 @@ static void test_protocol() {
     assert(q2dz::sanitize_log_line("v=0") == "[q2dz] sensitive transport diagnostic suppressed");
     assert(q2dz::sanitize_log_line("c=IN IP4 192.0.2.1") == "[q2dz] sensitive transport diagnostic suppressed");
     assert(q2dz::sanitize_log_line("a=fingerprint:sha-256 00:11") == "[q2dz] sensitive transport diagnostic suppressed");
+    assert(q2dz::sanitize_log_line("My peer id is abc123") == "[q2dz] sensitive transport diagnostic suppressed");
+    assert(q2dz::sanitize_log_line("GATEWAY_READY alias=room.q2ded.example") == "[q2dz] sensitive transport diagnostic suppressed");
+    assert(q2dz::sanitize_log_line("alias failed") == "alias failed");
     assert(gateway_error_exit_code("Connection to peer was closed") == 20);
     assert(gateway_error_exit_code("alias failed") == 2);
     assert(gateway_receive_exit_code(-1, 42) == 20);
