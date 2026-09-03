@@ -13,6 +13,13 @@ PowerShell нормализуют две формы каталога в преж
 
 **Baseline:** `947f3f8ff0db2c1e838b802340fff1cd2a780da9`.
 
+**Execution status (2026-09-03):** Tasks 0–3 и кодовая часть Task 6 выполнены.
+Linux build/package/reproducibility gates из Task 4 прошли; live gameplay и
+switching точного финального архива остаются открыты. Exact Windows build,
+lifecycle, package и live gates Task 5 не выполнялись. Источник фактов —
+`docs/verification/1.0.0-rc13.md`; незакрытые checkbox ниже остаются
+обязательными, а не считаются выполненными по плану.
+
 ## Ограничения
 
 - Не менять transport gateway, WebRTC-NET, Q2PRO-X, Quake protocol и Dos.Zone.
