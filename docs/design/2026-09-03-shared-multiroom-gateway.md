@@ -1,11 +1,22 @@
 # Общий многокомнатный шлюз q2prox-dz
 
-- **Статус:** проект решения
+- **Статус:** проект решения; amendment: virtual routing + concrete duplicate guard
 - **Дата:** 2026-09-03
 - **Область:** Windows и Linux
 - **Заменяет после принятия:** фиксированную схему `3 q2ded + 2 q2` из
   [ADR 0004](../adr/0004-q2pro-x-custom-source-room-hub.md) и
   [дизайна поддержки dedicated](2026-09-03-dedicated-server-support.md)
+
+**Подтверждённый amendment/status:** в наблюдении 20--40 секунд deployed
+`wss://net.js-dos.com:444` не прислал `AliasQueryResult` ни для `=alias`, ни для
+полного prefix; обычная scheduling race по этому наблюдению маловероятна. Это
+наблюдение, а вывод о неподдержанном deployed API остаётся inference. Native controlled peer не
+достиг `READY`; чтение кода показывает ту же query-dependent границу в
+Linux/Windows gateway. Dos.Zone server менять не требуется.
+
+**Evidence boundary:** exact Q2PRO-X 40-endpoint source gate остаётся
+`PENDING`, пока evidence не записан в durable verification docs; он не
+доказывает handshake, map entry или gameplay. Gameplay здесь не объявляется.
 
 ## Решение кратко
 
@@ -25,7 +36,14 @@
 `127.0.0.1:<port>`, но не отдельный процесс gateway. Q2PRO-X видит эти адреса
 через существующий Custom source, сам посылает обычный Quake II `status` и
 подключается к выбранному адресу. Gateway маршрутизирует датаграммы по паре
-«локальный endpoint — конкретный удалённый PeerId».
+«локальный endpoint — virtual PeerId».
+
+Для каждой цели gateway получает уникальный `routePeerId` через
+`humblenet_p2p_virtual_peer_for_alias(alias)`. Предлагаемый read-only API
+`humblenet_p2p_resolved_peer_for_virtual_peer(routePeerId)` должен возвращать
+`0` для invalid/unresolved/closed либо concrete `1..0x7fffffff`; getter ничего
+не создаёт. `concretePeerId` нужен только для duplicate guard и поля `READY
+peer=`.
 
 Список является динамическим и не делится на квоты `q2` и `q2ded`. Launcher
 сначала целиком проверяет снимок каталога, затем отправляет полный heartbeat;
@@ -44,12 +62,14 @@ working set. На Linux четыре idle gateway вместе с coordinator и
 линейный рост наиболее дорогой части. На Windows это означало бы десятки
 WebView2-деревьев. Такой предел нельзя считать долговременным решением.
 
-При этом закреплённый WebRTC-NET уже поддерживает несколько соединений в одном
-контексте:
+В текущем WebRTC-NET `eacd804` уже поддержаны virtual allocation и
+`sendto`/`recvfrom`; новые read-only resolver и registration getter ещё только
+предлагаются:
 
-- exact alias query возвращает удалённый PeerId;
-- `humblenet_p2p_sendto()` выбирает соединение по PeerId;
-- `humblenet_p2p_recvfrom()` возвращает PeerId отправителя;
+- `humblenet_p2p_virtual_peer_for_alias(alias)` даёт отдельный virtual route
+  key на alias;
+- `humblenet_p2p_sendto()` и `humblenet_p2p_recvfrom()` работают с virtual
+  route PeerId;
 - реализация WebRTC хранит несколько `RTCPeerConnection` в одной карте.
 
 Следовательно, переиспользование runtime является использованием штатной
@@ -130,14 +150,27 @@ Coordinator запускает Q2PRO-X сразу после готовност�
 Gateway скрывает за одной границей:
 
 - WebRTC-NET initialization и signaling;
-- сопоставление `targetId -> alias -> remote PeerId`;
+- сопоставление `targetId -> alias -> routePeerId (virtual) -> concretePeerId`;
 - отдельный loopback UDP socket и захваченный Q2 source для каждой комнаты;
 - OOB readiness и bounded room-close probes для каждой комнаты;
-- маршрутизацию UDP -> remote PeerId и remote PeerId -> UDP socket;
+- маршрутизацию UDP -> virtual routePeerId и virtual routePeerId -> UDP socket;
 - независимое удаление и повторное создание цели.
 
 Это остаётся одним существующим gateway executable на платформу. Новый
 отдельный сервис и общая библиотека не создаются.
+
+Production gateway не зависит от `AliasQuery` и соответствующей mailbox/query
+orchestration. `routePeerId` создаётся существующим virtual-peer helper, а
+concrete разрешается предлагаемым read-only getter-ом.
+`humblenet_p2p_disconnect(PeerId)`
+немедленно удаляет все map entries этого connection и закрывает его; это
+делает `DROP -> PUT` рабочим с первой попытки. Ни сервер, ни protocol v3 для
+этого не меняются.
+
+Тестовый controlled peer использует только предлагаемый узкий
+`humblenet_p2p_is_alias_registered(alias)`: `true` допустим лишь после
+`AliasLookup`-confirmation к текущему own PeerId, когда нет `pending` или
+`replay`. HTTP `/lookup` controlled peer не вызывает.
 
 ### Custom source
 
@@ -173,6 +206,12 @@ ABSENT -> RESOLVING -> PROBING -> READY
 READY -> CLOSED | FAILED | REMOVED
 ```
 
+Стабильные переходы: allocation failure — `FAILED stage=resolve
+code=peer_bind_failed`; unresolved до deadline — `FAILED stage=resolve
+code=alias_timeout`; duplicate concrete — `FAILED stage=resolve
+code=duplicate_remote_peer`; потеря уже установленного transport — `CLOSED
+reason=transport_closed`.
+
 Только `READY` попадает в Custom source. Повторная попытка создаёт новый
 `targetId`; позднее событие старой версии игнорируется.
 
@@ -200,7 +239,7 @@ Q2DZ/HUB/2 STOP
 Gateway отвечает:
 
 ```text
-Q2DZ/HUB/2 READY id=<uint64> udp=127.0.0.1:<high-port> peer=<remote-peer-id>
+Q2DZ/HUB/2 READY id=<uint64> udp=127.0.0.1:<high-port> peer=<concrete-peer-id>
 Q2DZ/HUB/2 CLOSED id=<uint64> reason=<stable-code>
 Q2DZ/HUB/2 FAILED id=<uint64> stage=<stable-stage> code=<stable-code>
 Q2DZ/HUB/2 HEARTBEAT state=ok targets=<count> ready=<count>
@@ -216,6 +255,9 @@ Q2DZ/HUB/2 HEARTBEAT state=ok targets=<count> ready=<count>
 Версии 1 и 2 нельзя смешивать. Несовпадение coordinator/gateway оставляет
 Custom source пустым и Q2PRO-X работающим, но transport не запускает.
 
+`READY peer` — только concrete PeerId для duplicate/readiness evidence; для
+маршрутизации он не используется.
+
 ## Маршрутизация датаграмм
 
 Для каждой цели gateway хранит:
@@ -223,7 +265,8 @@ Custom source пустым и Q2PRO-X работающим, но transport не 
 ```text
 targetId
 alias
-remotePeerId
+routePeerId       unique virtual PeerId used by transport maps
+concretePeerId    0 until resolved, then 1..0x7fffffff
 udpSocket
 capturedClientAddress | none
 probeState
@@ -232,21 +275,32 @@ counters
 
 Правила:
 
-1. UDP-пакет читается из socket конкретной цели.
-2. Первый loopback source захватывается для этой цели; второй отклоняется.
-3. Пакет отправляется через `humblenet_p2p_sendto(..., remotePeerId, ...)`.
-4. `humblenet_p2p_recvfrom()` возвращает remote PeerId отправителя.
-5. Gateway находит ровно одну цель и отправляет пакет в её UDP socket на
-   захваченный Q2 source.
-6. Неизвестный или уже удалённый PeerId отбрасывается и учитывается счётчиком.
+1. При создании цели gateway получает `routePeerId` через
+   `humblenet_p2p_virtual_peer_for_alias(alias)`; invalid virtual id означает
+   `FAILED code=peer_bind_failed`.
+2. Первый OOB probe отправляется через `routePeerId`, чем инициируется
+   AliasLookup; gateway делает pump и затем читает proposed
+   `humblenet_p2p_resolved_peer_for_virtual_peer(routePeerId)`.
+3. `0` означает invalid/unresolved/closed и оставляет цель unresolved до
+   deadline; после deadline цель получает `FAILED code=alias_timeout`.
+4. Если ACK пришёл раньше concrete id, ACK удерживается до resolver result;
+   concrete reserve и проверка уникальности выполняются атомарно. До этого
+   `READY` запрещён.
+5. Один concrete PeerId может принадлежать только одной активной цели; при
+   duplicate новая цель получает `FAILED code=duplicate_remote_peer`, а
+   survivor не меняется.
+6. UDP-пакет читается из socket конкретной цели.
+7. Первый loopback source захватывается для этой цели; второй отклоняется.
+8. Пакет отправляется через `humblenet_p2p_sendto(..., routePeerId, ...)`.
+9. `humblenet_p2p_recvfrom()` возвращает virtual route PeerId отправителя.
+10. Reverse map `routePeerId -> targetId` находит ровно одну цель и отправляет
+    пакет в её UDP socket на захваченный Q2 source.
+11. Неизвестный или уже удалённый virtual PeerId отбрасывается и учитывается
+    счётчиком.
 
-Один удалённый PeerId может соответствовать только одной активной цели. Если
-exact alias query возвращает PeerId уже занятой цели, новая цель получает
-`FAILED code=duplicate_remote_peer` и не публикуется. Это необходимо потому,
-что exact WebRTC-NET сопоставляет незавершённые outgoing connections по
-конкретному PeerId: два независимых одновременных соединения к одному peer
-неразличимы. Новый alias/signaling protocol ради недоказанного случая не
-создаётся.
+`routePeerId` отвечает только за routing. `concretePeerId` не создаёт
+соединение, а служит duplicate guard и значением `READY peer=`; duplicate
+всегда fail-closed.
 
 ## ICE и signaling
 
@@ -312,7 +366,14 @@ thread. WebRTC-NET применяет список к общему context: со
 ## Readiness, закрытие и восстановление
 
 Каждая цель имеет собственный `ManagedReadinessProbe`. `READY` выдаётся только
-после Quake II OOB `ping/ack` через соответствующий remote PeerId.
+после виртуального allocation, первого OOB `ping/ack` через `routePeerId`,
+resolver result и атомарного unique concrete reserve. ACK до concrete result
+удерживается; resolver сам ничего не создаёт.
+
+`humblenet_p2p_disconnect(routePeerId)` немедленно закрывает connection и
+удаляет все его map entries;
+поэтому `DROP -> PUT` не ждёт старого callback/query результата и работает с
+первой попытки.
 
 Закрытие DataChannel или три ограниченных неудачных OOB probe закрывают только
 эту цель. Для `q2ded` сохраняется текущий ограниченный recovery budget; для
@@ -403,9 +464,9 @@ ownership, один bounded restart и перепубликация только
 
 ### До полной реализации
 
-1. В одном exact WebRTC-NET context одновременно разрешить два разных alias,
-   получить два разных remote PeerId и провести двусторонний OOB `ping/ack` по
-   обоим.
+1. В одном exact WebRTC-NET context одновременно создать два разных virtual
+   `routePeerId`, получить два разных resolved concrete PeerId и провести
+   двусторонний OOB `ping/ack` по virtual маршрутам.
 2. Закрыть один remote peer и доказать, что второй продолжает обмен.
 3. Повторить 1--2 на native Linux и Windows WebView2/WASM.
 4. Под одним объединённым ICE snapshot одновременно подключить одну `q2` и
@@ -415,9 +476,10 @@ ownership, один bounded restart и перепубликация только
 6. Провести не менее 500 create/connect/drop циклов в одном Windows runtime;
    размеры JS connection/channel maps, handles и память возвращаются к
    устойчивому уровню.
-7. Проверить все поддерживаемые live aliases на duplicate concrete PeerId. При
-   обнаружении дубля выпуск блокируется и WebRTC-NET alias establishment
-   возвращается на отдельный дизайн; скрывать одну из комнат нельзя.
+7. Проверить все поддерживаемые live aliases на duplicate concrete PeerId.
+   При обнаружении дубля новая цель блокируется fail-closed, survivor остаётся
+   READY; virtual PeerId не считается concrete duplicate guard, скрывать одну
+   из комнат нельзя.
 
 Любой FAIL блокирует удаление нынешнего per-room режима и возвращает дизайн на
 пересмотр. Он не оправдывает простое увеличение числа WebView2 процессов.
@@ -431,9 +493,10 @@ ownership, один bounded restart и перепубликация только
    process и ровно одно WebView2 process tree.
 4. 40 endpoints уникальны, все представлены в source, отсутствует молчаливое
    усечение; 257-й target даёт явный отказ всего нового снимка.
-5. Exact поддерживаемый Q2PRO-X после `Refresh` отображает все 40 уникальных
-   endpoints, посылает `status` каждому, показывает последние строки и
-   сохраняет один UDP source для `status -> connect`.
+5. Exact Q2PRO-X 40-endpoint source gate остаётся `PENDING` до записи evidence
+   в durable verification docs. После `Refresh` он должен показать уникальные
+   endpoints, послать `status` и сохранить один UDP source для
+   `status -> connect`; это не gameplay evidence.
 6. Две цели одновременно отвечают настоящим `status`; connect/disconnect и
    переключение не смешивают датаграммы.
 7. Закрытие активной и неактивной комнаты удаляет только её endpoint.

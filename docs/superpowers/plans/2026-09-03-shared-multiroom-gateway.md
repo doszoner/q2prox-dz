@@ -12,7 +12,8 @@ WebRTC-NET runtime, который публикует динамический �
 **Architecture:** launcher каждые 15 секунд отправляет полностью проверенный
 heartbeat комнат и общий ICE snapshot. Coordinator владеет Q2PRO-X, Custom
 source и одним shared transport; transport держит отдельный loopback UDP socket
-и remote PeerId на комнату в одном HumbleNet context. Сбой комнаты изолирован,
+и virtual route PeerId на комнату в одном HumbleNet context. Concrete PeerId
+используется только для duplicate guard и `READY`. Сбой комнаты изолирован,
 общий crash получает одну попытку восстановления, секреты не сохраняются.
 
 **Tech Stack:** C++20/CMake, Win32/WebView2, JavaScript ES modules,
@@ -29,6 +30,9 @@ WebRTC-NET/HumbleNet, Python 3, PowerShell 7, CTest/Node unittest.
 - Не менять Q2PRO-X, Quake protocol, Dos.Zone и серверный `status`.
 - Не добавлять зависимости, новый сервис, транзакционный snapshot protocol,
   LRU, idle eviction или второй пользовательский режим.
+- Не использовать `AliasQuery` как production prerequisite: текущий deployed
+  signaling не вернул callback в двух ограниченных 20--40-секундных пробах.
+  Это наблюдение клиента, а не доказательство версии серверной реализации.
 - Не хранить ICE/TURN, alias, room JSON, SDP или candidates на диске, в argv,
   environment либо журналах.
 - Не использовать текущий грязный sibling checkout WebRTC-NET для release.
@@ -635,9 +639,10 @@ host не входит в измерения client CPU/RSS. ICE поступа�
 `connect A -> disconnect -> refresh -> connect B`. Ни один пакет A не приходит
 на endpoint B; имена/map/player count получены от настоящих серверов.
 
-В том же запуске разрешить все поддерживаемые live aliases и проверить
-уникальность concrete PeerId. Любой duplicate блокирует release: скрывать одну
-комнату или считать virtual PeerId достаточным запрещено.
+В том же запуске разрешить все поддерживаемые live aliases через virtual route
+PeerId и проверить concrete PeerId read-only getter-ом. Virtual id отвечает за
+маршрутизацию, concrete id — за уникальность. Любой duplicate получает явный
+`duplicate_remote_peer` и блокирует release; скрывать комнату нельзя.
 
 - [ ] **Step 3: 30-minute resource/churn test Linux.**
 
@@ -660,6 +665,107 @@ bytes, <75% одного logical CPU, без секундных pump gaps и б�
 git add docs/verification/1.0.0-rc14.md
 git commit -m "test: verify shared gateway capacity"
 ```
+
+## Task 7A: Убрать production-зависимость от AliasQuery
+
+Этот amendment заменяет только unchecked указания Tasks 3/4 использовать
+`exact alias query`, concrete `remotePeerId` как маршрут и reverse map по нему.
+Остальные уже выполненные части Tasks 1/3/4 остаются исторической записью.
+
+Живой one-peer запуск подтвердил: alias registration и собственный PeerId
+появляются, но `AliasQuery` callback не приходит ни для exact `=alias`, ни для
+полного prefix в ограниченных 20--40-секундных пробах. Вывод о неподдерживаемом
+server handler остаётся inference. Сервер Dos.Zone не меняется; gateway
+возвращается к штатному AliasLookup, который запускается первой отправкой на
+virtual PeerId.
+
+**Files:** in WebRTC-NET modify
+`src/humblenet/include/humblenet_p2p.h`,
+`src/humblenet/HumbleNet_API.json`,
+`src/humblenet/src/humblenet_p2p.cpp`,
+`src/humblenet/src/humblenet_alias.h`,
+`src/humblenet/src/humblenet_alias.cpp`, `webrtcnet/src/main.cpp`,
+`tests/CMakeLists.txt`; create `tests/test_alias_state.cpp`. In q2prox modify
+`linux/transport/q2_doszone_gateway.cpp`,
+`linux/transport/multiroom_state.hpp`,
+`linux/transport/multiroom_state.cpp`, `linux/tests/unit_tests.cpp`,
+`windows/gateway/assets/transport.html`,
+`windows/gateway/assets/transport_protocol.mjs`,
+`windows/gateway/tests/transport_protocol.test.mjs`,
+`tests/tools/q2dz-controlled-peer.cpp`, `deps.lock.json` and the existing
+`docs/verification/1.0.0-rc14.md`; delete
+`linux/transport/alias_query_mailbox.hpp` after its production/test wiring is
+gone.
+
+- [ ] **Step 1: RED WebRTC-NET alias-state test.**
+
+Отдельный runnable target проверяет: invalid/unresolved/closed virtual id даёт
+resolved concrete `0`; resolved connection даёт concrete `1..0x7fffffff` без
+создания соединения getter-ом; registration getter ложен до подтверждения,
+при pending/replay/rejection и истинен только для текущего own PeerId;
+`disconnect(virtual)` сразу удаляет все virtual/concrete map entries. Публичный
+`AliasQuery` API не удаляется.
+
+- [ ] **Step 2: GREEN WebRTC-NET API и cleanup.**
+
+Добавить только:
+
+```cpp
+PeerId humblenet_p2p_resolved_peer_for_virtual_peer(PeerId virtual_peer);
+ha_bool humblenet_p2p_is_alias_registered(const char* alias);
+```
+
+Первый getter read-only и ничего не создаёт. `disconnect(virtual)` закрывает
+одно connection и немедленно очищает все его ключи, чтобы `DROP -> PUT` того же
+alias начинал новое соединение с первой попытки. Собрать native/WASM и пройти
+новый target плюс существующие WebRTC-NET tests.
+
+- [ ] **Step 3: RED/GREEN Linux routing.**
+
+State хранит отдельно `route_peer` (virtual) и `concrete_peer`. Порядок:
+
+```text
+allocate virtual
+send first OOB probe through virtual (starts AliasLookup)
+pump WebRTC-NET
+poll resolved concrete getter
+atomically reserve concrete PeerId
+accept an already received ACK only after the reservation
+READY peer=<concrete>
+```
+
+Два virtual routes маршрутизируются раздельно. Второй target с тем же concrete
+получает `FAILED stage=resolve code=duplicate_remote_peer`; первый продолжает
+работать. Allocation failure даёт `FAILED stage=resolve
+code=peer_bind_failed`, unresolved target остаётся `RESOLVING` до deadline и
+затем даёт `FAILED stage=resolve code=alias_timeout`; established transport
+loss даёт `CLOSED reason=transport_closed`. Счётчик остаётся
+`unknown_peer_drops`. Production alias-query mailbox удалить.
+
+- [ ] **Step 4: RED/GREEN Windows/WASM routing.**
+
+Node tests доказывают отсутствие вызова `queryAliases`, virtual id для
+send/receive/disconnect и concrete id только для duplicate guard/`READY`.
+Ранний ACK удерживается до concrete reservation; stale target не захватывает
+replacement. Native host, bridge и HUB/2 contract не меняются.
+
+- [ ] **Step 5: controlled peer и live correction gates.**
+
+Controlled peer использует `humblenet_p2p_is_alias_registered(alias)`, не HTTP
+`/lookup` и не `AliasQuery`. Пройти последовательно: один peer READY/status;
+один peer с двумя aliases — ровно один target READY, второй FAILED duplicate,
+survivor продолжает status; `DROP -> PUT` того же alias; две разные цели,
+isolated close и ICE refresh без runtime restart. Затем повторить существующие
+40-target и Linux/Windows resource gates Task 7.
+
+- [ ] **Step 6: pin, reachability, evidence и commits.**
+
+Собрать exact native/WASM artifacts, обновить `deps.lock.json` и hashes,
+проверить dependency verifier. До упаковки новый immutable WebRTC-NET commit
+должен находиться через `git ls-remote` публичного origin; отсутствие commit в
+remote блокирует package, но не локальную реализацию. В verification report
+не записывать ICE, alias payloads или credentials. WebRTC-NET и q2prox commits
+остаются отдельными, от `doszoner`, без push.
 
 ## Task 8: Документация, release и живое принятие
 
