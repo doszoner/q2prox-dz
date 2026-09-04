@@ -11,10 +11,84 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
+
+struct HubFixtureCase {
+    std::string name;
+    std::string parser;
+    bool valid = false;
+    std::string line;
+    std::size_t repeat = 0;
+    char fill = 'x';
+};
+
+static std::string fixture_string(std::string_view object, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\":";
+    const auto key_pos = object.find(needle);
+    assert(key_pos != std::string_view::npos);
+    auto pos = key_pos + needle.size();
+    assert(pos < object.size() && object[pos] == '"');
+    std::string out;
+    for (++pos; pos < object.size(); ++pos) {
+        const char c = object[pos];
+        if (c == '"') return out;
+        if (c != '\\') { out.push_back(c); continue; }
+        assert(++pos < object.size());
+        const char escaped = object[pos];
+        if (escaped == 'n') out.push_back('\n');
+        else if (escaped == 'r') out.push_back('\r');
+        else if (escaped == 't') out.push_back('\t');
+        else if (escaped == 'u') {
+            assert(pos + 4 < object.size());
+            unsigned value = 0;
+            for (std::size_t i = 1; i <= 4; ++i) {
+                const char hex = object[pos + i];
+                value = value * 16U + static_cast<unsigned>(hex >= '0' && hex <= '9' ? hex - '0' :
+                    hex >= 'a' && hex <= 'f' ? hex - 'a' + 10 : hex - 'A' + 10);
+            }
+            out.push_back(static_cast<char>(value));
+            pos += 4;
+        } else {
+            out.push_back(escaped);
+        }
+    }
+    assert(false);
+    return {};
+}
+
+static std::vector<HubFixtureCase> load_hub_fixture() {
+    const auto source = fs::path(__FILE__).parent_path();
+    const auto path = source / "../../tests/contracts/hub-protocol-cases.json";
+    std::ifstream input(path, std::ios::binary);
+    assert(input);
+    const std::string text((std::istreambuf_iterator<char>(input)), {});
+    std::vector<HubFixtureCase> cases;
+    std::istringstream lines(text);
+    std::string object;
+    while (std::getline(lines, object)) {
+        if (object.find("{\"name\":") == std::string::npos) continue;
+        HubFixtureCase item;
+        item.name = fixture_string(object, "name");
+        item.parser = fixture_string(object, "parser");
+        item.valid = object.find("\"valid\":true") != std::string_view::npos;
+        if (object.find("\"line\":") != std::string_view::npos) item.line = fixture_string(object, "line");
+        if (object.find("\"repeat\":") != std::string_view::npos) {
+            const auto key = object.find("\"repeat\":") + 9;
+            const auto end = object.find_first_not_of("0123456789", key);
+            item.repeat = static_cast<std::size_t>(std::stoull(std::string(object.substr(key, end - key))));
+        }
+        if (object.find("\"fill\":") != std::string_view::npos) item.fill = fixture_string(object, "fill").at(0);
+        cases.push_back(std::move(item));
+    }
+    assert(cases.size() == 48);
+    return cases;
+}
 
 static void put_le32(unsigned char* p, std::uint32_t value) {
     p[0] = static_cast<unsigned char>(value & 0xffU);
@@ -57,6 +131,18 @@ static void test_protocol() {
     assert(non_loopback);
     assert(!q2dz::ready_endpoint(non_loopback.value()));
     assert(!q2dz::parse_gateway_event("Q2DZ/1 HEARTBEAT credential=oops"));
+    const std::map<std::string, std::string, std::less<>> ready_fields = {
+        {"id", "42"}, {"peer", "17"}, {"udp", "127.0.0.1:27910"}
+    };
+    const auto hub_ready = q2dz::format_hub_event(q2dz::GatewayEventType::TransportReady, ready_fields);
+    assert(hub_ready == "Q2DZ/HUB/2 READY id=42 udp=127.0.0.1:27910 peer=17");
+    assert(q2dz::parse_gateway_event(hub_ready));
+    assert(q2dz::format_hub_event(q2dz::GatewayEventType::TransportReady,
+                                  {{"id", "42"}, {"udp", "127.0.0.1:27910"}, {"credential", "secret"}}).empty());
+    assert(q2dz::format_hub_event(q2dz::GatewayEventType::TransportReady,
+                                  {{"aLiAs", "room.q2ded.server"}, {"id", "42"}, {"peer", "17"},
+                                   {"udp", "127.0.0.1:27910"}}).empty());
+    assert(q2dz::format_gateway_event(q2dz::GatewayEventType::Heartbeat, {{"token", "secret"}}).empty());
     const auto ping = q2dz::quake_oob_ping();
     assert(ping.size() == 9);
     const std::array<unsigned char, 8> ack = {0xffU,0xffU,0xffU,0xffU,'a','c','k','\n'};
@@ -97,6 +183,132 @@ static void test_protocol() {
     try { (void)parse_gateway_options(11, accepted_argv); }
     catch (const std::invalid_argument&) { rejected_1401 = true; }
     assert(rejected_1401);
+}
+
+static void test_shared_hub_fixture_red() {
+    auto cases = load_hub_fixture();
+    for (const auto& item : cases) {
+        if (item.parser == "event") {
+            const auto parsed = q2dz::parse_gateway_event(item.line);
+            assert(static_cast<bool>(parsed) == item.valid);
+            if (parsed) {
+                assert(q2dz::format_hub_event(parsed.value().type, parsed.value().fields) == item.line);
+                if (item.name == "failed") assert(parsed.value().type == q2dz::GatewayEventType::TargetFailed);
+            }
+        } else if (item.parser == "event_mix") {
+            q2dz::GatewayEventParser parser;
+            assert(parser.parse("Q2DZ/HUB/2 HEARTBEAT state=ok targets=1 ready=1"));
+            assert(!parser.parse(item.line));
+        }
+    }
+}
+
+static void test_shared_hub_fixture() {
+    const auto cases = load_hub_fixture();
+    q2dz::HubCommandParser rooms(q2dz::HubCommandChannel::rooms);
+    q2dz::HubCommandParser hub(q2dz::HubCommandChannel::hub);
+    for (const auto& item : cases) {
+        if (item.parser == "rooms_command") {
+            const auto parsed = rooms.parse(item.line);
+            assert(static_cast<bool>(parsed) == item.valid);
+            if (parsed) assert(q2dz::format_rooms_command(parsed.value()) == item.line);
+        } else if (item.parser == "hub_command") {
+            const auto parsed = hub.parse(item.line);
+            assert(static_cast<bool>(parsed) == item.valid);
+            if (parsed) assert(q2dz::format_hub_command(parsed.value()) == item.line);
+        } else if (item.parser == "hub_sequence") {
+            q2dz::HubCommandParser fresh(q2dz::HubCommandChannel::hub);
+            assert(static_cast<bool>(fresh.parse(item.line)) == item.valid);
+            assert(!q2dz::parse_hub_command(item.line));
+        } else if (item.parser == "line") {
+            q2dz::HubCommandFramer framer;
+            std::string input = item.line + std::string(item.repeat, item.fill);
+            assert(!framer.feed(input));
+            assert(framer.error() == q2dz::HubCommandFramer::Error::line_too_long);
+        } else if (item.parser == "queue") {
+            q2dz::HubCommandFramer framer;
+            const auto input = item.line + '\n';
+            std::size_t accepted = 0;
+            for (std::size_t i = 0; i < item.repeat; ++i) {
+                if (!framer.feed(input)) break;
+                ++accepted;
+            }
+            assert(!framer.feed(""));
+            assert(framer.error() == q2dz::HubCommandFramer::Error::queue_overflow);
+            assert(accepted == q2dz::HubCommandFramer::max_queued_lines);
+            assert(framer.queued_line_count() == 0);
+        } else if (item.parser == "formatter_invalid_utf8") {
+            q2dz::HubCommand command;
+            command.type = q2dz::HubCommandType::put;
+            command.id_or_generation = 42;
+            command.json = {'{', '"', 'x', '"', ':', '"', 0xffU, '"', '}'};
+            assert(q2dz::format_hub_command(command).empty());
+        }
+    }
+}
+
+static void test_hub_framer_boundary() {
+    const std::string head = "Q2DZ/HUB/2 ICE generation=7 json=[\"";
+    const std::string tail = "\"]";
+    const std::string line = head + std::string(q2dz::HubCommandFramer::max_line_bytes - head.size() - tail.size(), 'x') + tail;
+    assert(line.size() == q2dz::HubCommandFramer::max_line_bytes);
+    q2dz::HubCommandFramer framer;
+    assert(framer.feed(line + '\n'));
+    assert(framer.finish());
+    const auto lines = framer.drain();
+    assert(lines.size() == 1 && lines.front().view() == line);
+    assert(q2dz::parse_hub_command(lines.front().view()));
+    auto command = q2dz::parse_hub_command(lines.front().view());
+    command.value().clear();
+    assert(command.value().json.empty());
+
+    q2dz::HubCommandFramer oversized;
+    assert(!oversized.feed(line + "x"));
+    assert(oversized.error() == q2dz::HubCommandFramer::Error::line_too_long);
+
+    q2dz::HubCommandFramer cleared;
+    assert(cleared.feed("Q2DZ/HUB/2 STOP\npartial"));
+    cleared.clear();
+    assert(cleared.queued_line_count() == 0 && cleared.pending_byte_count() == 0);
+}
+
+static void test_hub_command_move_wipes_source() {
+    q2dz::HubCommand short_source;
+    short_source.room_id = "short-room";
+    short_source.json = {'s', 'e', 'c'};
+    q2dz::HubCommand short_destination(std::move(short_source));
+    assert(short_source.room_id.empty() && short_source.json.empty());
+    assert(short_destination.room_id == "short-room" && short_destination.json.size() == 3);
+
+    q2dz::HubCommand heap_source;
+    heap_source.room_id.assign(300, 'r');
+    q2dz::HubCommand heap_destination;
+    heap_destination = std::move(heap_source);
+    assert(heap_source.room_id.empty());
+    assert(heap_destination.room_id.size() == 300);
+}
+
+static void test_short_payload_formatter() {
+    q2dz::HubCommand command;
+    command.type = q2dz::HubCommandType::put;
+    command.id_or_generation = 42;
+    command.json = {'{', '"', 'x', '"', ':', '1', '}'};
+    assert(q2dz::format_hub_command(command) == "Q2DZ/HUB/2 PUT id=42 json={\"x\":1}");
+}
+
+static void test_hub_queue_capacity() {
+    q2dz::HubCommandFramer framer;
+    assert(framer.feed("Q2DZ/HUB/2 ICE generation=7 json=[]\n"));
+    for (std::uint64_t id = 1; id <= 256; ++id) {
+        assert(framer.feed("Q2DZ/HUB/2 PUT id=" + std::to_string(id) + " json={}\n"));
+    }
+    for (std::uint64_t id = 1; id <= 256; ++id) {
+        assert(framer.feed("Q2DZ/HUB/2 DROP id=" + std::to_string(id) + "\n"));
+    }
+    assert(framer.queued_line_count() == 513);
+    assert(!framer.feed("Q2DZ/HUB/2 STOP\n"));
+    assert(framer.error() == q2dz::HubCommandFramer::Error::queue_overflow);
+    assert(framer.queued_line_count() == 0);
 }
 
 static void test_content() {
@@ -168,6 +380,12 @@ static void test_child_environment_scrubs_credential_names() {
 int main() {
     test_json();
     test_protocol();
+    test_shared_hub_fixture_red();
+    test_shared_hub_fixture();
+    test_hub_framer_boundary();
+    test_hub_command_move_wipes_source();
+    test_short_payload_formatter();
+    test_hub_queue_capacity();
     test_content();
     test_child_environment_scrubs_credential_names();
     std::cout << "q2dz unit tests: PASS\n";
