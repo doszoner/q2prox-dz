@@ -559,7 +559,21 @@ def webrtc_main(args: argparse.Namespace, evidence: Evidence) -> int:
             return 0
         harness.run(args.duration)
         return 0
-    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+    except TimeoutError as error:
+        if _STOP.is_set():
+            return 0
+        evidence.emit(
+            {
+                "event": "error",
+                "mode": "webrtc",
+                "code": "peer_readiness_timeout",
+                "ready_count": len(harness.ready),
+                "target_count": harness.count,
+            }
+        )
+        print(str(error), file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         if _STOP.is_set():
             return 0
         evidence.emit(

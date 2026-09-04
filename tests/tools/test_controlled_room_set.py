@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from argparse import Namespace
 import importlib.util
 import io
 import json
@@ -139,6 +140,94 @@ def _run_overlong_line_regression(directory: Path) -> None:
             process.wait(timeout=5)
 
 
+def _run_readiness_timeout_regression(directory: Path) -> None:
+    fake_peer = _write_fake_peer(
+        directory,
+        "import sys\n"
+        "import time\n"
+        "sys.stdin.buffer.readline()\n"
+        "time.sleep(60)\n",
+    )
+    process = _run_webrtc_process(fake_peer)
+    try:
+        assert process.stdout is not None
+        started = read_line(process.stdout)
+        assert started.get("event") == "started"
+        output, error = process.communicate(timeout=5)
+        events = _parse_events(json.dumps(started, sort_keys=True, separators=(",", ":")) + "\n" + output)
+        assert process.returncode == 1
+        assert "Traceback" not in error
+        assert [event for event in events if event.get("event") == "error"] == [
+            {
+                "code": "peer_readiness_timeout",
+                "event": "error",
+                "mode": "webrtc",
+                "ready_count": 0,
+                "target_count": 1,
+            }
+        ]
+        _assert_stopped(events)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _run_stopped_timeout_regression() -> None:
+    spec = importlib.util.spec_from_file_location("controlled_room_set_stopped_timeout", HARNESS)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeEvidence:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def emit(self, event: dict[str, object]) -> None:
+            self.events.append(event)
+
+    class FakeHarness:
+        last: "FakeHarness | None" = None
+
+        def __init__(self, _count: int, _binary: str, _signal: str, evidence: FakeEvidence) -> None:
+            self.ready: dict[str, int] = {}
+            self.count = 1
+            self.evidence = evidence
+            self.closed = False
+            FakeHarness.last = self
+
+        def start(self, _ice: bytes) -> None:
+            return
+
+        def wait_ready(self, _timeout: float) -> bool:
+            raise TimeoutError("synthetic readiness timeout")
+
+        def close(self) -> None:
+            self.closed = True
+            self.evidence.emit({"event": "stopped", "children_alive": 0})
+
+    evidence = FakeEvidence()
+    module.PeerHarness = FakeHarness
+    module._read_ice_stdin = lambda: b"[]"
+    module._STOP.set()
+    try:
+        result = module.webrtc_main(
+            Namespace(
+                count=1,
+                peer_binary="/bin/true",
+                signal=module.DEFAULT_SIGNAL,
+                ready_timeout=1.0,
+                duration=None,
+            ),
+            evidence,
+        )
+        assert result == 0
+        assert FakeHarness.last is not None and FakeHarness.last.closed
+        assert evidence.events == [{"event": "stopped", "children_alive": 0}]
+    finally:
+        module._STOP.clear()
+
+
 def _run_queue_overflow_regression() -> None:
     spec = importlib.util.spec_from_file_location("controlled_room_set", HARNESS)
     assert spec is not None and spec.loader is not None
@@ -207,6 +296,8 @@ def main() -> int:
             directory = Path(temporary)
             _run_sigterm_regression(directory)
             _run_overlong_line_regression(directory)
+            _run_readiness_timeout_regression(directory)
+        _run_stopped_timeout_regression()
         _run_queue_overflow_regression()
         print("controlled-room-set source self-check: PASS")
         return 0
