@@ -1,14 +1,25 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import * as vm from "node:vm";
 
 import * as transportProtocol from "../assets/transport_protocol.mjs";
+import {
+  ManagedReadinessProbe,
+  quakeOob,
+} from "../../coordinator/web/managed-readiness-probe.mjs";
 
 const {
   bytesToMessage,
   createCadenceCounter,
+  createFairReceiveScheduler,
   exactAliasQuery,
   messageToBytes,
+  createTargetRegistry,
+  maxQueuedPacketsPerTarget,
+  maxPumpPacketsPerTick,
+  normalizeIceGeneration,
+  normalizeTargetId,
   parseStartMessage,
   reliableSendMode,
 } = transportProtocol;
@@ -67,6 +78,12 @@ test("validates startup and preserves supported datagram boundaries", () => {
     iceServers: [{ urls: ["stun:example.invalid"] }],
   });
   assert.equal(exactAliasQuery(config.alias), "=q2.3573146018");
+  assert.equal(normalizeIceGeneration("9007199254740993"), 9007199254740993n);
+  assert.equal(normalizeIceGeneration("18446744073709551615"),
+    18446744073709551615n);
+  for (const generation of [1, "01", "0", "18446744073709551616"]) {
+    assert.equal(normalizeIceGeneration(generation), null);
+  }
 
   for (const size of [1, 32, 512, 1390, 1400]) {
     const input = Uint8Array.from({ length: size }, (_, i) => (i * 31 + size) & 255);
@@ -97,8 +114,8 @@ test("transport page gates readiness on the managed Quake OOB probe", () => {
 test("transport page reports one-second cadence at existing call sites", () => {
   const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
   assert.match(html, /createCadenceCounter/);
-  assert.match(html, /const cadenceTimer = setInterval/);
-  assert.match(html, /clearInterval\(cadenceTimer\)/);
+  assert.match(html, /timer = setInterval\(pump, 5\)/);
+  assert.match(html, /clearInterval\(timer\)/);
   for (const call of [
     "timerTick", "waitCall", "aliasPoll", "probeSend", "probeAck",
     "dcToNative", "nativeToDc",
@@ -114,19 +131,207 @@ test("incoming datagram size rejection is bounded", () => {
   assert.equal(transportProtocol.classifyIncomingDatagram(1399), "accepted");
 });
 
+test("routes tagged datagrams by concrete peer and rejects duplicate peers", () => {
+  const registry = createTargetRegistry();
+  const largeTarget = "9007199254740993";
+  assert.equal(normalizeTargetId(largeTarget), largeTarget);
+  assert.equal(transportProtocol.parseTargetMessage({
+    targetId: "18446744073709551615", alias: "q2.max",
+  }).targetId, "18446744073709551615");
+  assert.equal(normalizeTargetId("09007199254740993"), null);
+  assert.equal(normalizeTargetId("18446744073709551616"), null);
+  assert.equal(registry.put({ targetId: largeTarget, alias: "q2.alpha" }), true);
+  assert.equal(registry.put({ targetId: "12", alias: "room.q2ded.beta" }), true);
+  assert.equal(registry.bindPeer(largeTarget, 101), "bound");
+  assert.equal(registry.bindPeer("12", 202), "bound");
+  assert.equal(registry.bindPeer("12", 0x80000001), "invalid_peer");
+  assert.equal(registry.bindPeer("12", 101), "duplicate_remote_peer");
+
+  const payload = Uint8Array.from([1, 2, 3]);
+  assert.deepEqual(registry.send(largeTarget, payload), {
+    type: "udp", targetId: largeTarget, data: bytesToMessage(payload).data,
+  });
+  assert.deepEqual(registry.receive(202, payload), {
+    type: "udp", targetId: "12", data: bytesToMessage(payload).data,
+  });
+  assert.deepEqual(registry.receive(999, payload), {
+    type: "drop", reason: "unknown_peer",
+  });
+
+  assert.equal(registry.close(largeTarget), true);
+  assert.equal(registry.targetForPeer(101), undefined);
+  assert.equal(registry.targetForPeer(202), "12");
+  assert.equal(registry.targets.size, 1);
+});
+
+test("keeps OOB probes and close state independent for two targets", () => {
+  const timers = [];
+  const ready = [];
+  const closed = [];
+  const makeProbe = (targetId) => new ManagedReadinessProbe({
+    send: () => true,
+    onReady: () => ready.push(targetId),
+    onRoomClosed: (reason) => closed.push([targetId, reason]),
+    setTimer: (callback) => {
+      timers.push(callback);
+      return callback;
+    },
+    clearTimer: () => {},
+  });
+  const first = makeProbe(11);
+  const second = makeProbe(12);
+  first.channelOpened();
+  second.channelOpened();
+  assert.equal(first.packetReceived(quakeOob("ack")), true);
+  assert.deepEqual(ready, [11]);
+  first.channelClosed("probe_timeout");
+  assert.deepEqual(closed, [[11, "probe_timeout"]]);
+  assert.equal(second.packetReceived(quakeOob("ack")), true);
+  assert.deepEqual(ready, [11, 12]);
+  assert.equal(second.closed, false);
+  assert.ok(timers.length >= 2);
+});
+
+test("pump work is bounded while per-target probes and ICE precede connections", () => {
+  const registry = createTargetRegistry();
+  registry.put({ targetId: 1, alias: "q2.alpha" });
+  registry.bindPeer(1, 101);
+  let received = 0;
+  assert.equal(registry.pump(
+    () => ({ peer: 101, data: Uint8Array.of(received++) }),
+    () => {},
+  ), maxPumpPacketsPerTick);
+
+  const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
+  assert.equal((html.match(/import WebRTCNet/g) ?? []).length, 1);
+  assert.equal((html.match(/setInterval\(/g) ?? []).length, 1);
+  assert.match(html, /new ManagedReadinessProbe/);
+  assert.match(html, /const targets = new Map/);
+  assert.match(html, /const remotePeerToTarget = new Map/);
+  assert.ok(html.indexOf("setIceServers") < html.indexOf("connectTo"));
+});
+
+test("production scheduler gives a second target a delivery slot under a flood", () => {
+  const single = Array.from({ length: maxPumpPacketsPerTick }, () => ({
+    peer: 303, data: Uint8Array.of(3),
+  }));
+  const singleDelivered = [];
+  const singleResult = createFairReceiveScheduler().pump(
+    () => single.shift(),
+    () => "303",
+    (targetId, data) => singleDelivered.push([targetId, data[0]]),
+  );
+  assert.equal(singleResult.scanned, maxPumpPacketsPerTick);
+  assert.equal(singleResult.delivered, maxPumpPacketsPerTick);
+  assert.equal(singleDelivered.length, maxPumpPacketsPerTick);
+
+  const scheduler = createFairReceiveScheduler();
+  const input = [
+    ...Array.from({ length: maxPumpPacketsPerTick - 1 }, () => ({
+      peer: 101, data: Uint8Array.of(1),
+    })),
+    { peer: 202, data: Uint8Array.of(2) },
+  ];
+  const delivered = [];
+  const drops = [];
+  const result = scheduler.pump(
+    () => input.shift(),
+    (peer) => peer === 101 ? "9007199254740993" : peer === 202 ? "12" : undefined,
+    (targetId, data) => delivered.push([targetId, data[0]]),
+    (packet, targetId) => drops.push([packet.peer, targetId]),
+  );
+  assert.equal(result.scanned, maxPumpPacketsPerTick);
+  assert.ok(delivered.some(([targetId, value]) => targetId === "12" && value === 2));
+  assert.equal(delivered.filter(([targetId]) => targetId === "9007199254740993").length,
+    maxPumpPacketsPerTick - 1);
+  assert.deepEqual(drops, []);
+
+  const interleaved = createFairReceiveScheduler();
+  const fortyPackets = Array.from({ length: 40 }, (_, index) => ({
+    peer: 1000 + index,
+    data: Uint8Array.of(index + 1),
+  }));
+  const fortyRouted = [];
+  const fortyResult = interleaved.pump(
+    () => fortyPackets.shift(),
+    (peer) => peer === 1000 ? "9007199254740993" : String(peer - 988),
+    (targetId, data) => fortyRouted.push([targetId, data[0]]),
+  );
+  assert.equal(fortyResult.scanned, 40);
+  assert.equal(fortyRouted.length, 40);
+  assert.deepEqual(fortyRouted.map(([, value]) => value),
+    Array.from({ length: 40 }, (_, index) => index + 1));
+
+  const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
+  assert.match(html, /createFairReceiveScheduler/);
+  assert.match(html, /receiveScheduler\.pump\(/);
+  assert.match(html, /maxPumpPacketsPerTick/);
+  assert.equal(maxQueuedPacketsPerTarget, 64);
+});
+
+test("startup burst capacity admits ICE plus all bounded targets before page-ready", () => {
+  const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
+  const lineBytes = 64 * 1024;
+  const queueCapacity = 256 + 2;
+  const burst = ["I".repeat(lineBytes), ...Array.from(
+    { length: 256 }, (_, index) => "P".repeat(lineBytes - String(index + 1).length))];
+  assert.equal(burst.length, 257);
+  assert.ok(burst.reduce((sum, line) => sum + line.length, 0) <= lineBytes * queueCapacity);
+  assert.match(source, /max_control_queue_commands = max_targets \+ 2/);
+  assert.match(source, /max_control_queue_bytes = max_control_bytes \* max_control_queue_commands/);
+  assert.match(source, /control_lines_\.size\(\) >= max_control_queue_commands/);
+  assert.match(source, /lines\.size\(\) < max_control_commands_per_tick/);
+});
+
 test("native gateway exposes only the managed non-sensitive startup contract", () => {
   const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
   const cmake = readFileSync(new URL("../CMakeLists.txt", import.meta.url), "utf8");
+  const wasmSource = readFileSync(
+    new URL("../../../../WebRTC-NET-q2prox-shared/webrtcnet/src/main.cpp", import.meta.url),
+    "utf8");
   for (const option of ["--managed-session", "--udp-port", "--owner-handle", "--user-data-dir"]) {
     assert.match(source, new RegExp(option));
   }
   assert.match(source, /record_oversized_datagram\(\s*static_cast<std::size_t>\(length\)/);
   assert.match(source, /record_accepted_datagram\(datagram\.size\(\)/);
   assert.match(source, /record_oversized_transport_drop\(message/);
+  assert.match(source, /record_unknown_peer_drop\(message/);
+  assert.match(source, /fail_target\(target->second, "udp", "udp_async_error"\)/);
+  assert.match(source, /fail_target\(id, "udp", "udp_receive_failed"\)/);
+  assert.doesNotMatch(source, /fail\("udp_async_error"\)/);
+  assert.ok(source.includes('targetId\\":\\"'));
   assert.doesNotMatch(source, /\+\+oversized_(?:udp|transport)_drops_/);
   assert.doesNotMatch(source, /--alias|--ice-file|read_ice_file/);
+  assert.match(source, /control_mode_ = mode;/);
+  assert.match(source, /control_mode_ == ControlMode::hub/);
+  assert.match(source, /Q2DZ\/HUB\/2 FATAL stage=gateway code=/);
+  assert.doesNotMatch(source, /legacy_mode_ \|\| targets_\.empty\(\)/);
+  assert.match(source, /generation\\":\\"/);
+  assert.match(source, /void fail_target\([\s\S]*?post_hub_command\(drop\);[\s\S]*?close_target\(target_id\)/);
+  assert.match(source, /constexpr UINT retire_socket_message = WM_APP \+ 3;/);
+  assert.match(source, /WSAAsyncSelect\(target->second\.socket, window_, 0, 0\)/);
+  assert.match(source, /retiring_sockets_\.insert/);
+  assert.match(source, /if \(message == retire_socket_message\)/);
+  assert.match(source, /read_hub_bytes\(pending, hub_pending_\);\s*secure_clear\(pending\);/);
+  const readHub = source.slice(source.indexOf("void read_hub_bytes"),
+    source.indexOf("void start_control_reader"));
+  assert.match(readHub, /std::string remainder = pending\.substr\(newline \+ 1U\)/);
+  assert.match(readHub, /secure_clear\(pending\);\s*pending = std::move\(remainder\)/);
+  assert.doesNotMatch(readHub, /pending\.erase\(0/);
+  assert.match(source, /SecureZeroMemory\(value,/);
+  assert.match(source, /secure_clear\(wide\);/);
+  assert.match(source, /ControlMode mode;\s*\{\s*std::lock_guard lock\(control_mutex_\);\s*mode = control_mode_;/);
   assert.match(cmake, /managed-readiness-probe\.mjs/);
   assert.match(cmake, /CMAKE_MSVC_RUNTIME_LIBRARY/);
+  assert.match(wasmSource,
+    /EM_JS\(void, aliasQueryAdd,\s*\(const char\* query, const char\* alias, uint32_t peer, uint32_t token\)/);
+  assert.match(wasmSource,
+    /Module\.aliasQueryAdd\(UTF8ToString\(query\), UTF8ToString\(alias\), peer, token\)/);
+  assert.match(wasmSource,
+    /EM_JS\(void, aliasQueryEnd,\s*\(const char\* query, uint32_t token\)/);
+  assert.match(wasmSource,
+    /Module\.onAliasQueryEnd\(UTF8ToString\(query\), token\)/);
+  assert.match(wasmSource, /queryAliases\(const char\* cquery, uint32_t token\)/);
 });
 
 test("native gateway keeps WebView2 foreground without production browser flags", () => {
@@ -155,4 +360,382 @@ test("native gateway keeps WebView2 foreground without production browser flags"
   assert.doesNotMatch(source, /diagnostic_background_timer_flag=/);
   assert.doesNotMatch(source, /SetEnvironmentVariable/);
   assert.doesNotMatch(source, /<<\s*message|<<\s*configuration_/);
+});
+
+test("keeps v1 startup dispatch alongside HUB/2 control dispatch", () => {
+  const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
+  assert.match(html, /value\?\.version === 1/);
+  assert.match(html, /startLegacy\(value\)/);
+  assert.match(html, /value\?\.type === "put"/);
+  assert.match(html, /value\?\.type === "drop"/);
+  assert.match(html, /value\?\.type === "ice"/);
+  assert.ok(source.indexOf("bind_target_socket(1)") <
+    source.indexOf("post_legacy_configuration(std::move(legacy))"));
+  assert.match(source, /if \(legacy_mode_\) \{\s*failed_ = true;/);
+});
+
+function createTransportPageHarness() {
+  const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
+  const script = html.slice(html.indexOf('<script type="module">') + '<script type="module">'.length)
+    .replace(/<\/script>\s*$/, "")
+    .replace(/import WebRTCNet from "\.\/webrtcnet\.mjs";\n/, "")
+    .replace(/import \{[\s\S]*?\} from "\.\/transport_protocol\.mjs";\n/, "")
+    .replace(/import \{ ManagedReadinessProbe \} from "\.\/managed-readiness-probe\.mjs";\n/, "");
+  const posts = [];
+  const pumpTimers = [];
+  const probeTimers = [];
+  const receiveQueue = [];
+  const calls = [];
+  const memory = new ArrayBuffer(64 * 1024);
+  let nextAllocation = 8;
+  let webRtcOptions;
+  const runtime = {
+    HEAPU8: new Uint8Array(memory),
+    HEAP32: new Int32Array(memory),
+    _malloc(size) {
+      const pointer = nextAllocation;
+      nextAllocation += size;
+      return pointer;
+    },
+    cwrap(name) {
+      if (name === "setIceServers") return (value) => {
+        calls.push([name, value]);
+        return 1;
+      };
+      if (name === "connectTo") return (...args) => {
+        calls.push([name, ...args]);
+        return 1;
+      };
+      if (name === "wait") return () => {};
+      if (name === "myId") return () => 7;
+      if (name === "queryAliases") return (query, token) => calls.push([name, query, token]);
+      if (name === "sendto") return (pointer, length, peer) => {
+        calls.push([name, peer, runtime.HEAPU8.slice(pointer, pointer + length)]);
+        return length;
+      };
+      if (name === "recvfrom") return (pointer, length, peerPointer) => {
+        const packet = receiveQueue.shift();
+        if (!packet) return 0;
+        runtime.HEAPU8.set(packet.data.subarray(0, length), pointer);
+        runtime.HEAP32[peerPointer >> 2] = packet.peer;
+        return packet.data.length;
+      };
+      if (name === "disconnect") return (peer) => calls.push([name, peer]);
+      if (name === "shutdown") return () => calls.push([name]);
+      throw new Error(`unexpected cwrap ${name}`);
+    },
+  };
+  function fakeWebRTCNet(options) {
+    webRtcOptions = options;
+    return Promise.resolve(runtime);
+  }
+  const fakeSetTimeout = (callback, delay) => {
+    const timer = { callback, delay, active: true };
+    probeTimers.push(timer);
+    return timer;
+  };
+  const fakeClearTimeout = (timer) => { if (timer) timer.active = false; };
+  function TestProbe(options) {
+    return new ManagedReadinessProbe({
+      ...options, setTimer: fakeSetTimeout, clearTimer: fakeClearTimeout,
+    });
+  }
+  const webview = {
+    addEventListener(_name, callback) { this.listener = callback; },
+    postMessage(value) { posts.push(value); },
+  };
+  const context = {
+    WebRTCNet: fakeWebRTCNet,
+    ManagedReadinessProbe: TestProbe,
+    bytesToMessage,
+    classifyIncomingDatagram: transportProtocol.classifyIncomingDatagram,
+    createCadenceCounter,
+    createFairReceiveScheduler,
+    exactAliasQuery,
+    maxDatagram: transportProtocol.maxDatagram,
+    maxTargets: transportProtocol.maxTargets,
+    maxPumpPacketsPerTick,
+    messageToBytes,
+    normalizeIceGeneration,
+    normalizeTargetId,
+    parseStartMessage,
+    parseTargetMessage: transportProtocol.parseTargetMessage,
+    reliableSendMode,
+    chrome: { webview },
+    window: {},
+    performance: { now: () => 100 },
+    setInterval(callback) { pumpTimers.push(callback); return callback; },
+    clearInterval() {},
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+    atob,
+    btoa,
+    TextEncoder,
+    TextDecoder,
+  };
+  vm.runInNewContext(script, context, { filename: "transport.html" });
+  assert.equal(JSON.stringify(posts.shift()),
+    JSON.stringify({ type: "state", value: "page-ready", reason: "" }));
+  return {
+    calls,
+    posts,
+    probeTimers,
+    receiveQueue,
+    pumpTimers,
+    state: { get webRtcOptions() { return webRtcOptions; } },
+    webview,
+    setNextQueryToken(value) {
+      vm.runInNewContext(`nextQueryRequestToken = ${String(value)}`, context);
+    },
+    async flush() {
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  };
+}
+
+async function runLegacyPageAdmission() {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  webview.listener({ data: {
+    version: 1,
+    roomId: "room.q2.example.1",
+    alias: "q2.alpha",
+    ordered: false,
+    iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  assert.equal(calls[0][0], "setIceServers");
+  assert.equal(calls[1][0], "connectTo");
+  assert.equal(pumpTimers.length, 1);
+  pumpTimers[0]();
+  assert.deepEqual(calls.at(-1).slice(0, 2), ["queryAliases", "=q2.alpha"]);
+  const queryToken = calls.at(-1)[2];
+  assert.ok(Number.isInteger(queryToken) && queryToken > 0);
+  harness.state.webRtcOptions.aliasQueryAdd("=q2.alpha", "q2.alpha", 77, queryToken);
+  harness.state.webRtcOptions.onAliasQueryEnd("=q2.alpha", queryToken);
+  pumpTimers[0]();
+  receiveQueue.push({ peer: 77, data: quakeOob("ack") });
+  pumpTimers[0]();
+  const ready = posts.find((value) => value.value === "transport-ready");
+  assert.equal(JSON.stringify(ready), JSON.stringify({
+    type: "state", value: "transport-ready", targetId: "1", peer: 77,
+  }));
+  return { calls, posts };
+}
+
+test("v1 page dispatch admits a legacy target and emits tagged ready state", async () => {
+  const result = await runLegacyPageAdmission();
+  assert.ok(result.calls.some(([name, peer]) => name === "sendto" && peer === 77));
+});
+
+test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  const aliases = Array.from({ length: 40 }, (_, index) =>
+    index % 2 === 0 ? `q2.room.${index + 1}` : `room.q2ded.room.${index + 1}`);
+  const peers = aliases.map((_, index) => 100 + index + 1);
+  const iceServers = [{ urls: ["stun:example.invalid"] }];
+
+  webview.listener({ data: {
+    type: "ice", generation: "9007199254740993", iceServers,
+  } });
+  await harness.flush();
+  for (let index = 0; index < aliases.length; ++index) {
+    webview.listener({ data: {
+      type: "put", targetId: String(index + 1),
+      config: { alias: aliases[index], ordered: false },
+    } });
+  }
+  await harness.flush();
+
+  assert.equal(pumpTimers.length, 1);
+  assert.equal(calls[0][0], "setIceServers");
+  assert.equal(calls[0][1], JSON.stringify(iceServers));
+  assert.equal(calls[1][0], "connectTo");
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, query]) => query),
+    aliases.map((alias) => `=${alias}`));
+
+  const options = harness.state.webRtcOptions;
+  assert.ok(options);
+  const queryTokens = new Map(calls.filter(([name]) => name === "queryAliases")
+    .map(([, query, token]) => [query, token]));
+  for (let index = 0; index < aliases.length; ++index) {
+    const query = `=${aliases[index]}`;
+    const token = queryTokens.get(query);
+    options.aliasQueryAdd(query, aliases[index], peers[index], token);
+    options.onAliasQueryEnd(query, token);
+  }
+  pumpTimers[0]();
+  assert.equal(calls.filter(([name]) => name === "sendto").length, 40);
+
+  // Put an ACK and a uniquely tagged payload beside each other for every
+  // target.  The production scheduler must deliver each ACK before its
+  // payload while its bounded scan splits the 80-packet burst over ticks.
+  for (let index = 0; index < aliases.length; ++index) {
+    receiveQueue.push({ peer: peers[index], data: quakeOob("ack") });
+    receiveQueue.push({
+      peer: peers[index], data: Uint8Array.of(index + 1, 255 - index),
+    });
+  }
+  pumpTimers[0]();
+  pumpTimers[0]();
+
+  const ready = posts.filter((value) => value.value === "transport-ready");
+  assert.equal(ready.length, 40);
+  assert.deepEqual(ready.map(({ targetId, peer }) => [targetId, peer]).sort(
+    ([left], [right]) => Number(left) - Number(right)),
+    peers.map((peer, index) => [String(index + 1), peer]));
+  const routed = posts.filter((value) => value.type === "udp");
+  assert.equal(routed.length, 40);
+  assert.deepEqual(routed.map(({ targetId, data }) => [targetId, data]).sort(
+    ([left], [right]) => Number(left) - Number(right)),
+    aliases.map((_, index) => [
+      String(index + 1), bytesToMessage(Uint8Array.of(index + 1, 255 - index)).data,
+    ]));
+
+  const beforeDrop = posts.length;
+  webview.listener({ data: { type: "drop", targetId: "1" } });
+  await harness.flush();
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === peers[0]));
+  receiveQueue.push({ peer: peers[0], data: Uint8Array.of(0xd1) });
+  receiveQueue.push({ peer: peers[1], data: Uint8Array.of(0xd2) });
+  pumpTimers[0]();
+  const survivor = posts.slice(beforeDrop).filter((value) => value.type === "udp");
+  assert.deepEqual(survivor.map(({ type, targetId, data }) => [type, targetId, data]), [[
+    "udp", "2", bytesToMessage(Uint8Array.of(0xd2)).data,
+  ]]);
+  assert.ok(posts.slice(beforeDrop).some((value) =>
+    value.type === "drop" && value.reason === "unknown_peer"));
+});
+
+test("production page does not let an old alias query bind a replacement target", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  const alias = "q2.stale";
+  const query = `=${alias}`;
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
+    [query]);
+  const oldToken = calls.find(([name, value]) => name === "queryAliases" && value === query)[2];
+
+  webview.listener({ data: { type: "drop", targetId: "1" } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 1);
+
+  const options = harness.state.webRtcOptions;
+  options.aliasQueryAdd(query, alias, 11, oldToken);
+  options.onAliasQueryEnd(query, oldToken);
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
+    [query, query]);
+  const newToken = calls.at(-1)[2];
+  assert.notEqual(newToken, oldToken);
+
+  // The old query may finish asynchronously after the replacement query has
+  // started.  Its callbacks must not bind or close the fresh token's record.
+  options.aliasQueryAdd(query, alias, 12, oldToken);
+  options.onAliasQueryEnd(query, oldToken);
+
+  options.aliasQueryAdd(query, alias, 22, newToken);
+  options.onAliasQueryEnd(query, newToken);
+  pumpTimers[0]();
+  receiveQueue.push({ peer: 22, data: quakeOob("ack") });
+  pumpTimers[0]();
+  const ready = posts.filter((value) => value.value === "transport-ready");
+  assert.deepEqual(ready.map(({ targetId, peer }) => [targetId, peer]), [["1", 22]]);
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === 22) === false);
+});
+
+test("production page clears a failed target before same-id retry", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  const alias = "q2.retry";
+  const query = `=${alias}`;
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  const options = harness.state.webRtcOptions;
+  const firstToken = calls.find(([name, value]) => name === "queryAliases" && value === query)[2];
+  options.aliasQueryAdd(query, alias, 11, firstToken);
+  options.aliasQueryAdd(query, alias, 12, firstToken);
+  options.onAliasQueryEnd(query, firstToken);
+  pumpTimers[0]();
+  assert.ok(posts.some((value) => value.type === "state" && value.value === "failed" &&
+    value.targetId === "1" && value.reason === "alias_not_unique"));
+
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
+    [query, query]);
+  const retryToken = calls.at(-1)[2];
+  options.aliasQueryAdd(query, alias, 22, retryToken);
+  options.onAliasQueryEnd(query, retryToken);
+  pumpTimers[0]();
+  receiveQueue.push({ peer: 22, data: quakeOob("ack") });
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["1", 22]]);
+  assert.equal(posts.filter((value) => value.type === "state" && value.value === "failed")
+    .length, 1);
+});
+
+test("production page normalizes signed uint32 alias callback tokens", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+
+  const admit = async (targetId, token, peer) => {
+    harness.setNextQueryToken(token);
+    const alias = `q2.token-${targetId}`;
+    const query = `=${alias}`;
+    webview.listener({ data: {
+      type: "put", targetId: String(targetId), config: { alias, ordered: false },
+    } });
+    await harness.flush();
+    pumpTimers[0]();
+    const queryCall = calls.at(-1);
+    assert.deepEqual(queryCall.slice(0, 2), ["queryAliases", query]);
+    assert.equal(queryCall[2], token);
+    const signedToken = token > 0x7fffffff ? token - 0x100000000 : token;
+    const options = harness.state.webRtcOptions;
+    options.aliasQueryAdd(query, alias, peer, signedToken);
+    options.onAliasQueryEnd(query, signedToken);
+    pumpTimers[0]();
+    receiveQueue.push({ peer, data: quakeOob("ack") });
+    pumpTimers[0]();
+    assert.ok(posts.some((value) => value.type === "state" &&
+      value.value === "transport-ready" && value.targetId === String(targetId) &&
+      value.peer === peer));
+  };
+
+  await admit(1, 0x80000000, 801);
+  await admit(2, 0xffffffff, 802);
 });

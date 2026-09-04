@@ -33,14 +33,39 @@ struct NativeCadence {
     std::uint64_t post_to_web_max_gap_ms = 0;
 };
 
+struct TaggedDatagram {
+    std::uint64_t target_id;
+    std::vector<std::uint8_t> datagram;
+};
+
+struct TransportReadyMessage {
+    std::uint64_t target_id;
+    std::uint32_t peer;
+};
+
+struct TargetStateMessage {
+    std::uint64_t target_id;
+    std::string value;
+    std::string reason;
+    std::uint32_t peer = 0;
+};
+
 std::string encode_datagram_message(const std::vector<std::uint8_t> &datagram);
+std::string encode_datagram_message(std::uint64_t target_id,
+                                    const std::vector<std::uint8_t> &datagram);
 std::vector<std::uint8_t> decode_datagram_message(std::string_view message);
+TaggedDatagram decode_tagged_datagram_message(std::string_view message);
+std::optional<std::uint64_t> parse_ice_generation_message(std::string_view message);
 bool record_oversized_datagram(std::size_t size,
                                std::uint64_t &oversized_drops) noexcept;
 void record_accepted_datagram(std::size_t size, std::size_t &maximum) noexcept;
 bool record_oversized_transport_drop(std::string_view message,
                                      std::uint64_t &oversized_drops) noexcept;
+bool record_unknown_peer_drop(std::string_view message,
+                              std::uint64_t &unknown_peer_drops) noexcept;
 std::optional<std::uint32_t> parse_transport_ready_peer(std::string_view message);
+std::optional<TransportReadyMessage> parse_transport_ready_message(std::string_view message);
+std::optional<TargetStateMessage> parse_target_state_message(std::string_view message);
 std::optional<std::string> parse_room_closed_reason(std::string_view message);
 std::optional<std::string> parse_transport_failed_reason(std::string_view message);
 std::optional<CadenceSnapshot> parse_cadence_message(std::string_view message);
