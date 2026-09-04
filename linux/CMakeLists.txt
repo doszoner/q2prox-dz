@@ -126,6 +126,7 @@ if(BUILD_TESTING)
     target_link_options(q2dz-unit-tests PRIVATE -fsanitize=address,undefined)
   endif()
   add_test(NAME unit COMMAND q2dz-unit-tests)
+  set_tests_properties(unit PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME fake-lifecycle
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_lifecycle.sh
             $<TARGET_FILE:q2dz-session>
