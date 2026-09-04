@@ -75,6 +75,7 @@ public:
     [[nodiscard]] bool feed(std::string_view bytes);
     [[nodiscard]] bool finish();
     [[nodiscard]] std::deque<WipedLine> drain();
+    [[nodiscard]] std::deque<WipedLine> drain(std::size_t maximum);
     void clear() noexcept;
     [[nodiscard]] std::size_t pending_byte_count() const noexcept { return pending_.size(); }
     [[nodiscard]] std::size_t queued_line_count() const noexcept { return lines_.size(); }

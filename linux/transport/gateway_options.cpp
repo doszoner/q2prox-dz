@@ -27,9 +27,13 @@ int parse_number(const std::string &value) {
 
 GatewayOptions parse_gateway_options(int argc, char **argv) {
     GatewayOptions options;
+    if (argc == 1) return options;
     for (int index = 1; index < argc; ++index) {
         const std::string option = argv[index];
-        if (option == "--bind") {
+        if (option == "--max-datagram") {
+            options.max_datagram = parse_number(require_value(argc, argv, index));
+        } else if (option == "--bind") {
+            options.legacy_arguments = true;
             const std::string bind = require_value(argc, argv, index);
             constexpr const char prefix[] = "127.0.0.1:";
             if (bind.rfind(prefix, 0) != 0) {
@@ -41,21 +45,25 @@ GatewayOptions parse_gateway_options(int argc, char **argv) {
             }
             options.port = static_cast<std::uint16_t>(port);
         } else if (option == "--signal") {
+            options.legacy_arguments = true;
             options.signal = require_value(argc, argv, index);
         } else if (option == "--ice-file") {
+            options.legacy_arguments = true;
             options.ice_file = require_value(argc, argv, index);
         } else if (option == "--alias") {
+            options.legacy_arguments = true;
             options.alias = require_value(argc, argv, index);
-        } else if (option == "--max-datagram") {
-            options.max_datagram = parse_number(require_value(argc, argv, index));
         } else {
             throw std::invalid_argument("unknown option: " + option);
         }
     }
-    if (options.port == 0 || options.signal.rfind("wss://", 0) != 0 ||
-        options.ice_file.empty() || !valid_alias(options.alias) ||
-        options.max_datagram != 1400) {
+    if (options.max_datagram != 1400) {
         throw std::invalid_argument("invalid or incomplete gateway options");
+    }
+    if (options.legacy_arguments &&
+        (options.port == 0 || options.signal.rfind("wss://", 0) != 0 ||
+         options.ice_file.empty() || !valid_alias(options.alias))) {
+        throw std::invalid_argument("invalid or incomplete legacy gateway options");
     }
     return options;
 }

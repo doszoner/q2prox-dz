@@ -9,7 +9,8 @@ struct GatewayOptions {
     std::string ice_file;
     std::string alias;
     std::uint16_t port = 0;
-    int max_datagram = 0;
+    int max_datagram = 1400;
+    bool legacy_arguments = false;
 };
 
 GatewayOptions parse_gateway_options(int argc, char **argv);

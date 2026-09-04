@@ -578,6 +578,18 @@ std::deque<WipedLine> HubCommandFramer::drain() {
     return result;
 }
 
+std::deque<WipedLine> HubCommandFramer::drain(std::size_t maximum) {
+    if (maximum >= lines_.size()) return drain();
+    std::deque<WipedLine> result;
+    while (maximum != 0 && !lines_.empty()) {
+        queued_bytes_ -= lines_.front().view().size();
+        result.emplace_back(std::move(lines_.front()));
+        lines_.pop_front();
+        --maximum;
+    }
+    return result;
+}
+
 Result<GatewayEvent> parse_gateway_event(std::string_view input) {
     if (input.starts_with(kHubPrefix)) return parse_v2_event(input);
     return parse_v1_event(input);

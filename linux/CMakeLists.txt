@@ -70,11 +70,12 @@ if(EXISTS "${Q2DZ_WEBRTC_NET_RELEASE_DIR}/humblenet_p2p.h" AND
   add_executable(q2dz-webrtc-gateway
     transport/q2_doszone_gateway.cpp
     transport/gateway_options.cpp
-    transport/probe_options.cpp)
+    transport/probe_options.cpp
+    transport/multiroom_state.cpp)
   target_include_directories(q2dz-webrtc-gateway PRIVATE
     transport "${Q2DZ_WEBRTC_NET_RELEASE_DIR}")
   target_link_libraries(q2dz-webrtc-gateway PRIVATE
-    "${Q2DZ_WEBRTC_NET_RELEASE_DIR}/libhumblenet.so" dl pthread)
+    q2dz_common "${Q2DZ_WEBRTC_NET_RELEASE_DIR}/libhumblenet.so" dl pthread)
   target_compile_options(q2dz-webrtc-gateway PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
     -Wformat=2 -Wshadow -Wnull-dereference -Wdouble-promotion
@@ -87,6 +88,12 @@ if(EXISTS "${Q2DZ_WEBRTC_NET_RELEASE_DIR}/humblenet_p2p.h" AND
   set_target_properties(q2dz-webrtc-gateway PROPERTIES
     BUILD_RPATH "${Q2DZ_WEBRTC_NET_RELEASE_DIR}"
     INSTALL_RPATH "$ORIGIN/../lib")
+  if(Q2DZ_ENABLE_SANITIZERS)
+    target_compile_options(q2dz-webrtc-gateway PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(q2dz-webrtc-gateway PRIVATE
+      -fsanitize=address,undefined)
+  endif()
 else()
   if(Q2DZ_REQUIRE_WEBRTC_GATEWAY)
     message(FATAL_ERROR "Pinned WebRTC-NET runtime is required for a product build: ${Q2DZ_WEBRTC_NET_RELEASE_DIR}")
@@ -105,7 +112,8 @@ include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(q2dz-unit-tests tests/unit_tests.cpp
-    transport/gateway_options.cpp transport/probe_options.cpp)
+    transport/gateway_options.cpp transport/probe_options.cpp
+    transport/multiroom_state.cpp)
   target_link_libraries(q2dz-unit-tests PRIVATE q2dz_common)
   target_include_directories(q2dz-unit-tests PRIVATE transport)
   target_compile_definitions(q2dz-unit-tests PRIVATE _GNU_SOURCE)
@@ -135,6 +143,14 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify-legacy-contract.py
               --gateway $<TARGET_FILE:q2dz-webrtc-gateway>
               --adapter ${CMAKE_CURRENT_SOURCE_DIR}/config/legacy-gateway.json)
+    add_test(NAME direct-gateway-hub
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_direct_gateway.py
+              $<TARGET_FILE:q2dz-webrtc-gateway>)
+    set_tests_properties(direct-gateway-hub PROPERTIES TIMEOUT 15)
+    if(Q2DZ_ENABLE_SANITIZERS)
+      set_tests_properties(direct-gateway-hub PROPERTIES
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:strict_string_checks=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+    endif()
   endif()
 endif()
 
