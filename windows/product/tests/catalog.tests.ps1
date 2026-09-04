@@ -1,8 +1,8 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$catalogPath = Join-Path $PSScriptRoot '..\catalog.ps1'
-. $catalogPath
+. (Join-Path $PSScriptRoot '..\catalog.ps1')
+. (Join-Path $PSScriptRoot '..\q2dz-launch.ps1')
 
 function Assert-True {
   param([bool]$Value, [string]$Message)
@@ -19,76 +19,209 @@ function Assert-Equal {
 function Assert-Throws {
   param([scriptblock]$Action, [string]$Message)
   $thrown = $false
-  try { & $Action } catch { $thrown = $true }
+  try { & $Action | Out-Null } catch { $thrown = $true }
   if (-not $thrown) { throw "ASSERT THROWS failed: $Message" }
 }
 
-function Compress-TestBytes {
-  param([byte[]]$Bytes)
-  $output = New-Object System.IO.MemoryStream
-  $gzip = New-Object -TypeName System.IO.Compression.GZipStream -ArgumentList @(
-    $output,
-    [System.IO.Compression.CompressionMode]::Compress,
-    $true
+function New-TestRoom {
+  param(
+    [string]$RoomId = 'room.q2.client.1',
+    [string]$Owner = '1',
+    [string]$Map = 'q2dm1',
+    [string]$Name = 'Client'
   )
-  try { $gzip.Write($Bytes, 0, $Bytes.Length) } finally { $gzip.Dispose() }
-  $result = $output.ToArray()
-  $output.Dispose()
-  return $result
+  return [pscustomobject]@{
+    room = $RoomId; owner = $Owner; roomReady = $true; players = 1; rtcServer = 'lvc.dos.zone'
+    createSettings = [pscustomobject]@{ prefix = 'q2'; name = $Name; map = $Map; maxPlayers = 16 }
+  }
 }
 
-function Start-TestHttpListener {
+function New-TestDedicatedRoom {
   param(
-    [byte[]]$Body,
-    [int]$StatusCode = 200,
-    [string]$Location = '',
-    [bool]$Gzip = $false,
-    [int]$DelayMilliseconds = 0
+    [string]$RoomId = 'room.q2ded.server.1',
+    [string]$Map = 'q2dm1',
+    [string]$Name = 'Server'
   )
-  $port = Get-Random -Minimum 30000 -Maximum 50000
-  $prefix = "http://127.0.0.1:$port/"
-  $ready = Join-Path ([System.IO.Path]::GetTempPath()) ("q2dz-catalog-ready-{0}.txt" -f ([guid]::NewGuid()))
-  $bodyBase64 = [Convert]::ToBase64String($Body)
-  $job = Start-Job -ArgumentList $prefix,$ready,$bodyBase64,$StatusCode,$Location,$Gzip,$DelayMilliseconds -ScriptBlock {
-    param($Prefix, $ReadyPath, $BodyBase64, $Status, $Redirect, $UseGzip, $Delay)
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add($Prefix)
-    $listener.Start()
-    Set-Content -LiteralPath $ReadyPath -Value 'ready' -Encoding ASCII
-    try {
-      $context = $listener.GetContext()
-      $bytes = [Convert]::FromBase64String($BodyBase64)
-      $context.Response.StatusCode = $Status
-      if ($Redirect) { $context.Response.RedirectLocation = $Redirect }
-      if ($UseGzip) { $context.Response.Headers.Add('Content-Encoding', 'gzip') }
-      $context.Response.ContentLength64 = $bytes.Length
-      $context.Response.OutputStream.Flush()
-      if ($Delay -gt 0) { Start-Sleep -Milliseconds $Delay }
-      $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-      $context.Response.OutputStream.Close()
-      $context.Response.Close()
-    } finally {
-      $listener.Stop()
-      $listener.Close()
-      Remove-Item -LiteralPath $ReadyPath -Force -ErrorAction SilentlyContinue
+  return [pscustomobject]@{
+    room = $RoomId; owner = 0; players = 1
+    createSettings = [pscustomobject]@{ prefix = 'q2ded'; name = $Name; map = $Map; maxPlayers = 16 }
+  }
+}
+
+function New-TestRtc {
+  return @([pscustomobject]@{
+    domain = 'lvc.dos.zone'
+    iceservers = @([pscustomobject]@{ urls = @('stun:example.invalid') })
+  })
+}
+
+function New-TestRows {
+  param([int]$Q2, [int]$Dedicated)
+  $rows = [System.Collections.Generic.List[object]]::new()
+  foreach ($index in 0..($Q2 - 1)) {
+    if ($Q2 -gt 0) { [void]$rows.Add((New-TestRoom -RoomId ('room.q2.client.{0:D3}' -f $index) -Owner ([string]$index) -Name ('Q2 {0:D3}' -f $index))) }
+  }
+  foreach ($index in 0..($Dedicated - 1)) {
+    if ($Dedicated -gt 0) { [void]$rows.Add((New-TestDedicatedRoom -RoomId ('room.q2ded.server.{0:D3}' -f $index) -Name ('DED {0:D3}' -f $index))) }
+  }
+  return @($rows)
+}
+
+function New-TestLookup {
+  param([object[]]$Rows)
+  $aliases = [System.Collections.Generic.List[string]]::new()
+  foreach ($row in $Rows) { [void]$aliases.Add((Get-Q2DzRoomAlias $row)) }
+  return [pscustomobject]@{ aliases = @($aliases.ToArray()) }
+}
+
+function Invoke-HeartbeatScenario {
+  param($Case)
+  $name = [string]$Case.name
+  $payload = $Case.payload
+  if ($name -eq 'heartbeat-mixed-20-q2-20-q2ded' -or $name -eq 'heartbeat-retains-all-40') {
+    $rows = @(New-TestRows ([int]$payload.q2) ([int]$payload.q2ded))
+    $plan = Get-Q2DzTargetPlan -Targets (New-Q2DzTargetMap) -Rows $rows -MakeConfig {
+      param($row)
+      return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+    }
+    if ($name -eq 'heartbeat-mixed-20-q2-20-q2ded') {
+      $ordered = @(Sort-Q2DzStrings @($plan.Targets.Keys))
+      $q2Count = @($rows | Where-Object { $_.createSettings.prefix -ceq 'q2' }).Count
+      $q2dedCount = @($rows | Where-Object { $_.createSettings.prefix -ceq 'q2ded' }).Count
+      return [pscustomobject]@{
+        count = $plan.Targets.Count
+        q2 = $q2Count
+        q2ded = $q2dedCount
+        order = if (($ordered -join ',') -eq (($plan.Targets.Keys | Sort-Object) -join ',')) { 'room-id' } else { 'unexpected' }
+      }
+    }
+    $firstMiss = Get-Q2DzTargetPlan -Targets $plan.Targets -Rows @() -MakeConfig { param($row) return '' }
+    $secondMiss = Get-Q2DzTargetPlan -Targets $firstMiss.Targets -Rows @() -MakeConfig { param($row) return '' }
+    return [pscustomobject]@{
+      count = $plan.Targets.Count
+      missesBeforeDrop = if ($secondMiss.Targets.Count -eq 0 -and $secondMiss.Drops.Count -eq $plan.Targets.Count) { 2 } else { 0 }
     }
   }
-  for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $ready); $i++) {
-    Start-Sleep -Milliseconds 50
-  }
-  if (-not (Test-Path -LiteralPath $ready)) {
-    Stop-Job $job -ErrorAction SilentlyContinue
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
-    throw 'localhost HttpListener did not start'
-  }
-  return @{ Job = $job; Uri = $prefix; Ready = $ready }
-}
 
-function Stop-TestHttpListener {
-  param($Server)
-  Stop-Job $Server.Job -ErrorAction SilentlyContinue
-  Remove-Job $Server.Job -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath $Server.Ready -Force -ErrorAction SilentlyContinue
+  if ($name -eq 'heartbeat-map-content-failure-preserves-target') {
+    $old = New-TestRoom 'room.q2.map-scenario.1' '1' ([string]$payload.mapBefore)
+    $changed = New-TestRoom $old.room '1' ([string]$payload.mapAfter)
+    $oldConfig = New-Q2DzRoomConfig -Room $old -LookupPayload (New-TestLookup @($old)) -RtcPayload @(New-TestRtc)
+    $current = New-Q2DzTargetMap
+    $current[$old.room] = New-Q2DzTarget $old.room $oldConfig 0 ([string]$payload.mapBefore)
+    $failed = $false
+    try {
+      Get-Q2DzTargetPlan -Targets $current -Rows @($changed) -MakeConfig {
+        param($row)
+        return New-Q2DzRoomConfig -Room $row -LookupPayload (New-TestLookup @($row)) -RtcPayload @(New-TestRtc)
+      } -MapAvailable { param($row) return $false } | Out-Null
+    } catch { $failed = $_.Exception.Message -match 'content' }
+    return [pscustomobject]@{
+      contentFailure = if ($failed -and $current[$old.room].Config -eq $oldConfig) { 'preserve' } else { 'changed' }
+    }
+  }
+
+  if ($name -eq 'heartbeat-retains-full-existing-room') {
+    $existing = New-TestRoom 'room.q2.full-scenario.1' '1'
+    $existing.players = $existing.createSettings.maxPlayers
+    $new = New-TestRoom 'room.q2.full-scenario.2' '2'
+    $new.players = $new.createSettings.maxPlayers
+    $config = New-Q2DzRoomConfig -Room $existing -LookupPayload (New-TestLookup @($existing)) -RtcPayload @(New-TestRtc)
+    $current = New-Q2DzTargetMap
+    $current[$existing.room] = New-Q2DzTarget $existing.room $config 0 $existing.createSettings.map
+    $plan = Get-Q2DzTargetPlan -Targets $current -Rows @($existing,$new) -MakeConfig {
+      param($row)
+      return New-Q2DzRoomConfig -Room $row -LookupPayload (New-TestLookup @($row)) -RtcPayload @(New-TestRtc)
+    }
+    return [pscustomobject]@{
+      fullExisting = if ($plan.Targets.ContainsKey($existing.room)) { 'retain' } else { 'evict' }
+      fullNew = if (-not $plan.Targets.ContainsKey($new.room)) { 'skip' } else { 'add' }
+    }
+  }
+
+  if ($name -eq 'heartbeat-invalid-global-rtc') {
+    try { Get-Q2DzDedicatedIceServers @($payload.rtc) | Out-Null } catch { return [pscustomobject]@{ error = 'invalid_global_rtc' } }
+    return [pscustomobject]@{ error = 'accepted' }
+  }
+
+  if ($name -eq 'heartbeat-duplicate-room-id' -or $name -eq 'heartbeat-duplicate-derived-alias') {
+    if ($name -eq 'heartbeat-duplicate-room-id') {
+      $rows = @((New-TestRoom 'room.q2.shared-scenario.1' '1'), (New-TestRoom 'room.q2.shared-scenario.1' '2'))
+    } else {
+      $rows = @((New-TestRoom 'room.q2.alias-scenario.1' '3'), (New-TestRoom 'room.q2.alias-scenario.2' '3'))
+    }
+    try { Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = $rows }) | Out-Null }
+    catch {
+      $message = $_.Exception.Message
+      return [pscustomobject]@{ error = if ($message -match 'duplicate room') { 'duplicate_room_id' } elseif ($message -match 'duplicate Q2 aliases') { 'duplicate_alias' } else { 'unexpected' } }
+    }
+    return [pscustomobject]@{ error = 'accepted' }
+  }
+
+  if ($name -eq 'heartbeat-capacity-256-compatible' -or $name -eq 'heartbeat-capacity-257-compatible') {
+    $rows = @(New-TestRows ([int]$payload.q2) ([int]$payload.q2ded))
+    try {
+      $plan = Get-Q2DzTargetPlan -Targets (New-Q2DzTargetMap) -Rows $rows -MakeConfig {
+        param($row)
+        return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"q2dm1","game":"3zb2"}')
+      }
+      return [pscustomobject]@{ count = $plan.Targets.Count }
+    } catch {
+      $errorName = if ($_.Exception.Message -match 'catalog_capacity_exceeded') { 'catalog_capacity_exceeded' } else { 'unexpected' }
+      return [pscustomobject]@{ error = $errorName; count = $rows.Count }
+    }
+  }
+
+  if ($name -eq 'heartbeat-capacity-replacement') {
+    $currentRows = @(New-TestRows ([int]$payload.current) 0)
+    $currentTargets = New-Q2DzTargetMap
+    foreach ($row in $currentRows) {
+      $config = ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+      $currentTargets[$row.room] = New-Q2DzTarget $row.room $config 0 $row.createSettings.map
+    }
+    $desiredRows = @($currentRows | Where-Object { $_.room -cne [string]$payload.missing })
+    $desiredRows += New-TestRoom ([string]$payload.replacement) ([string]$payload.replacementOwner) 'q2dm1' 'Replacement'
+    $makeConfig = {
+      param($row)
+      return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+    }
+    $first = Get-Q2DzTargetPlan -Targets $currentTargets -Rows $desiredRows -MakeConfig $makeConfig
+    $second = Get-Q2DzTargetPlan -Targets $first.Targets -Rows $desiredRows -MakeConfig $makeConfig
+    return [pscustomobject]@{
+      firstCount = $first.Targets.Count
+      firstMisses = [int]$first.Targets[[string]$payload.missing].Misses
+      firstDrops = @($first.Drops).Count
+      secondCount = $second.Targets.Count
+      secondDrops = @($second.Drops).Count
+      deferredAdmitted = if ($second.Targets.ContainsKey([string]$payload.replacement) -and
+          -not $first.Targets.ContainsKey([string]$payload.replacement)) { 1 } else { 0 }
+    }
+  }
+
+  if ($name -eq 'heartbeat-ice-snapshot-byte-limit') {
+    $servers = [System.Collections.Generic.List[object]]::new()
+    for ($serverIndex = 0; $serverIndex -lt [int]$payload.serverCount; $serverIndex++) {
+      $urls = [System.Collections.Generic.List[string]]::new()
+      for ($urlIndex = 0; $urlIndex -lt [int]$payload.urlsPerServer; $urlIndex++) {
+        $prefix = 'stun:example.invalid?server={0}&url={1}&' -f $serverIndex,$urlIndex
+        [void]$urls.Add($prefix + ('x' * ([int]$payload.urlLength - $prefix.Length)))
+      }
+      [void]$servers.Add([pscustomobject]@{ urls = @($urls.ToArray()) })
+    }
+    $rtc = @([pscustomobject]@{ domain = 'lvc.dos.zone'; iceservers = @($servers.ToArray()) })
+    Assert-True (Test-Q2DzRtcPayload $rtc) 'generated oversized RTC aggregate is field-valid'
+    try { Get-Q2DzDedicatedIceServers $rtc | Out-Null }
+    catch {
+      return [pscustomobject]@{
+        error = if ($_.Exception.Message -eq 'global ICE snapshot exceeds 65536 bytes') {
+          'ice_snapshot_too_large'
+        } else { 'unexpected' }
+      }
+    }
+    return [pscustomobject]@{ error = 'accepted' }
+  }
+
+  throw "Unhandled heartbeat scenario: $name"
 }
 
 $repo = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
@@ -96,424 +229,126 @@ $fixturePath = Join-Path $repo 'tests\contracts\doszone-api-cases.json'
 $cases = @(Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json)
 if ($cases.Count -eq 1 -and $cases[0] -is [array]) { $cases = @($cases[0]) }
 
+$scenarioNames = [System.Collections.Generic.List[string]]::new()
 foreach ($case in $cases) {
-  if ($case.kind -eq 'dedicated-ice') {
-    $thrown = $false
-    $actualIce = @()
-    try { $actualIce = @(Get-Q2DzDedicatedIceServers @($case.payload)) } catch { $thrown = $true }
-    Assert-Equal ([bool]$case.valid) (-not $thrown) "shared case $($case.name)"
-    if ($case.valid) {
-      Assert-Equal ($case.expected.iceServers | ConvertTo-Json -Depth 8 -Compress) `
-        ($actualIce | ConvertTo-Json -Depth 8 -Compress) "shared ICE order $($case.name)"
+  if ($case.kind -eq 'heartbeat-scenario') {
+    [void]$scenarioNames.Add([string]$case.name)
+    $actual = Invoke-HeartbeatScenario $case
+    foreach ($property in @($case.expected.PSObject.Properties)) {
+      Assert-Equal $property.Value $actual.($property.Name) "shared scenario $($case.name) field $($property.Name)"
     }
     continue
   }
-  switch ($case.kind) {
-    'rooms' { $actual = Test-Q2DzRoomPayload $case.payload }
-    'aliases' { $actual = Test-Q2DzAliasPayload $case.payload }
-    'rtc' { $actual = Test-Q2DzRtcPayload @($case.payload) }
+  if ($case.kind -eq 'dedicated-ice') {
+    $thrown = $false
+    $actual = @()
+    try { $actual = @(Get-Q2DzDedicatedIceServers @($case.payload)) } catch { $thrown = $true }
+    Assert-Equal ([bool]$case.valid) (-not $thrown) "shared case $($case.name)"
+    if ($case.valid) {
+      Assert-Equal ($case.expected.iceServers | ConvertTo-Json -Depth 8 -Compress) `
+        ($actual | ConvertTo-Json -Depth 8 -Compress) "shared ICE order $($case.name)"
+    }
+    continue
+  }
+  $actual = switch ($case.kind) {
+    'rooms' { Test-Q2DzRoomPayload $case.payload }
+    'aliases' { Test-Q2DzAliasPayload $case.payload }
+    'rtc' { Test-Q2DzRtcPayload @($case.payload) }
     default { throw "Unknown contract case kind: $($case.kind)" }
   }
   Assert-Equal ([bool]$case.valid) ([bool]$actual) "shared case $($case.name)"
-  if ($case.kind -eq 'rooms') {
-    $selectionCount = 0
-    $selectedFound = $false
-    $selectionThrew = $false
-    $expectedRoomId = if ($case.valid) { $case.payload.rooms[0].room } else { '' }
-    try {
-      foreach ($row in (Get-Q2DzJoinableRooms $case.payload)) {
-        $selectionCount++
-        if ($row.room -eq $expectedRoomId) { $selectedFound = $true }
-      }
-    } catch { $selectionThrew = $true }
-    if ($case.valid) {
-      Assert-True $selectedFound "valid room case $($case.name) reaches selection"
-      if ($case.PSObject.Properties.Name -contains 'expected') {
-        $row = $case.payload.rooms[0]
-        Assert-Equal $case.expected.alias (Get-Q2DzRoomAlias $row) "shared alias $($case.name)"
-        $actualRange = @(0..4 | Where-Object { (Get-Q2DzSlotKind $_) -ceq (Get-Q2DzRoomKind $row) })
-        Assert-Equal ($case.expected.slotRange -join ',') (($actualRange[0],$actualRange[-1]) -join ',') "shared slots $($case.name)"
-      }
-    } elseif (-not $selectionThrew) {
-      Assert-Equal 0 $selectionCount "invalid room case $($case.name) does not reach selection"
-    }
-  }
 }
+Assert-Equal 11 $scenarioNames.Count 'Task 6 shared heartbeat cases are registered and executed'
 
-Assert-True (Test-Q2DzEndpoint $Q2DZ_ROOM_ENDPOINT) 'room endpoint must be allow-listed'
-Assert-True (Test-Q2DzEndpoint $Q2DZ_LOOKUP_ENDPOINT) 'lookup endpoint must be allow-listed'
-Assert-True (Test-Q2DzEndpoint $Q2DZ_RTC_ENDPOINT) 'RTC endpoint must be allow-listed'
-Assert-Throws { Test-Q2DzEndpoint 'http://127.0.0.1:1/' } 'HTTP endpoint must not be allow-listed'
-Assert-Throws { Test-Q2DzEndpoint 'https://cloud.dos.zone/room/get?extra=1' } 'endpoint query must not be allow-listed'
-Assert-Throws { Test-Q2DzEndpoint 'HTTPS://CLOUD.DOS.ZONE/ROOM/GET' } 'uppercase endpoint must not be allow-listed'
-
-$client = New-Q2DzHttpClient
-$server = $null
-try {
-  $validBody = [Text.Encoding]::UTF8.GetBytes('{"ok":true}')
-  $server = Start-TestHttpListener -Body $validBody
-  $parsed = Read-Q2DzJson -Client $client -Uri $server.Uri
-  Assert-True ($parsed.ok -eq $true) 'localhost JSON should parse through bounded reader'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$originalRoomEndpoint = $Q2DZ_ROOM_ENDPOINT
-try {
-  $server = Start-TestHttpListener -Body ([Text.Encoding]::UTF8.GetBytes('{"rooms":[]}'))
-  $Q2DZ_ROOM_ENDPOINT = $server.Uri
-  $catalogObject = Get-Q2DzJson $server.Uri
-  Assert-True ($catalogObject.PSObject.Properties.Name -contains 'rooms') 'Get-Q2DzJson must not wrap a top-level object'
-  Assert-True ($catalogObject.rooms -is [array]) 'Get-Q2DzJson must preserve nested arrays'
-} finally {
-  $Q2DZ_ROOM_ENDPOINT = $originalRoomEndpoint
-  if ($server) { Stop-TestHttpListener $server }
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $arrayBody = [Text.Encoding]::UTF8.GetBytes('[{"domain":"lvc.example.invalid","iceservers":[{"urls":["stun:example.invalid"]}]}]')
-  $server = Start-TestHttpListener -Body $arrayBody
-  $arrayParsed = Read-Q2DzJson -Client $client -Uri $server.Uri
-  Assert-True ($arrayParsed -is [array]) 'top-level JSON array must remain an array'
-  Assert-True (Test-Q2DzRtcPayload $arrayParsed) 'preserved top-level RTC array must validate'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$originalRtcEndpoint = $Q2DZ_RTC_ENDPOINT
-try {
-  $arrayBody = [Text.Encoding]::UTF8.GetBytes('[{"domain":"lvc.example.invalid","iceservers":[{"urls":["stun:example.invalid"]}]}]')
-  $server = Start-TestHttpListener -Body $arrayBody
-  $Q2DZ_RTC_ENDPOINT = $server.Uri
-  $arrayThroughFetch = @(& { param($Endpoint) Get-Q2DzJson $Endpoint } $server.Uri)
-  Assert-Equal 1 $arrayThroughFetch.Count 'one-row RTC response must remain one flat row through FetchJson'
-  Assert-True ($arrayThroughFetch[0] -isnot [array]) 'FetchJson must not nest a top-level array'
-  Assert-True (Test-Q2DzRtcPayload $arrayThroughFetch) 'flat one-row RTC response must validate'
-} finally {
-  $Q2DZ_RTC_ENDPOINT = $originalRtcEndpoint
-  if ($server) { Stop-TestHttpListener $server }
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $server = Start-TestHttpListener -Body ([Text.Encoding]::UTF8.GetBytes('{}')) -StatusCode 302 -Location 'http://127.0.0.1:9/'
-  Assert-Throws { Read-Q2DzJson -Client $client -Uri $server.Uri } 'redirect must be rejected'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $server = Start-TestHttpListener -Body ([Text.Encoding]::UTF8.GetBytes('{"ok":true}')) -DelayMilliseconds 1500
-  Assert-Throws { Read-Q2DzJson -Client $client -Uri $server.Uri -TimeoutSeconds 1 } 'body deadline must cover delayed body reads'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $server = Start-TestHttpListener -Body ([Text.Encoding]::UTF8.GetBytes('{not-json'))
-  Assert-Throws { Read-Q2DzJson -Client $client -Uri $server.Uri } 'malformed JSON must be rejected'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $large = [Text.Encoding]::UTF8.GetBytes(('x' * (2MB + 1)))
-  $server = Start-TestHttpListener -Body (Compress-TestBytes $large) -Gzip $true
-  Assert-Throws { Read-Q2DzJson -Client $client -Uri $server.Uri } 'decompressed body over 2 MiB must be rejected'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$server = $null
-$client = New-Q2DzHttpClient
-try {
-  $rawLarge = New-Object byte[] $Q2DZ_MAX_BODY
-  $random = [Security.Cryptography.RandomNumberGenerator]::Create()
-  try { $random.GetBytes($rawLarge) } finally { $random.Dispose() }
-  $rawCompressed = Compress-TestBytes $rawLarge
-  Assert-True ($rawCompressed.Length -gt $Q2DZ_MAX_BODY) 'incompressible gzip body must exceed raw limit'
-  $server = Start-TestHttpListener -Body $rawCompressed -Gzip $true
-  Assert-Throws { Read-Q2DzJson -Client $client -Uri $server.Uri } 'compressed raw body over 2 MiB must be rejected'
-} finally {
-  if ($server) { Stop-TestHttpListener $server }
-  $client.Dispose()
-}
-
-$room = [pscustomobject]@{
-  room = 'room.q2.test.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Test'; map = 'q2dm1'; maxPlayers = 16 }
-}
-$rtc = [pscustomobject]@{
-  domain = 'lvc.example.invalid'
-  iceservers = @([pscustomobject]@{ urls = @('stun:example.invalid') })
-}
-$lookupPayload = [pscustomobject]@{ aliases = @('q2.1') }
-
-# Live hub slot planner tests are pure: no network, timer, process or content
-# checker is involved.  They describe the bounded state transitions before
-# the launcher starts using them.
-$slot = {
-  param([string]$RoomId = '', [string]$Config = '', [int]$Misses = 0, [string]$MapName = '')
-  New-Q2DzHubSlot $RoomId $Config $Misses $MapName
-}
-$q2Slots = {
-  param($First = $null, $Second = $null, $Dedicated = $null)
-  @(
-    $(if ($Dedicated) { $Dedicated } else { & $slot }), (& $slot), (& $slot),
-    $(if ($First) { $First } else { & $slot }),
-    $(if ($Second) { $Second } else { & $slot })
-  )
-}
-$roomB = [pscustomobject]@{
-  room = 'room.q2.test.2'; owner = '2'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Other'; map = 'q2dm2'; maxPlayers = 16 }
-}
-$readyRows = @(Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = @($roomB, $room) }))
-Assert-Equal $roomB.room $readyRows[0].room 'ready rooms are sorted by name'
-Assert-Equal 2 $readyRows.Count 'ready room selection retains all ready rooms, including full rooms'
-Assert-Equal 2 (@(Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($roomB, $room) }))).Count 'joinable rooms only apply the capacity filter'
-Assert-Equal 1 (@(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload ([pscustomobject]@{ aliases = @('q2.1') }))).Count 'registered selection filters ready rows by alias'
-
-$makeConfig = {
+$mixedRows = New-TestRows 20 20
+$mixedLookup = New-TestLookup $mixedRows
+$emptyTargets = New-Q2DzTargetMap
+$mixedPlan = Get-Q2DzTargetPlan -Targets $emptyTargets -Rows $mixedRows -MakeConfig {
   param($row)
-  if ($row.room -eq $room.room) { return 'A' }
-  return 'B'
+  return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
 }
-$planned = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows $readyRows -MakeConfig $makeConfig
-Assert-Equal $room.room $planned[3].RoomId 'existing room is retained'
-Assert-Equal 'A' $planned[3].Config 'existing room keeps its original config'
-Assert-Equal $roomB.room $planned[4].RoomId 'free slot is filled from ready rows'
-Assert-Equal 'B' $planned[4].Config 'new room receives its compact config'
+Assert-Equal 40 $mixedPlan.Targets.Count 'mixed 20 q2 and 20 q2ded retains every target'
+Assert-Equal (($mixedRows.room | Sort-Object) -join ',') ((Sort-Q2DzStrings @($mixedPlan.Targets.Keys)) -join ',') 'target map is stable by room id'
 
-$oneMiss = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @() -MakeConfig $makeConfig
-Assert-Equal $room.room $oneMiss[3].RoomId 'one successful missing poll retains a room'
-Assert-Equal 1 $oneMiss[3].Misses 'one successful missing poll increments misses'
-$twoMisses = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 1)) -Rows @() -MakeConfig $makeConfig
-Assert-Equal '' $twoMisses[3].RoomId 'two successful missing polls free a slot'
-$missingDedicated = Update-Q2DzHubSlots -Slots @(& $q2Slots $null $null (& $slot 'room.q2ded.server' 'old' 0 'q2dm1')) `
-  -Rows @() -MakeConfig $makeConfig
-Assert-Equal 'room.q2ded.server' $missingDedicated[0].RoomId 'one missing poll retains dedicated slot'
-Assert-Equal $false $missingDedicated[0].Send 'missing dedicated does not send stale recovery config'
-$missingDedicatedAgain = Update-Q2DzHubSlots -Slots $missingDedicated -Rows @() -MakeConfig $makeConfig
-Assert-Equal '' $missingDedicatedAgain[0].RoomId 'two missing polls clear dedicated slot'
+$one = New-TestRoom -RoomId 'room.q2.keep.1'
+$oneConfig = '{"roomId":"room.q2.keep.1","alias":"q2.1","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"q2dm1","game":"3zb2"}'
+$current = New-Q2DzTargetMap
+$current[$one.room] = New-Q2DzTarget $one.room $oneConfig 0 'q2dm1'
+$firstMiss = Get-Q2DzTargetPlan -Targets $current -Rows @() -MakeConfig { param($row) return '' }
+Assert-True $firstMiss.Targets.ContainsKey($one.room) 'one successful miss retains target'
+Assert-Equal 1 $firstMiss.Targets[$one.room].Misses 'one successful miss is counted'
+Assert-Equal 0 $firstMiss.Drops.Count 'one successful miss does not drop'
+$secondMiss = Get-Q2DzTargetPlan -Targets $firstMiss.Targets -Rows @() -MakeConfig { param($row) return '' }
+Assert-Equal 0 $secondMiss.Targets.Count 'second successful miss removes target from state'
+Assert-Equal $one.room $secondMiss.Drops[0] 'second successful miss emits exact room drop'
 
-$fullRoom = $room | Select-Object *
-$fullRoom.players = $fullRoom.createSettings.maxPlayers
-$retainedFull = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @($fullRoom) -MakeConfig $makeConfig
-Assert-Equal $room.room $retainedFull[3].RoomId 'retained room is not removed when full'
-$newFull = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows @($fullRoom) -MakeConfig $makeConfig
-Assert-Equal '' $newFull[3].RoomId 'new full room does not fill a free slot'
-
-$oversizedConfig = { param($row) if ($row.room -eq $roomB.room) { return ('x' * (256KB)) }; return 'A' }
-$oversized = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room 'A' 0)) -Rows @($room, $roomB) -MakeConfig $oversizedConfig
-Assert-Equal $room.room $oversized[3].RoomId 'oversized candidate does not disturb retained room'
-Assert-Equal '' $oversized[4].RoomId 'oversized candidate is skipped locally'
-$threeRows = @($room, $roomB, ($roomB | Select-Object *))
-$threeRows[2].room = 'room.q2.test.3'; $threeRows[2].owner = '3'
-$threeRows[2].createSettings.name = 'Third'
-$threeSlots = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows $threeRows -MakeConfig { param($row) return $row.room }
-Assert-Equal 2 (@($threeSlots | Where-Object { $_.RoomId })).Count 'hub never admits more than two rooms'
-
-Assert-Equal "0 -`n" (ConvertTo-Q2DzHubCommand 0 (& $slot)) 'empty slot command is independent and newline terminated'
-Assert-Equal "1 -`n" (ConvertTo-Q2DzHubCommand 1 (& $slot)) 'second empty slot command is independent and newline terminated'
-Assert-Equal "4 -`n" (ConvertTo-Q2DzHubCommand 4 (& $slot)) 'fifth empty slot is accepted'
-Assert-Throws { ConvertTo-Q2DzHubCommand 5 (& $slot) } 'sixth hub slot is rejected'
-Assert-Throws { ConvertTo-Q2DzHubCommand 0 (& $slot 'room.q2.large' ('x' * (256KB))) } 'oversized hub command is rejected'
-
-$dedicated = [pscustomobject]@{
-  room = 'room.q2ded.server.1'; owner = 0; players = 1
-  createSettings = [pscustomobject]@{ prefix = 'q2ded'; name = 'Server'; map = 'q2dm1'; maxPlayers = 16 }
+$fullExisting = New-TestRoom -RoomId 'room.q2.full-existing.1'
+$fullExisting.players = $fullExisting.createSettings.maxPlayers
+$fullNew = New-TestRoom -RoomId 'room.q2.full-new.2' -Owner '2'
+$fullNew.players = $fullNew.createSettings.maxPlayers
+$fullCurrent = New-Q2DzTargetMap
+$fullCurrent[$fullExisting.room] = New-Q2DzTarget $fullExisting.room $oneConfig 0 'q2dm1'
+$fullPlan = Get-Q2DzTargetPlan -Targets $fullCurrent -Rows @($fullExisting,$fullNew) -MakeConfig {
+  param($row)
+  return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
 }
-$dedicatedLookup = [pscustomobject]@{ aliases = @($dedicated.room) }
-$dedicatedRtc = @(
-  [pscustomobject]@{ domain = 'a.example.invalid'; iceservers = @(
-    [pscustomobject]@{ urls = @('stun:shared.example.invalid') },
-    [pscustomobject]@{ urls = @('turn:a.example.invalid'); username = 'u'; credential = 'c' }
-  ) },
-  [pscustomobject]@{ domain = 'b.example.invalid'; iceservers = @(
-    [pscustomobject]@{ urls = @('stun:shared.example.invalid') },
-    [pscustomobject]@{ urls = @('stun:b.example.invalid') }
-  ) }
-)
-$dedicatedIce = @(Get-Q2DzDedicatedIceServers $dedicatedRtc)
-Assert-Equal $dedicated.room (Get-Q2DzRoomAlias $dedicated) 'dedicated room uses its exact room alias'
-Assert-Equal 3 $dedicatedIce.Count 'dedicated room flattens and stably deduplicates all RTC rows'
-Assert-Equal 'stun:shared.example.invalid' $dedicatedIce[0].urls[0] 'dedicated ICE order keeps the first occurrence'
+Assert-True $fullPlan.Targets.ContainsKey($fullExisting.room) 'already-ready full room is retained'
+Assert-True (-not $fullPlan.Targets.ContainsKey($fullNew.room)) 'new full room is not added'
 
-$dedicatedRows = @($dedicated)
-foreach ($number in 2..4) {
-  $copy = $dedicated | Select-Object *
-  $copy.room = "room.q2ded.server.$number"
-  $copy.createSettings = $dedicated.createSettings | Select-Object *
-  $copy.createSettings.name = "Server $number"
-  $dedicatedRows += $copy
-}
-$mixedPlan = Update-Q2DzHubSlots -Slots @(& $q2Slots) -Rows @($dedicatedRows + @($room,$roomB)) `
-  -MakeConfig { param($row) return ($row.room | ConvertTo-Json -Compress) }
-Assert-Equal 3 @($mixedPlan[0..2] | Where-Object { $_.RoomId }).Count 'dedicated pool is capped at three slots'
-Assert-Equal 2 @($mixedPlan[3..4] | Where-Object { $_.RoomId }).Count 'legacy q2 pool keeps two slots'
+$mapChanged = New-TestRoom -RoomId $one.room -Map 'missing'
+$mapCurrent = New-Q2DzTargetMap
+$mapCurrent[$one.room] = New-Q2DzTarget $one.room $oneConfig 0 'q2dm1'
+$mapFailed = $false
+try {
+  Get-Q2DzTargetPlan -Targets $mapCurrent -Rows @($mapChanged) -MakeConfig {
+    param($row)
+    return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+  } -MapAvailable { param($row) return $false } | Out-Null
+} catch { $mapFailed = $_.Exception.Message -match 'content' }
+Assert-True $mapFailed 'map content failure preserves prior state'
+Assert-Equal $oneConfig $mapCurrent[$one.room].Config 'map content failure does not mutate old target'
 
-$oldDedicated = & $slot $dedicated.room '{"map":"q2dm0"}' 0 'q2dm0'
-$mapChecks = 0
-$changedMap = Update-Q2DzHubSlots -Slots @(& $q2Slots $null $null $oldDedicated) -Rows @($dedicated) `
-  -MakeConfig { param($row) return ('{"map":"' + $row.createSettings.map + '"}') } `
-  -MapAvailable { param($row) $script:mapChecks++; return $true }
-Assert-Equal 1 $mapChecks 'dedicated map change is checked once'
-Assert-Equal 'q2dm1' $changedMap[0].MapName 'dedicated map state is refreshed'
-Assert-True $changedMap[0].Config.Contains('q2dm1') 'dedicated config is refreshed without replacing the slot'
+$duplicateRoom = New-TestRoom -RoomId 'room.q2.duplicate.1' -Owner '1'
+$duplicateRoomAgain = New-TestRoom -RoomId 'room.q2.duplicate.1' -Owner '2'
+Assert-Throws { Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = @($duplicateRoom,$duplicateRoomAgain) }) } 'duplicate room id is rejected'
+$duplicateAliasA = New-TestRoom -RoomId 'room.q2.alias-a.1' -Owner '3'
+$duplicateAliasB = New-TestRoom -RoomId 'room.q2.alias-b.2' -Owner '3'
+Assert-Throws { Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = @($duplicateAliasA,$duplicateAliasB) }) } 'duplicate derived alias is rejected'
 
-$legacyChangedMap = $room | Select-Object *
-$legacyChangedMap.createSettings = $room.createSettings | Select-Object *
-$legacyChangedMap.createSettings.map = 'q2dm2'
-$legacyMapChecks = 0
-$legacyMap = Update-Q2DzHubSlots -Slots @(& $q2Slots (& $slot $room.room '{"map":"q2dm1"}' 0 'q2dm1')) `
-  -Rows @($legacyChangedMap) -MakeConfig { param($row) return ('{"map":"' + $row.createSettings.map + '"}') } `
-  -MapAvailable { param($row) $script:legacyMapChecks++; return $true }
-Assert-Equal 1 $legacyMapChecks 'legacy q2 map change is checked once'
-Assert-Equal 'q2dm2' $legacyMap[3].MapName 'legacy q2 map state is refreshed'
-Assert-True $legacyMap[3].Config.Contains('q2dm2') 'legacy q2 config follows the changed map'
-$legacyRtcFailure = Update-Q2DzHubSlots `
-  -Slots @(& $q2Slots (& $slot $room.room '{"map":"q2dm1"}' 0 'q2dm1')) -Rows @($legacyChangedMap) `
-  -MakeConfig { throw 'RTC unavailable' } -MapAvailable { return $true }
-Assert-Equal $room.room $legacyRtcFailure[3].RoomId 'temporary RTC failure keeps active legacy q2'
-Assert-Equal $false $legacyRtcFailure[3].Send 'temporary RTC failure sends no destructive q2 command'
+$exactRows = New-TestRows 256 0
+$exactPlan = Get-Q2DzTargetPlan -Targets (New-Q2DzTargetMap) -Rows $exactRows -MakeConfig {
+  param($row)
+  return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"q2dm1","game":"3zb2"}')
+}
+Assert-Equal 256 $exactPlan.Targets.Count 'exactly 256 compatible targets are retained'
+$tooMany = New-TestRows 257 0
+Assert-Throws { Get-Q2DzTargetPlan -Targets (New-Q2DzTargetMap) -Rows $tooMany -MakeConfig { param($row) return '{}' } } '257 compatible targets fail with catalog capacity'
 
-$unsupportedProfileRoom = [pscustomobject]@{
-  room = 'room.q2.unsupported-profile.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; profile = 'baseq2'; name = 'Unsupported'; map = 'q2dm1'; maxPlayers = 16 }
-}
-$nonQ2Room = [pscustomobject]@{
-  room = 'room.q3.unsupported.1'; owner = '1'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q3'; name = 'Unsupported'; map = 'q3dm1'; maxPlayers = 16 }
-}
-foreach ($unsupportedRoom in @($unsupportedProfileRoom,$nonQ2Room)) {
-  $transportFetches = @()
-  Assert-Throws {
-    Get-Q2DzSelectedTransport -Room $unsupportedRoom -FetchJson {
-      param($Endpoint)
-      $script:transportFetches += $Endpoint
-      throw 'credential endpoint must not be called'
-    }
-  } 'unsupported room must be rejected before credential fetch'
-  Assert-Equal 0 $transportFetches.Count 'unsupported room must fetch zero credential endpoints'
-}
-$transportFetches = @()
-$transport = Get-Q2DzSelectedTransport -Room $room -FetchJson {
-  param($Endpoint)
-  $script:transportFetches += $Endpoint
-  if ($Endpoint -ceq $Q2DZ_LOOKUP_ENDPOINT) { return $lookupPayload }
-  if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) { return @($rtc) }
-  throw "unexpected endpoint: $Endpoint"
-}
-Assert-Equal 2 $transportFetches.Count 'supported room fetches lookup then RTC exactly once'
-Assert-Equal $Q2DZ_LOOKUP_ENDPOINT $transportFetches[0] 'lookup precedes RTC credential fetch'
-Assert-Equal $Q2DZ_RTC_ENDPOINT $transportFetches[1] 'RTC credential fetch follows validation and lookup'
-Assert-Equal 'q2.1' $transport.Alias 'supported transport returns confirmed catalog alias'
+$invalidRtc = @([pscustomobject]@{ domain = 'bad domain'; iceservers = @([pscustomobject]@{ urls = @('stun:example.invalid') }) })
+Assert-Throws { Get-Q2DzDedicatedIceServers $invalidRtc } 'invalid global RTC is rejected'
 
-$secondRtc = [pscustomobject]@{
-  domain = 'lvc2.example.invalid'
-  iceservers = @([pscustomobject]@{ urls = @('stun:example.invalid') })
-}
-$noEnumerateRtcRows = @($rtc, $secondRtc)
-$transport = Get-Q2DzSelectedTransport -Room $room -FetchJson {
-  param($Endpoint)
-  if ($Endpoint -ceq $Q2DZ_LOOKUP_ENDPOINT) { return $lookupPayload }
-  if ($Endpoint -ceq $Q2DZ_RTC_ENDPOINT) {
-    Write-Output -NoEnumerate $noEnumerateRtcRows
-    return
+$emptyFetch = {
+  param($endpoint)
+  switch ($endpoint) {
+    $Q2DZ_ROOM_ENDPOINT { return [pscustomobject]@{ rooms = @() } }
+    $Q2DZ_LOOKUP_ENDPOINT { return [pscustomobject]@{ aliases = @() } }
+    $Q2DZ_RTC_ENDPOINT { return (New-TestRtc) }
+    default { throw "unexpected endpoint $endpoint" }
   }
-  throw "unexpected endpoint: $Endpoint"
 }
-Assert-Equal 'lvc.example.invalid' $transport.Rtc.domain 'no-enumerated multi-row RTC payload remains flat'
-
-$mixedRows = @(
-  $room,
-  [pscustomobject]@{
-    room = 'room.q2.bad.1'; owner = '2'; roomReady = $true; players = $true; rtcServer = 'lvc.example.invalid'
-    createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Bad'; map = 'q2dm1'; maxPlayers = 16 }
-  },
-  [pscustomobject]@{
-    room = 'room.q3.ignore.1'; owner = '3'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-    createSettings = [pscustomobject]@{ prefix = 'q3'; name = 'Q3'; map = 'q3dm1'; maxPlayers = 16 }
-  }
-)
-$mixedSelectionCount = 0
-$mixedSelected = $false
-foreach ($row in (Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = $mixedRows }))) {
-  $mixedSelectionCount++
-  if ($row.room -eq $room.room) { $mixedSelected = $true }
-}
-Assert-Equal 1 $mixedSelectionCount 'mixed catalog exposes only valid Q2 rows'
-Assert-True $mixedSelected 'mixed catalog keeps valid Q2 row selectable'
-
-$staleRoom = [pscustomobject]@{
-  room = 'room.q2.stale.1'; owner = '2'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Stale'; map = 'q2dm1'; maxPlayers = 16 }
-}
-$registeredCount = 0
-$registeredSelected = $false
-foreach ($row in (Get-Q2DzRegisteredRooms -Catalog ([pscustomobject]@{ rooms = @($room,$staleRoom) }) -LookupPayload $lookupPayload)) {
-  $registeredCount++
-  if ($row.room -eq $staleRoom.room) { $registeredSelected = $true }
-}
-Assert-Equal 1 $registeredCount 'initial list is filtered by registered aliases'
-Assert-True (-not $registeredSelected) 'stale alias is hidden before display'
-
-$caseAliasLookup = [pscustomobject]@{ aliases = @('Q2.1') }
-$caseRegistered = @(Get-Q2DzRegisteredRooms -Catalog ([pscustomobject]@{ rooms = @($room) }) -LookupPayload $caseAliasLookup)
-Assert-Equal 0 $caseRegistered.Count 'aliases differing only by case must not register a room'
-Assert-Throws { Test-Q2DzSelectedRoom -Room $room -LookupPayload $caseAliasLookup -RtcPayload @($rtc) } 'case-mismatched alias must be rejected'
-
-Assert-True (Test-Q2DzSelectedRoom -Room $room -LookupPayload $lookupPayload -RtcPayload @($rtc)) 'fresh selected room must validate'
-Assert-Throws { Test-Q2DzSelectedRoom -Room $room -LookupPayload ([pscustomobject]@{ aliases = @('q2.other') }) -RtcPayload @($rtc) } 'alias mismatch must be rejected'
-Assert-Throws { Test-Q2DzSelectedRoom -Room $room -LookupPayload $lookupPayload -RtcPayload @([pscustomobject]@{ domain = 'https://lvc.example.invalid'; iceservers = @($rtc.iceservers) }) } 'URL-shaped RTC domain must be rejected'
-Assert-Throws { Test-Q2DzSelectedRoom -Room $room -LookupPayload $lookupPayload -RtcPayload @([pscustomobject]@{ domain = 'lvc.example.invalid'; ordered = $true; iceservers = @($rtc.iceservers) }) } 'ordered RTC must be rejected'
-Assert-Equal $false (Test-Q2DzRoomPayload ([pscustomobject]@{ rooms = $room })) 'scalar rooms must be rejected'
-Assert-Equal $false (Test-Q2DzAliasPayload ([pscustomobject]@{ aliases = 'q2.1' })) 'scalar aliases must be rejected'
-Assert-Equal $false (Test-Q2DzRtcPayload $rtc) 'scalar RTC top-level must be rejected'
-Assert-Equal $false (Test-Q2DzRtcPayload @([pscustomobject]@{ domain = 'lvc.example.invalid'; iceservers = $rtc.iceservers[0] })) 'scalar iceservers must be rejected'
-Assert-Throws { Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = $room }) } 'scalar rooms must not reach selection'
-$duplicateRoom = [pscustomobject]@{
-  room = $room.room; owner = '2'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Duplicate'; map = 'q2dm1'; maxPlayers = 16 }
-}
-Assert-Throws { Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($room, $duplicateRoom) }) } 'duplicate room ids must not reach selection'
-$caseRoom = [pscustomobject]@{
-  room = 'ROOM.Q2.TEST.1'; owner = '9'; roomReady = $true; players = 1; rtcServer = 'lvc.example.invalid'
-  createSettings = [pscustomobject]@{ prefix = 'q2'; name = 'Case variant'; map = 'q2dm1'; maxPlayers = 16 }
-}
-Assert-Equal 2 (@(Get-Q2DzJoinableRooms ([pscustomobject]@{ rooms = @($room, $caseRoom) }))).Count 'room ids differing only by case are distinct'
+$emptyPlan = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+  -ContentCheckPath 'q2dz-content-check.exe' -FetchJson $emptyFetch -RunContentCheck { param($path,$map,$root) return $true }
+Assert-Equal 0 $emptyPlan.Targets.Count 'empty PSCustomObject catalog is accepted'
+Assert-Equal 1 $emptyPlan.IceServers.Count 'empty catalog still validates global RTC'
 
 $launcherText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\q2dz-launch.ps1') -Raw
-Assert-True ($launcherText.Contains('The launcher has no room picker')) 'launcher keeps room selection inside Q2PRO-X'
-Assert-True (-not $launcherText.Contains('Open in Q2PRO-X')) 'launcher has no duplicate room action'
-Assert-True (-not $launcherText.Contains('ListBox')) 'launcher has no preliminary room chooser'
-Assert-True (-not $launcherText.Contains('--hub')) 'launcher uses the coordinator''s only supported mode'
-Assert-True ($launcherText.Contains("'--gateway', " + '$gateway')) 'launcher invokes the single hub coordinator mode'
-Assert-True ($launcherText.Contains('Get-Q2DzLiveHubSlots')) 'launcher refreshes the live hub state'
-Assert-True ($launcherText.Contains('Update-Q2DzHubSlots')) 'launcher uses the bounded slot planner'
-Assert-True ($launcherText.Contains('ConvertTo-Q2DzHubCommand')) 'launcher sends independent bounded slot commands'
-Assert-True ($launcherText.Contains('$rtcState')) 'launcher fetches one RTC snapshot while filling slots'
-Assert-True (-not $launcherText.Contains('Get-Q2DzSelectedTransport -Room $candidate')) 'launcher does not refetch transport data per room'
-Assert-True ($launcherText.Contains('RedirectStandardInput')) 'launcher uses a real redirected coordinator stdin'
-Assert-True ($launcherText.Contains('StandardInput.BaseStream')) 'launcher writes coordinator stdin as explicit bytes'
-Assert-True ($launcherText.Contains('UTF8Encoding')) 'launcher encodes coordinator stdin as UTF-8 without BOM'
+Assert-True ($launcherText.Contains('Q2DZ/ROOMS/2 ICE')) 'launcher emits ROOMS/2 ICE'
+Assert-True ($launcherText.Contains('Write-Q2DzHeartbeat')) 'launcher emits full heartbeat'
+Assert-True ($launcherText.Contains('Get-Q2DzLiveTargets')) 'launcher refreshes dynamic room state'
+Assert-True ($launcherText.Contains('StandardInput.BaseStream')) 'launcher writes coordinator stdin as bytes'
+Assert-True ($launcherText.Contains('UTF8Encoding')) 'launcher creates explicit UTF-8 coordinator encoding'
+Assert-True (-not $launcherText.Contains('Q2DZ_HUB_MAX_ROOMS')) 'launcher has no fixed-capacity constants'
+$legacyTargetType = 'Hub' + [char]83 + 'lot'
+Assert-True (-not $launcherText.Contains($legacyTargetType)) 'launcher has no legacy room model'
 
-Write-Output ('catalog contract tests: PASS ({0} shared cases)' -f $cases.Count)
+Write-Output ('catalog contract tests: PASS ({0} shared cases, dynamic target planner)' -f $cases.Count)

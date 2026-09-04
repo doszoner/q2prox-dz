@@ -68,19 +68,72 @@ function Wait-Q2DzCoordinator {
   return $null
 }
 
-function Write-Q2DzHubSlots {
+function ConvertTo-Q2DzCommandText {
+  param([Parameter(Mandatory = $true)][string]$Text)
+  if ([Text.Encoding]::UTF8.GetByteCount($Text) -gt $Q2DZ_MAX_HUB_COMMAND_BYTES) {
+    throw 'hub command exceeds 256 KiB'
+  }
+  return $Text
+}
+
+function ConvertTo-Q2DzIceCommand {
+  param(
+    [Parameter(Mandatory = $true)][UInt64]$Generation,
+    [Parameter(Mandatory = $true)]$IceServers
+  )
+  if ($Generation -eq 0) { throw 'invalid ICE generation' }
+  $json = ConvertTo-Json -InputObject ([array]@($IceServers)) -Depth 8 -Compress
+  return ConvertTo-Q2DzCommandText (('Q2DZ/ROOMS/2 ICE generation={0} json={1}' -f $Generation,$json) + "`n")
+}
+
+function ConvertTo-Q2DzPutCommand {
+  param([Parameter(Mandatory = $true)]$Target)
+  if (-not (Test-Q2DzSafeToken $Target.RoomId) -or [string]::IsNullOrEmpty([string]$Target.Config)) {
+    throw 'target has no safe room id'
+  }
+  return ConvertTo-Q2DzCommandText (('Q2DZ/ROOMS/2 PUT room={0} json={1}' -f $Target.RoomId,$Target.Config) + "`n")
+}
+
+function ConvertTo-Q2DzDropCommand {
+  param([Parameter(Mandatory = $true)][string]$RoomId)
+  if (-not (Test-Q2DzSafeToken $RoomId)) { throw 'target has no safe room id' }
+  return ConvertTo-Q2DzCommandText (('Q2DZ/ROOMS/2 DROP room={0}' -f $RoomId) + "`n")
+}
+
+function Write-Q2DzUtf8 {
+  param(
+    [Parameter(Mandatory = $true)]$Writer,
+    [Parameter(Mandatory = $true)][string]$Text
+  )
+  $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+  try {
+    $Writer.BaseStream.Write($bytes, 0, $bytes.Length)
+  } finally {
+    [Array]::Clear($bytes, 0, $bytes.Length)
+  }
+}
+
+function Write-Q2DzHeartbeat {
   param(
     [Parameter(Mandatory = $true)]$Process,
     [Parameter(Mandatory = $true)]$Writer,
-    [Parameter(Mandatory = $true)][object[]]$Slots
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)][UInt64]$Generation
   )
-  if ($Slots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
+  if ($null -eq $Plan -or $null -eq $Plan.Targets -or $null -eq $Plan.IceServers) {
+    throw 'hub heartbeat is incomplete'
+  }
+  $lines = [System.Collections.Generic.List[string]]::new()
   try {
-    for ($index = 0; $index -lt $Slots.Count; $index++) {
-      if (-not $Slots[$index].Send) { continue }
-      $Writer.Write((ConvertTo-Q2DzHubCommand $index $Slots[$index]))
+    [void]$lines.Add((ConvertTo-Q2DzIceCommand $Generation $Plan.IceServers))
+    foreach ($roomId in (Sort-Q2DzStrings @($Plan.Drops))) {
+      [void]$lines.Add((ConvertTo-Q2DzDropCommand $roomId))
     }
-    $Writer.Flush()
+    foreach ($roomId in (Sort-Q2DzStrings @($Plan.Targets.Keys))) {
+      [void]$lines.Add((ConvertTo-Q2DzPutCommand $Plan.Targets[$roomId]))
+    }
+    foreach ($line in $lines) { Write-Q2DzUtf8 -Writer $Writer -Text $line }
+    $Writer.BaseStream.Flush()
     if ($Process.HasExited) { return [int]$Process.ExitCode }
     return $null
   } catch {
@@ -93,6 +146,8 @@ function Write-Q2DzHubSlots {
     $code = Wait-Q2DzCoordinator -Process $Process
     if ($null -eq $code) { throw 'coordinator closed stdin but did not exit' }
     return $code
+  } finally {
+    $lines.Clear()
   }
 }
 
@@ -104,7 +159,8 @@ function New-Q2DzRoomConfig {
   param(
     [Parameter(Mandatory = $true)]$Room,
     [Parameter(Mandatory = $true)]$LookupPayload,
-    [Parameter(Mandatory = $true)]$RtcPayload
+    [Parameter(Mandatory = $true)]$RtcPayload,
+    $IceServers = $null
   )
   if (-not (Test-Q2DzRoomRow $Room) -or ((Get-Q2DzRoomKind $Room) -ceq 'q2' -and -not $Room.roomReady)) {
     throw 'The selected room is no longer available'
@@ -113,17 +169,16 @@ function New-Q2DzRoomConfig {
   $alias = Get-Q2DzRoomAlias $Room
   if ($LookupPayload.aliases -cnotcontains $alias) { throw 'selected room alias is no longer registered' }
   if (-not (Test-Q2DzRtcPayload $RtcPayload)) { throw 'RTC configuration has an invalid schema' }
-  if ((Get-Q2DzRoomKind $Room) -ceq 'q2ded') {
-    $iceServers = @(Get-Q2DzDedicatedIceServers $RtcPayload)
-  } else {
-    $matches = @($RtcPayload | Where-Object { $_.domain -ceq $Room.rtcServer })
-    if ($matches.Count -ne 1) { throw 'fresh RTC configuration is unavailable' }
-    $iceServers = @($matches[0].iceservers)
-  }
+  $iceServers = [array]@(if ($null -eq $IceServers) {
+      Get-Q2DzDedicatedIceServers $RtcPayload
+    } else {
+      @($IceServers)
+    })
   $config = [ordered]@{
     version = 1
     roomId = $Room.room
     alias = $alias
+    signalingUrl = $Q2DZ_SIGNALING_URL
     ordered = $Q2DZ_ORDERED
     iceServers = $iceServers
     map = $Room.createSettings.map
@@ -137,34 +192,25 @@ function New-Q2DzRoomConfig {
   return $json
 }
 
-function Get-Q2DzLiveHubSlots {
+function Get-Q2DzLiveTargets {
   param(
-    [Parameter(Mandatory = $true)][object[]]$Slots,
+    [Parameter(Mandatory = $true)]$Targets,
     [Parameter(Mandatory = $true)][string]$Q2Path,
     [Parameter(Mandatory = $true)][string]$ContentCheckPath,
     [scriptblock]$FetchJson = { param($Endpoint) Get-Q2DzJson $Endpoint },
     [scriptblock]$RunContentCheck = $null
   )
   $catalog = & $FetchJson $Q2DZ_ROOM_ENDPOINT
+  if (-not (Test-Q2DzRoomPayload $catalog) -and
+      -not (Test-Q2DzEmptyRoomCatalog $catalog)) {
+    try { Get-Q2DzReadyRooms $catalog | Out-Null } catch { throw }
+    throw 'room catalog has an invalid schema'
+  }
   $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
   $readyRows = @(Get-Q2DzReadyRooms $catalog)
   $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
-  $hasDedicated = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -ceq 'q2ded' }).Count -gt 0
-  $freezeDedicated = $false
-  $rtcState = [pscustomobject]@{ Fetched = $hasDedicated; Rows = $null }
-  if ($hasDedicated) {
-    $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
-    if (-not (Test-Q2DzRtcPayload $rtcState.Rows)) {
-      throw 'RTC configuration has an invalid schema'
-    } else {
-      try {
-        Get-Q2DzDedicatedIceServers $rtcState.Rows | Out-Null
-      } catch {
-        $freezeDedicated = $true
-        $registeredReady = @($registeredReady | Where-Object { (Get-Q2DzRoomKind $_) -cne 'q2ded' })
-      }
-    }
-  }
+  $rtcRows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
+  $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows)
   $check = if ($RunContentCheck) { $RunContentCheck } else {
     {
       param($Path, $Map, $Root)
@@ -174,30 +220,21 @@ function Get-Q2DzLiveHubSlots {
   }
   $makeConfig = {
     param($row)
-    if (-not $rtcState.Fetched) {
-      $rtcState.Fetched = $true
-      $rtcState.Rows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
-    }
-    New-Q2DzRoomConfig -Room $row -LookupPayload $lookup -RtcPayload $rtcState.Rows
+    New-Q2DzRoomConfig -Room $row -LookupPayload $lookup -RtcPayload $rtcRows -IceServers $iceServers
   }
   $mapAvailable = {
     param($row)
     $root = Split-Path -Parent $Q2Path
     return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
   }
-  $updated = @(Update-Q2DzHubSlots -Slots $Slots -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable)
-  if ($freezeDedicated) {
-    foreach ($index in 0..($Q2DZ_HUB_DEDICATED_SLOTS - 1)) {
-      $slot = $Slots[$index]
-      $updated[$index] = New-Q2DzHubSlot $slot.RoomId $slot.Config $slot.Misses $slot.MapName $false
-    }
-  }
+  $updated = Get-Q2DzTargetPlan -Targets $Targets -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable
+  $updated.IceServers = @($iceServers)
   return $updated
 }
 
 function Invoke-Q2DzHub {
   param(
-    [Parameter(Mandatory = $true)][object[]]$InitialSlots,
+    [Parameter(Mandatory = $true)]$InitialTargets,
     [Parameter(Mandatory = $true)][string]$Q2Path,
     [Parameter(Mandatory = $true)][string]$CoordinatorPath,
     [string[]]$CoordinatorArguments = @(),
@@ -205,7 +242,17 @@ function Invoke-Q2DzHub {
     [scriptblock]$Refresh = $null,
     [double]$PollIntervalSeconds = $HUB_POLL_SECONDS
   )
-  if ($InitialSlots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
+  $initialPlan = if ($InitialTargets.PSObject.Properties.Name -contains 'Targets' -and
+      $InitialTargets.PSObject.Properties.Name -contains 'IceServers') { $InitialTargets } else { $null }
+  $targets = if ($initialPlan) { Copy-Q2DzTargetMap $initialPlan.Targets } else { Copy-Q2DzTargetMap $InitialTargets }
+  $initialIce = if ($initialPlan) { @($initialPlan.IceServers) } else {
+    $candidate = $null
+    foreach ($roomId in (Sort-Q2DzStrings @($targets.Keys))) {
+      try { $candidate = (([string]$targets[$roomId].Config) | ConvertFrom-Json -ErrorAction Stop).iceServers } catch { $candidate = $null }
+      if ($candidate) { break }
+    }
+    @($candidate)
+  }
   $owner = if ($StartCoordinator) {
     & $StartCoordinator $CoordinatorPath $CoordinatorArguments
   } else {
@@ -215,10 +262,13 @@ function Invoke-Q2DzHub {
   $writer = $owner.Writer
   $exitCode = $null
   try {
-    $code = Write-Q2DzHubSlots -Process $process -Writer $writer -Slots $InitialSlots
-    if ($null -ne $code) { $exitCode = $code; return $code }
-    $slots = @($InitialSlots)
+    if (@($initialIce).Count -gt 0) {
+      $code = Write-Q2DzHeartbeat -Process $process -Writer $writer `
+        -Plan ([pscustomobject]@{ Targets = $targets; IceServers = @($initialIce); Drops = @() }) -Generation 1
+      if ($null -ne $code) { $exitCode = $code; return $code }
+    }
     $refreshFn = if ($Refresh) { $Refresh } else { throw 'hub refresh function is required' }
+    $generation = [UInt64]1
     $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
     while ($true) {
       while ($true) {
@@ -227,14 +277,17 @@ function Invoke-Q2DzHub {
         if ((Get-Q2DzMonotonicSeconds) -ge $deadline) { break }
       }
       try {
-        $updated = @(& $refreshFn $slots)
-        if ($updated.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub refresh returned an invalid slot count' }
+        $updated = & $refreshFn $targets
+        if ($null -eq $updated -or $null -eq $updated.Targets -or $null -eq $updated.IceServers) {
+          throw 'hub refresh returned an incomplete heartbeat'
+        }
       } catch {
         $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
         continue
       }
-      $slots = $updated
-      $code = Write-Q2DzHubSlots -Process $process -Writer $writer -Slots $slots
+      $targets = Copy-Q2DzTargetMap $updated.Targets
+      $generation++
+      $code = Write-Q2DzHeartbeat -Process $process -Writer $writer -Plan $updated -Generation $generation
       if ($null -ne $code) { $exitCode = $code; return $code }
       $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
     }
@@ -305,17 +358,20 @@ function Start-Q2DzLauncher {
     Set-Content -LiteralPath $q2PathFile -Value $q2 -Encoding UTF8
   }
 
-  $slots = @(1..$Q2DZ_HUB_MAX_ROOMS | ForEach-Object { New-Q2DzHubSlot })
+  $targets = New-Q2DzTargetMap
+  $initial = $null
   try {
-    $slots = @(Get-Q2DzLiveHubSlots -Slots $slots -Q2Path $q2 -ContentCheckPath $contentCheck)
+    $initial = Get-Q2DzLiveTargets -Targets $targets -Q2Path $q2 -ContentCheckPath $contentCheck
+    $targets = $initial.Targets
   } catch {
-    $slots = @(1..$Q2DZ_HUB_MAX_ROOMS | ForEach-Object { New-Q2DzHubSlot })
+    $initial = $null
   }
   $refresh = {
-    param($currentSlots)
-    Get-Q2DzLiveHubSlots -Slots $currentSlots -Q2Path $q2 -ContentCheckPath $contentCheck
+    param($currentTargets)
+    Get-Q2DzLiveTargets -Targets $currentTargets -Q2Path $q2 -ContentCheckPath $contentCheck
   }
-  return (Invoke-Q2DzHub -InitialSlots $slots -Q2Path $q2 -CoordinatorPath $coordinator -CoordinatorArguments @(
+  $initialValue = if ($initial) { $initial } else { $targets }
+  return (Invoke-Q2DzHub -InitialTargets $initialValue -Q2Path $q2 -CoordinatorPath $coordinator -CoordinatorArguments @(
     '--gateway', $gateway,
     '--q2', $q2,
     '--session-root', (Join-Path $state 'sessions')

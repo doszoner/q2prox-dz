@@ -15,10 +15,9 @@ $Q2DZ_MAX_ICE_URL = 2048
 $Q2DZ_MAX_ICE_FIELD = 1024
 $Q2DZ_MAX_HUB_COMMAND_BYTES = 256KB
 $Q2DZ_MAX_GATEWAY_CONFIG_BYTES = 65535
-$Q2DZ_HUB_DEDICATED_SLOTS = 3
-$Q2DZ_HUB_Q2_SLOTS = 2
-$Q2DZ_HUB_MAX_ROOMS = 5
-$Q2DZ_HUB_CANDIDATES_PER_SLOT = 4
+$Q2DZ_MAX_TARGETS = 256
+$Q2DZ_MAX_ICE_SNAPSHOT_BYTES = 65536
+$Q2DZ_SIGNALING_URL = 'wss://net.js-dos.com:444'
 
 function Test-Q2DzEndpoint {
   param([Parameter(Mandatory = $true)][string]$Uri)
@@ -302,15 +301,18 @@ function Test-Q2DzRoomRow {
   return $true
 }
 
-function New-Q2DzHubSlot {
+function New-Q2DzTarget {
   param(
     [string]$RoomId = '',
     [string]$Config = '',
     [int]$Misses = 0,
-    [string]$MapName = '',
-    [bool]$Send = $true
+    [string]$MapName = ''
   )
-  return [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses; MapName = $MapName; Send = $Send }
+  return [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses; MapName = $MapName }
+}
+
+function New-Q2DzTargetMap {
+  return [System.Collections.Hashtable]::new([StringComparer]::Ordinal)
 }
 
 function Get-Q2DzRoomKind { param($Room) return [string]$Room.createSettings.prefix }
@@ -319,7 +321,27 @@ function Get-Q2DzRoomAlias {
   if ((Get-Q2DzRoomKind $Room) -ceq 'q2ded') { return [string]$Room.room }
   return 'q2.{0}' -f ([string]$Room.owner)
 }
-function Get-Q2DzSlotKind { param([int]$Index) if ($Index -lt 3) { return 'q2ded' }; return 'q2' }
+
+function Sort-Q2DzStrings {
+  param([string[]]$Values)
+  $result = @($Values)
+  if ($result.Count -gt 1) { [Array]::Sort($result, [StringComparer]::Ordinal) }
+  return $result
+}
+
+function Sort-Q2DzRoomRows {
+  param([object[]]$Rows)
+  $result = @($Rows)
+  if ($result.Count -gt 1) {
+    $comparer = [System.Collections.Generic.Comparer[object]]::Create(
+      [System.Comparison[object]]{
+        param($Left, $Right)
+        return [StringComparer]::Ordinal.Compare([string]$Left.room, [string]$Right.room)
+      })
+    [Array]::Sort($result, $comparer)
+  }
+  return $result
+}
 
 function ConvertTo-Q2DzCanonicalJsonValue {
   param($Value)
@@ -351,7 +373,20 @@ function Get-Q2DzDedicatedIceServers {
     }
   }
   if ($result.Count -lt 1 -or $result.Count -gt $Q2DZ_MAX_ICE_SERVERS) {
-    throw 'dedicated RTC configuration exceeds the supported limit'
+    throw 'global RTC configuration exceeds the supported limit'
+  }
+  $serialized = $null
+  $bytes = $null
+  try {
+    $serialized = ConvertTo-Json -InputObject ([array]@($result)) -Depth 8 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($serialized)
+    if ($bytes.Length -gt $Q2DZ_MAX_ICE_SNAPSHOT_BYTES) {
+      throw 'global ICE snapshot exceeds 65536 bytes'
+    }
+  }
+  finally {
+    if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+    $serialized = $null
   }
   return @($result)
 }
@@ -375,9 +410,7 @@ function Get-Q2DzReadyRooms {
     $seenAliases += $alias
     if ((Get-Q2DzRoomKind $row) -ceq 'q2ded' -or $row.roomReady) { $result += $row }
   }
-  return @($result | Sort-Object `
-    @{ Expression = { $_.createSettings.name.ToLowerInvariant() } }, `
-    @{ Expression = { [string]$_.room } })
+  return @(Sort-Q2DzRoomRows $result)
 }
 
 function Select-Q2DzRegisteredRooms {
@@ -394,104 +427,89 @@ function Select-Q2DzRegisteredRooms {
   return @($result)
 }
 
-function ConvertTo-Q2DzHubCommand {
-  param(
-    [int]$Index,
-    [Parameter(Mandatory = $true)]$Slot
-  )
-  if ($Index -lt 0 -or $Index -ge $Q2DZ_HUB_MAX_ROOMS) { throw 'invalid hub slot' }
-  $value = if ([string]::IsNullOrEmpty($Slot.RoomId)) {
-    '-'
-  } else {
-    ('{0} {1}' -f $Slot.RoomId, $Slot.Config)
+function Copy-Q2DzTargetMap {
+  param([Parameter(Mandatory = $true)]$Targets)
+  if ($Targets -isnot [hashtable]) { throw 'hub target state must be a room map' }
+  $result = New-Q2DzTargetMap
+  foreach ($key in @($Targets.Keys)) {
+    $target = $Targets[$key]
+    if ($null -eq $target -or [string]$target.RoomId -cne [string]$key -or
+        [string]::IsNullOrEmpty([string]$target.Config)) {
+      throw 'hub target state key does not match room id'
+    }
+    $result[[string]$key] = New-Q2DzTarget ([string]$target.RoomId) ([string]$target.Config) ([int]$target.Misses) ([string]$target.MapName)
   }
-  $text = ('{0} {1}' -f $Index, $value) + "`n"
-  if ([Text.Encoding]::UTF8.GetByteCount($text) -gt $Q2DZ_MAX_HUB_COMMAND_BYTES) {
-    throw 'hub slot command exceeds 256 KiB'
-  }
-  return $text
+  if ($result.Count -gt $Q2DZ_MAX_TARGETS) { throw 'catalog_capacity_exceeded' }
+  return $result
 }
 
-function Update-Q2DzHubSlots {
+function Get-Q2DzTargetPlan {
   param(
-    [Parameter(Mandatory = $true)][object[]]$Slots,
+    [Parameter(Mandatory = $true)]$Targets,
     [object[]]$Rows = @(),
     [Parameter(Mandatory = $true)][scriptblock]$MakeConfig,
     [scriptblock]$MapAvailable = { param($row) return $true }
   )
-  if ($Slots.Count -ne $Q2DZ_HUB_MAX_ROOMS) { throw 'hub requires exactly five slots' }
+  $current = Copy-Q2DzTargetMap $Targets
+  $rows = @($Rows)
+  $seenRooms = New-Q2DzTargetMap
+  $seenAliases = New-Q2DzTargetMap
+  foreach ($row in $rows) {
+    if (-not (Test-Q2DzRoomRow $row)) { throw 'room catalog has an invalid schema' }
+    $roomId = [string]$row.room
+    if ($seenRooms.ContainsKey($roomId)) { throw 'room catalog has duplicate room ids' }
+    $seenRooms[$roomId] = $true
+    $alias = Get-Q2DzRoomAlias $row
+    if ($seenAliases.ContainsKey($alias)) { throw 'room catalog has duplicate Q2 aliases' }
+    $seenAliases[$alias] = $true
+  }
+  $desired = @($rows | Where-Object { $_.players -lt $_.createSettings.maxPlayers })
+  if ($desired.Count -gt $Q2DZ_MAX_TARGETS) { throw 'catalog_capacity_exceeded' }
 
-  $updated = @()
-  for ($slotIndex = 0; $slotIndex -lt $Slots.Count; $slotIndex++) {
-    $slot = $Slots[$slotIndex]
-    if ([string]::IsNullOrEmpty($slot.RoomId)) {
-      $updated += New-Q2DzHubSlot
+  $updated = New-Q2DzTargetMap
+  $drops = [System.Collections.Generic.List[string]]::new()
+  foreach ($roomId in (Sort-Q2DzStrings @($current.Keys))) {
+    $target = $current[$roomId]
+    $row = @($rows | Where-Object { [string]$_.room -ceq [string]$roomId }) | Select-Object -First 1
+    if ($null -eq $row) {
+      if ([int]$target.Misses -lt 1) {
+        $updated[$roomId] = New-Q2DzTarget $target.RoomId $target.Config ([int]$target.Misses + 1) $target.MapName
+      } else {
+        [void]$drops.Add([string]$roomId)
+      }
       continue
     }
-    $retained = $null
-    foreach ($row in @($Rows)) {
-      if ([string]$row.room -ceq [string]$slot.RoomId) { $retained = $row; break }
-    }
-    if ($null -ne $retained -and (Get-Q2DzRoomKind $retained) -ceq (Get-Q2DzSlotKind $slotIndex)) {
-      $map = [string]$retained.createSettings.map
-      $mapChanged = -not [string]::IsNullOrEmpty([string]$slot.MapName) -and $slot.MapName -cne $map
-      if ($mapChanged -and -not (& $MapAvailable $retained)) {
-        $updated += New-Q2DzHubSlot
-        continue
-      }
-      if ((Get-Q2DzRoomKind $retained) -ceq 'q2ded' -or $mapChanged) {
-        try {
-          $values = @(& $MakeConfig $retained)
-          if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }
-          $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$values[0]) 0 $map
-        } catch {
-          $updated += New-Q2DzHubSlot $slot.RoomId $slot.Config $slot.Misses $slot.MapName $false
-        }
-      } else {
-        $savedMap = if ([string]::IsNullOrEmpty([string]$slot.MapName)) { $map } else { [string]$slot.MapName }
-        $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) 0 $savedMap
-      }
-    } elseif ([int]$slot.Misses -lt 1) {
-      $send = (Get-Q2DzSlotKind $slotIndex) -cne 'q2ded'
-      $updated += New-Q2DzHubSlot ([string]$slot.RoomId) ([string]$slot.Config) ([int]$slot.Misses + 1) ([string]$slot.MapName) $send
-    } else {
-      $updated += New-Q2DzHubSlot
-    }
+    $map = [string]$row.createSettings.map
+    $values = @(& $MakeConfig $row)
+    if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }
+    $config = [string]$values[0]
+    $changed = $config -cne [string]$target.Config
+    $mapChanged = -not [string]::IsNullOrEmpty([string]$target.MapName) -and [string]$target.MapName -cne $map
+    if ($changed -and $mapChanged -and -not (& $MapAvailable $row)) { throw 'map content check failed' }
+    $savedConfig = if ($changed) { $config } else { [string]$target.Config }
+    $updated[$roomId] = New-Q2DzTarget $target.RoomId $savedConfig 0 $map
+    if ($changed) { [void]$drops.Add([string]$roomId) }
   }
 
-  $activeIds = @($updated | Where-Object { -not [string]::IsNullOrEmpty($_.RoomId) } |
-    ForEach-Object { [string]$_.RoomId })
-  foreach ($pool in @(
-    [pscustomobject]@{ Kind = 'q2ded'; First = 0; Count = $Q2DZ_HUB_DEDICATED_SLOTS },
-    [pscustomobject]@{ Kind = 'q2'; First = $Q2DZ_HUB_DEDICATED_SLOTS; Count = $Q2DZ_HUB_Q2_SLOTS }
-  )) {
-    $attempted = 0
-    foreach ($row in @($Rows | Where-Object { (Get-Q2DzRoomKind $_) -ceq $pool.Kind })) {
-      if ($attempted -ge ($pool.Count * $Q2DZ_HUB_CANDIDATES_PER_SLOT)) { break }
-      $roomId = [string]$row.room
-      if ($activeIds -ccontains $roomId -or $row.players -ge $row.createSettings.maxPlayers) { continue }
-      $emptyIndex = $null
-      for ($index = $pool.First; $index -lt ($pool.First + $pool.Count); $index++) {
-        if ([string]::IsNullOrEmpty($updated[$index].RoomId)) { $emptyIndex = $index; break }
-      }
-      if ($null -eq $emptyIndex) { break }
-      $attempted++
-      if (-not (& $MapAvailable $row)) { continue }
-      try {
-        $configValues = @(& $MakeConfig $row)
-        if ($configValues.Count -ne 1 -or $configValues[0] -isnot [string]) { throw 'room configuration must be one string' }
-        $config = [string]$configValues[0]
-        if ([string]::IsNullOrEmpty($config) -or $config.Contains("`r") -or $config.Contains("`n")) {
-          throw 'room configuration must fit one line'
-        }
-        $candidate = New-Q2DzHubSlot $roomId $config 0 ([string]$row.createSettings.map)
-        ConvertTo-Q2DzHubCommand $emptyIndex $candidate | Out-Null
-      } catch { continue }
-      $updated[$emptyIndex] = $candidate
-      $activeIds += $roomId
+  foreach ($row in (Sort-Q2DzRoomRows $desired)) {
+    $roomId = [string]$row.room
+    if ($updated.ContainsKey($roomId)) { continue }
+    if (-not (& $MapAvailable $row)) { throw 'map content check failed' }
+    if ($updated.Count -ge $Q2DZ_MAX_TARGETS) { continue }
+    $values = @(& $MakeConfig $row)
+    if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }
+    $config = [string]$values[0]
+    if ([string]::IsNullOrEmpty($config) -or $config.Contains("`r") -or $config.Contains("`n")) {
+      throw 'room configuration must fit one line'
     }
+    $updated[$roomId] = New-Q2DzTarget $roomId $config 0 ([string]$row.createSettings.map)
   }
-  return @($updated)
+  if ($updated.Count -gt $Q2DZ_MAX_TARGETS) { throw 'catalog_capacity_exceeded' }
+  return [pscustomobject]@{
+    Targets = $updated
+    IceServers = @()
+    Drops = @(Sort-Q2DzStrings $drops.ToArray())
+  }
 }
 
 function Test-Q2DzRoomPayload {
@@ -516,6 +534,15 @@ function Test-Q2DzRoomPayload {
     }
   }
   return $supportedCount -gt 0
+}
+
+function Test-Q2DzEmptyRoomCatalog {
+  param($Value)
+  if ($null -eq $Value -or $null -eq $Value.PSObject -or
+      $Value.PSObject.Properties.Name -notcontains 'rooms' -or $Value.rooms -isnot [array]) {
+    return $false
+  }
+  return @($Value.rooms).Count -eq 0
 }
 
 function Get-Q2DzJoinableRooms {

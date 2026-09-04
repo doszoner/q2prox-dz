@@ -28,16 +28,11 @@ GAME = "3zb2"
 FETCH_TIMEOUT = 15
 MAX_BODY = 2 * 1024 * 1024
 ROOM_CLOSED_EXIT = 73
-HUB_DEDICATED_SLOTS = 3
-HUB_Q2_SLOTS = 2
-HUB_MAX_ROOMS = HUB_DEDICATED_SLOTS + HUB_Q2_SLOTS
+MAX_HUB_TARGETS = 256
+MAX_ICE_SNAPSHOT_BYTES = 65536
 MAX_HUB_COMMAND_BYTES = 256 * 1024
 MAX_GATEWAY_CONFIG_BYTES = 65535
 HUB_POLL_SECONDS = 15.0
-# Keep content checks bounded even when the public catalog is large. Four
-# candidates per slot is enough to skip missing maps without spawning an
-# unbounded number of helper processes.
-HUB_CANDIDATES_PER_SLOT = 4
 _AUTO = object()
 MAX_TOKEN = 255
 MAX_OWNER = 250
@@ -59,12 +54,18 @@ class LaunchError(RuntimeError):
 
 
 @dataclasses.dataclass
-class HubSlot:
-    room_id: str = ""
-    config: str = ""
+class HubTarget:
+    room_id: str
+    config: str
     misses: int = 0
     map_name: str = ""
-    send: bool = True
+
+
+@dataclasses.dataclass
+class TargetPlan:
+    targets: dict[str, HubTarget]
+    ice_servers: list[dict]
+    drops: tuple[str, ...] = ()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -368,7 +369,7 @@ def ready_rooms(payload):
     if len(aliases) != len(set(aliases)):
         raise LaunchError("room catalog has duplicate Q2 aliases")
     rows = [row for row in strict_rows if row["createSettings"]["prefix"] == "q2ded" or row["roomReady"]]
-    return sorted(rows, key=lambda row: (row["createSettings"]["name"].casefold(), row["room"]))
+    return sorted(rows, key=lambda row: row["room"])
 
 
 def joinable_rooms(payload):
@@ -393,11 +394,7 @@ def _room_alias(row):
     return row["room"] if _room_kind(row) == "q2ded" else f"q2.{row['owner']}"
 
 
-def _slot_kind(index):
-    return "q2ded" if index < HUB_DEDICATED_SLOTS else "q2"
-
-
-def _dedicated_ice_servers(rtc_rows):
+def _ice_snapshot(rtc_rows):
     if not validate_rtc_payload(rtc_rows):
         raise LaunchError("RTC configuration has an invalid schema")
     result = []
@@ -409,8 +406,24 @@ def _dedicated_ice_servers(rtc_rows):
                 seen.add(key)
                 result.append(server)
     if not 1 <= len(result) <= MAX_ICE_SERVERS:
-        raise LaunchError("dedicated RTC configuration exceeds the supported limit")
+        raise LaunchError("global RTC configuration exceeds the supported limit")
+    snapshot_bytes = bytearray()
+    try:
+        try:
+            snapshot_bytes.extend(
+                json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            )
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise LaunchError("global ICE snapshot is not valid UTF-8 JSON") from exc
+        if len(snapshot_bytes) > MAX_ICE_SNAPSHOT_BYTES:
+            raise LaunchError("global ICE snapshot exceeds 65536 bytes")
+    finally:
+        snapshot_bytes[:] = b"\x00" * len(snapshot_bytes)
     return result
+
+
+def _dedicated_ice_servers(rtc_rows):
+    return _ice_snapshot(rtc_rows)
 
 
 def _config_text(config):
@@ -430,90 +443,139 @@ def _config_text(config):
     return text
 
 
-def encode_slot(index, slot):
-    if index < 0 or index >= HUB_MAX_ROOMS:
-        raise LaunchError("invalid hub slot")
-    payload = (
-        f"{index} -\n" if not slot.room_id
-        else f"{index} {slot.room_id} {slot.config}\n"
-    )
+def _command_line(payload):
+    payload_bytes = bytearray()
     try:
-        payload_bytes = payload.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise LaunchError("hub slot command is not valid UTF-8") from exc
-    if len(payload_bytes) > MAX_HUB_COMMAND_BYTES:
-        raise LaunchError("hub slot command exceeds 256 KiB")
-    return payload
+        try:
+            payload_bytes.extend(payload.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise LaunchError("hub command is not valid UTF-8") from exc
+        if len(payload_bytes) > MAX_HUB_COMMAND_BYTES:
+            raise LaunchError("hub command exceeds 256 KiB")
+        return payload
+    finally:
+        payload_bytes[:] = b"\x00" * len(payload_bytes)
 
 
-def reconcile_slots(slots, rows, make_config, map_available=lambda _row: True):
-    """Retain known rooms and fill empty slots from ready registered rows."""
-    if len(slots) != HUB_MAX_ROOMS:
-        raise LaunchError("hub requires exactly five slots")
+def encode_ice(generation, ice_servers):
+    if not _is_int(generation) or generation < 1:
+        raise LaunchError("invalid ICE generation")
+    return _command_line(
+        f"Q2DZ/ROOMS/2 ICE generation={generation} json={_config_text(ice_servers)}\n"
+    )
+
+
+def encode_put(target):
+    if not isinstance(target, HubTarget) or not _safe_token(target.room_id):
+        raise LaunchError("target has no safe room id")
+    return _command_line(f"Q2DZ/ROOMS/2 PUT room={target.room_id} json={target.config}\n")
+
+
+def encode_drop(room_id):
+    if not _safe_token(room_id):
+        raise LaunchError("target has no safe room id")
+    return _command_line(f"Q2DZ/ROOMS/2 DROP room={room_id}\n")
+
+
+def _target_from_config(config):
+    if isinstance(config, HubTarget):
+        return dataclasses.replace(config)
+    if not isinstance(config, dict) or not isinstance(config.get("roomId"), str) or not config["roomId"]:
+        raise LaunchError("hub room configuration has no room id")
+    text = _config_text(config)
+    return HubTarget(config["roomId"], text, 0, str(config.get("map", "")))
+
+
+def _copy_targets(targets):
+    if not isinstance(targets, dict):
+        raise LaunchError("hub target state must be a room map")
+    copied = {}
+    for room_id, target in targets.items():
+        normalized = _target_from_config(target)
+        if room_id != normalized.room_id:
+            raise LaunchError("hub target state key does not match room id")
+        copied[room_id] = normalized
+    if len(copied) > MAX_HUB_TARGETS:
+        raise LaunchError("catalog_capacity_exceeded")
+    return copied
+
+
+def _validate_rows(rows):
+    seen_rooms = set()
+    seen_aliases = set()
+    for row in rows:
+        if not _strict_room(row):
+            raise LaunchError("room catalog has an invalid schema")
+        room_id = row["room"]
+        if room_id in seen_rooms:
+            raise LaunchError("room catalog has duplicate room ids")
+        seen_rooms.add(room_id)
+        alias = _room_alias(row)
+        if alias in seen_aliases:
+            raise LaunchError("room catalog has duplicate Q2 aliases")
+        seen_aliases.add(alias)
+
+
+def reconcile_targets(targets, rows, make_config, map_available=lambda _row: True):
+    """Build one complete room-id snapshot without mutating the live state."""
+    current = _copy_targets(targets)
+    rows = list(rows)
+    _validate_rows(rows)
     by_id = {row["room"]: row for row in rows}
-    updated = []
-    for index, slot in enumerate(slots):
-        if not slot.room_id:
-            updated.append(HubSlot())
-            continue
-        row = by_id.get(slot.room_id)
-        if row is not None and _room_kind(row) == _slot_kind(index):
-            map_name = row["createSettings"]["map"]
-            map_changed = bool(slot.map_name and slot.map_name != map_name)
-            if map_changed and not map_available(row):
-                updated.append(HubSlot())
-                continue
-            if _room_kind(row) == "q2ded" or map_changed:
-                try:
-                    updated.append(HubSlot(slot.room_id, _config_text(make_config(row)), 0, map_name))
-                except LaunchError:
-                    updated.append(dataclasses.replace(slot, send=False))
+    desired_rows = [
+        row for row in rows
+        if row["players"] < row["createSettings"]["maxPlayers"]
+    ]
+    if len(desired_rows) > MAX_HUB_TARGETS:
+        raise LaunchError("catalog_capacity_exceeded")
+
+    updated = {}
+    drops = set()
+    for room_id in sorted(current):
+        target = current[room_id]
+        row = by_id.get(room_id)
+        if row is None:
+            if target.misses < 1:
+                updated[room_id] = dataclasses.replace(target, misses=target.misses + 1)
             else:
-                updated.append(HubSlot(slot.room_id, slot.config, 0, slot.map_name or map_name))
-        elif slot.misses < 1:
-            updated.append(HubSlot(
-                slot.room_id, slot.config, slot.misses + 1, slot.map_name,
-                send=_slot_kind(index) != "q2ded",
-            ))
-        else:
-            updated.append(HubSlot())
+                drops.add(room_id)
+            continue
+        map_name = row["createSettings"]["map"]
+        config_text = _config_text(make_config(row))
+        changed = config_text != target.config
+        map_changed = bool(target.map_name) and target.map_name != map_name
+        if changed and map_changed and not map_available(row):
+            raise LaunchError("map content check failed")
+        updated[room_id] = HubTarget(room_id, config_text if changed else target.config, 0, map_name)
+        if changed:
+            drops.add(room_id)
 
-    active_ids = {slot.room_id for slot in updated if slot.room_id}
-    for kind, indices in (("q2ded", range(0, HUB_DEDICATED_SLOTS)),
-                          ("q2", range(HUB_DEDICATED_SLOTS, HUB_MAX_ROOMS))):
-        attempted = 0
-        limit = len(indices) * HUB_CANDIDATES_PER_SLOT
-        for row in (candidate for candidate in rows if _room_kind(candidate) == kind):
-            if attempted >= limit:
-                break
-            room_id = row["room"]
-            if room_id in active_ids or row["players"] >= row["createSettings"]["maxPlayers"]:
-                continue
-            empty_index = next((index for index in indices if not updated[index].room_id), None)
-            if empty_index is None:
-                break
-            attempted += 1
-            if not map_available(row):
-                continue
-            try:
-                config_text = _config_text(make_config(row))
-                candidate = HubSlot(room_id, config_text, 0, row["createSettings"]["map"])
-                encode_slot(empty_index, candidate)
-            except LaunchError:
-                continue
-            updated[empty_index] = candidate
-            active_ids.add(room_id)
-    return updated
+    for row in sorted(desired_rows, key=lambda value: value["room"]):
+        room_id = row["room"]
+        if room_id in updated:
+            continue
+        if not map_available(row):
+            raise LaunchError("map content check failed")
+        if len(updated) >= MAX_HUB_TARGETS:
+            continue
+        config_text = _config_text(make_config(row))
+        target = HubTarget(room_id, config_text, 0, row["createSettings"]["map"])
+        encode_put(target)
+        updated[room_id] = target
+
+    if len(updated) > MAX_HUB_TARGETS:
+        raise LaunchError("catalog_capacity_exceeded")
+    return TargetPlan(updated, [], tuple(sorted(drops)))
 
 
-def poll_once(slots, fetch, writer):
-    """Apply one successful refresh; catalog failures leave slots untouched."""
+def poll_once(targets, fetch, writer):
+    """Apply one successful refresh; failures leave the room map untouched."""
     try:
         updated = fetch()
     except LaunchError:
-        return slots
+        return targets
     writer(updated)
-    return updated
+    return updated.targets if isinstance(updated, TargetPlan) else updated
 
 
 def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subprocess.run):
@@ -525,7 +587,7 @@ def notify(message, level="error", zenity=_AUTO, output=sys.stderr, runner=subpr
         output.write(message + "\n")
 
 
-def make_room_config(selected, lookup, rtc_rows):
+def make_room_config(selected, lookup, rtc_rows, ice_servers=None):
     if not _strict_room(selected) or (selected["createSettings"]["prefix"] == "q2" and selected.get("roomReady") is not True):
         raise LaunchError("The selected room is no longer available")
     alias = _room_alias(selected)
@@ -535,15 +597,10 @@ def make_room_config(selected, lookup, rtc_rows):
         raise LaunchError("selected room alias is no longer registered")
     if not validate_rtc_payload(rtc_rows):
         raise LaunchError("RTC configuration has an invalid schema")
-    if _room_kind(selected) == "q2ded":
-        ice_servers = _dedicated_ice_servers(rtc_rows)
-    else:
-        if not validate_rtc_payload(rtc_rows):
-            raise LaunchError("RTC configuration has an invalid schema")
-        matches = [row for row in rtc_rows if row["domain"] == selected["rtcServer"]]
-        if len(matches) != 1:
-            raise LaunchError("fresh RTC configuration is unavailable")
-        ice_servers = matches[0]["iceservers"]
+    if ice_servers is None:
+        ice_servers = _ice_snapshot(rtc_rows)
+    elif not isinstance(ice_servers, list) or not 1 <= len(ice_servers) <= MAX_ICE_SERVERS:
+        raise LaunchError("global RTC configuration has an invalid schema")
     config = {
         "version": 1,
         "roomId": selected["room"],
@@ -710,12 +767,32 @@ def wait_child(process, timeout=10.0):
         return None
 
 
-def write_slots(process, slots):
+def _write_bytes(process, line):
+    encoded = bytearray(line.encode("utf-8"))
     try:
-        for index, slot in enumerate(slots):
-            if not slot.send:
-                continue
-            process.stdin.write(encode_slot(index, slot))
+        process.stdin.write(bytes(encoded))
+    except BrokenPipeError:
+        code = wait_child(process)
+        if code is None:
+            raise LaunchError("coordinator closed stdin but did not exit")
+        return code
+    finally:
+        encoded[:] = b"\x00" * len(encoded)
+    return None
+
+
+def write_heartbeat(process, plan, generation):
+    if not isinstance(plan, TargetPlan):
+        plan = TargetPlan(_copy_targets(plan), [], ())
+    lines = []
+    try:
+        lines.append(encode_ice(generation, plan.ice_servers))
+        lines.extend(encode_drop(room_id) for room_id in sorted(plan.drops))
+        lines.extend(encode_put(plan.targets[room_id]) for room_id in sorted(plan.targets))
+        for line in lines:
+            code = _write_bytes(process, line)
+            if code is not None:
+                return code
         process.stdin.flush()
         return None
     except BrokenPipeError:
@@ -723,69 +800,47 @@ def write_slots(process, slots):
         if code is None:
             raise LaunchError("coordinator closed stdin but did not exit")
         return code
+    finally:
+        lines.clear()
 
 
-def _initial_slots(configs):
-    slots = [HubSlot() for _ in range(HUB_MAX_ROOMS)]
-    for config in configs[:HUB_MAX_ROOMS]:
-        if isinstance(config, HubSlot):
-            kind = "q2ded" if config.room_id.startswith("room.q2ded.") else "q2"
-            index = next((i for i in range(HUB_MAX_ROOMS) if _slot_kind(i) == kind and not slots[i].room_id), None)
-            if index is None:
-                raise LaunchError(f"hub has no free {kind} slot")
-            slots[index] = dataclasses.replace(config)
-            continue
-        if not isinstance(config, dict) or not isinstance(config.get("roomId"), str) or not config["roomId"]:
-            raise LaunchError("hub room configuration has no room id")
-        kind = "q2ded" if config["roomId"].startswith("room.q2ded.") else "q2"
-        index = next((i for i in range(HUB_MAX_ROOMS) if _slot_kind(i) == kind and not slots[i].room_id), None)
-        if index is None:
-            raise LaunchError(f"hub has no free {kind} slot")
-        slots[index] = HubSlot(config["roomId"], _config_text(config), 0, str(config.get("map", "")))
-    return slots
+def _room_catalog_is_empty(catalog):
+    return isinstance(catalog, dict) and catalog.get("rooms") == []
 
 
-def refresh_slots(slots, q2_path, *, fetch=None, content_checker=None, runner=subprocess.run):
+def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runner=subprocess.run):
     fetch = fetch or fetch_json
     catalog = fetch(ROOM_ENDPOINT)
+    if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
+        try:
+            ready_rooms(catalog)
+        except LaunchError:
+            raise
+        raise LaunchError("room catalog has an invalid schema")
     lookup = fetch(LOOKUP_ENDPOINT)
     rows = registered_rooms(ready_rooms(catalog), lookup)
-    needs_dedicated_rtc = any(_room_kind(row) == "q2ded" for row in rows)
-    freeze_dedicated = False
-    rtc_rows = fetch(RTC_ENDPOINT) if needs_dedicated_rtc else None
-    if needs_dedicated_rtc:
-        if not validate_rtc_payload(rtc_rows):
-            raise LaunchError("RTC configuration has an invalid schema")
-        else:
-            try:
-                _dedicated_ice_servers(rtc_rows)
-            except LaunchError:
-                freeze_dedicated = True
-                rows = [row for row in rows if _room_kind(row) != "q2ded"]
+    rtc_rows = fetch(RTC_ENDPOINT)
+    ice_servers = _ice_snapshot(rtc_rows)
 
     def make_config(row):
-        nonlocal rtc_rows
-        if rtc_rows is None:
-            rtc_rows = fetch(RTC_ENDPOINT)
-        return make_room_config(row, lookup, rtc_rows)
+        return make_room_config(row, lookup, rtc_rows, ice_servers)
 
-    updated = reconcile_slots(
-        slots,
+    plan = reconcile_targets(
+        targets,
         rows,
         make_config,
         lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
     )
-    if freeze_dedicated:
-        updated[:HUB_DEDICATED_SLOTS] = [
-            dataclasses.replace(slot, send=False) for slot in slots[:HUB_DEDICATED_SLOTS]
-        ]
-    return updated
+    plan.ice_servers = ice_servers
+    return plan
 
 
 def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
             runner=None, popen=None, refresh=None, poll_interval=HUB_POLL_SECONDS):
-    if len(configs) > HUB_MAX_ROOMS:
-        raise LaunchError("Q2PRO-X hub accepts up to five rooms")
+    initial_plan = configs if isinstance(configs, TargetPlan) else None
+    targets = _copy_targets(configs.targets) if initial_plan else (
+        _copy_targets(configs) if isinstance(configs, dict) else _initial_targets(configs)
+    )
     args = [
         str(session),
         "--gateway", str(managed),
@@ -794,14 +849,16 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
         "--q2", str(q2_path),
         "--game", GAME,
     ]
-    slots = _initial_slots(configs)
     starter = popen or runner or subprocess.Popen
-    process = starter(args, stdin=subprocess.PIPE, text=True, encoding="utf-8")
+    process = starter(args, stdin=subprocess.PIPE)
     try:
-        code = write_slots(process, slots)
-        if code is not None:
-            return code
-        refresh_fn = refresh or refresh_slots
+        initial_ice = initial_plan.ice_servers if initial_plan else _targets_ice_servers(targets)
+        if initial_ice:
+            code = write_heartbeat(process, TargetPlan(targets, initial_ice), generation=1)
+            if code is not None:
+                return code
+        refresh_fn = refresh or refresh_targets
+        generation = 1
         while True:
             code = wait_child(process, timeout=poll_interval)
             if code is not None:
@@ -810,11 +867,13 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
 
             def publish(updated):
                 nonlocal child_code
-                child_code = write_slots(process, updated)
+                nonlocal generation
+                generation += 1
+                child_code = write_heartbeat(process, updated, generation)
 
-            slots = poll_once(
-                slots,
-                lambda: refresh_fn(slots, q2_path),
+            targets = poll_once(
+                targets,
+                lambda: refresh_fn(targets, q2_path),
                 publish,
             )
             if child_code is not None:
@@ -839,33 +898,53 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
                     process.wait(timeout=5.0)
 
 
+def _initial_targets(configs):
+    if isinstance(configs, dict):
+        return _copy_targets(configs)
+    targets = {}
+    for config in configs:
+        target = _target_from_config(config)
+        targets[target.room_id] = target
+    return _copy_targets(targets)
+
+
+def _targets_ice_servers(targets):
+    for room_id in sorted(targets):
+        try:
+            config = json.loads(targets[room_id].config)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(config, dict) and isinstance(config.get("iceServers"), list):
+            return config["iceServers"]
+    return []
+
+
+def make_hub_targets(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
+    if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
+        try:
+            ready_rooms(catalog)
+        except LaunchError:
+            raise
+        raise LaunchError("room catalog has an invalid schema")
+    rows = registered_rooms(ready_rooms(catalog), lookup)
+    ice_servers = _ice_snapshot(rtc_rows)
+    plan = reconcile_targets(
+        {}, rows,
+        lambda row: make_room_config(row, lookup, rtc_rows, ice_servers),
+        lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
+    )
+    return plan.targets
+
+
 def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
-    rows = registered_rooms(joinable_rooms(catalog), lookup)
-    configs = []
-    for kind, capacity in (("q2ded", HUB_DEDICATED_SLOTS), ("q2", HUB_Q2_SLOTS)):
-        attempted = 0
-        accepted = 0
-        for row in (candidate for candidate in rows if _room_kind(candidate) == kind):
-            if attempted >= capacity * HUB_CANDIDATES_PER_SLOT or accepted >= capacity:
-                break
-            attempted += 1
-            if not content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner):
-                continue
-            try:
-                config = make_room_config(row, lookup, rtc_rows)
-            except LaunchError:
-                continue
-            configs.append(dict(config))
-            accepted += 1
-    if not configs:
-        raise LaunchError("There are no compatible Dos.Zone rooms for this Q2PRO-X installation.")
-    return configs
+    targets = make_hub_targets(catalog, lookup, rtc_rows, q2_path, content_checker=content_checker, runner=runner)
+    return [json.loads(targets[room_id].config) for room_id in sorted(targets)]
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--help"]:
-        print("Usage: q2dz-launch [--select-q2]\nOpen Q2PRO-X's Dos.Zone browser with up to five compatible servers through Wine.")
+        print("Usage: q2dz-launch [--select-q2]\nOpen Q2PRO-X's Dos.Zone browser with compatible servers through Wine.")
         return 0
     if argv == ["--select-q2"]:
         return 0 if select_q2_path() else 3
@@ -877,14 +956,12 @@ def main(argv=None):
         if not q2_path:
             return 3
         paths = _installed_paths()
-        slots = [HubSlot() for _ in range(HUB_MAX_ROOMS)]
-        slots = poll_once(
-            slots,
-            lambda: refresh_slots(slots, q2_path),
-            lambda _updated: None,
-        )
+        try:
+            targets = refresh_targets({}, q2_path)
+        except LaunchError:
+            targets = TargetPlan({}, [])
         result = run_hub(
-            slots,
+            targets,
             q2_path,
             session=paths["session"],
             managed=paths["managed"],
