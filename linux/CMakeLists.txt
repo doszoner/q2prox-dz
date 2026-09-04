@@ -139,7 +139,27 @@ if(BUILD_TESTING)
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capture_live_snapshot.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/capture-live-snapshot.sh)
   set_tests_properties(live-snapshot-filter PROPERTIES TIMEOUT 20)
+  add_test(NAME controlled-room-source
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tests/tools/test_controlled_room_set.py)
+  set_tests_properties(controlled-room-source PROPERTIES TIMEOUT 15)
   if(TARGET q2dz-webrtc-gateway)
+    add_executable(q2dz-controlled-peer ../tests/tools/q2dz-controlled-peer.cpp)
+    target_include_directories(q2dz-controlled-peer PRIVATE
+      "${Q2DZ_WEBRTC_NET_RELEASE_DIR}")
+    target_link_libraries(q2dz-controlled-peer PRIVATE
+      "${Q2DZ_WEBRTC_NET_RELEASE_DIR}/libhumblenet.so" dl pthread)
+    target_compile_options(q2dz-controlled-peer PRIVATE
+      -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
+      -Wformat=2 -Wshadow -Wnull-dereference -Wdouble-promotion
+      -fstack-protector-strong -fno-plt -fno-common)
+    if(Q2DZ_WERROR)
+      target_compile_options(q2dz-controlled-peer PRIVATE -Werror)
+    endif()
+    target_link_options(q2dz-controlled-peer PRIVATE
+      -Wl,-z,relro,-z,now,-z,noexecstack -Wl,--as-needed)
+    set_target_properties(q2dz-controlled-peer PROPERTIES
+      BUILD_RPATH "${Q2DZ_WEBRTC_NET_RELEASE_DIR}")
+
     add_test(NAME webrtc-gateway-contract
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify-legacy-contract.py
               --gateway $<TARGET_FILE:q2dz-webrtc-gateway>
