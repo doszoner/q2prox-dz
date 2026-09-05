@@ -166,6 +166,45 @@ GUI-сессию или подготовить отдельный runtime snapsh
 Guest `shutdown.exe /s /t 0` через GuestControl в этом прогоне показал help и не
 выключил VM; финальный cleanup снова выполнен `VBoxManage controlvm ... poweroff`.
 
+## Runtime snapshot 2026-09-05
+
+Подготовлен отдельный snapshot для Windows live gameplay gate.
+
+```text
+snapshot: q2prox-runtime-ready-20260905
+uuid: f00c01fd-dbb8-4215-ad33-53d3b1fe9ab0
+parent/current previous point: q2prox-build-env-ready-20260905
+vm state after snapshot: poweroff
+```
+
+В VM добавлен runtime tree:
+
+```text
+C:\Users\user\q2-runtime-20260905\Quake2-PlayGround-2026\Q2PRO-X.exe
+SHA-256: 831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d
+```
+
+`q2-path.txt` установлен на этот путь:
+
+```text
+C:\Users\user\AppData\Local\Q2PRO-X Dos.Zone\state\q2-path.txt
+```
+
+Runtime ZIP был временно собран на host из
+`/home/ssolovey/Games/Quake2-PlayGround-2026/`, без `logs`, `screenshots` и
+crash/log files, передан в VM, проверен по SHA-256 и удалён из VM и `/tmp`.
+
+Граница доказанного: это только подготовка runtime-окружения. Live gate всё ещё
+требует интерактивной пользовательской GUI-сессии в Windows и не считается
+пройденным.
+
+Использование:
+
+```bash
+VBoxManage snapshot 9a57e185-2b98-458b-b58f-c9e23e666ce9 restore q2prox-runtime-ready-20260905
+VBoxManage startvm 9a57e185-2b98-458b-b58f-c9e23e666ce9 --type headless
+```
+
 ## Старые snapshot
 
 После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
@@ -175,12 +214,14 @@ Guest `shutdown.exe /s /t 0` через GuestControl в этом прогоне 
 q2prox-dz-clean-runtime-20260830
 guest-additions-ready-20260905
 q2prox-build-env-ready-20260905
+q2prox-runtime-ready-20260905
 ```
 
 `q2prox-build-env-ready-20260905` — штатная точка для быстрых headless-сборок.
 `q2prox-dz-clean-runtime-20260830` и `guest-additions-ready-20260905` оставлены
 как минимальный откат к runtime/GuestControl-состоянию, если понадобится чистая
-проверка без build tools. Это не отработанные мёртвые образы.
+проверка без build tools. `q2prox-runtime-ready-20260905` — ближайшая стартовая
+точка для Windows live gameplay gate. Это не отработанные мёртвые образы.
 
 Удалены как отработанные старые rollback-точки:
 
@@ -198,4 +239,11 @@ current snapshot: q2prox-build-env-ready-20260905
 remaining snapshots: q2prox-dz-clean-runtime-20260830,
   guest-additions-ready-20260905,
   q2prox-build-env-ready-20260905
+```
+
+После подготовки runtime snapshot текущая точка изменилась:
+
+```text
+current snapshot: q2prox-runtime-ready-20260905
+running VMs: none
 ```
