@@ -50,6 +50,14 @@ function Wait-GatewayPid([string]$dir, [int]$timeoutMs = 10000) {
   throw "shared gateway pid did not appear in $dir"
 }
 
+function Wait-SourceUrl([string]$dir, [int]$timeoutMs = 10000) {
+  $path = Marker $dir 'q2-source-url'
+  if (-not (Wait-Path $path $true $timeoutMs)) {
+    throw "Q2 source URL marker did not appear in $dir"
+  }
+  return Get-Content -LiteralPath $path
+}
+
 function Wait-GatewayPidChange([string]$dir, [int]$oldPid, [int]$timeoutMs = 10000) {
   $path = Gateway-PidPath $dir
   $deadline = [Environment]::TickCount + $timeoutMs
@@ -281,7 +289,7 @@ try {
   # One process serves a dynamic 0 -> 1 -> 2 -> 1 -> 0 target set.
   $case = Start-Case 'dynamic'
   if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw 'Q2 did not read the empty source' }
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   $q2Pid = [int](Get-Content (Marker $case.Dir 'q2.pid'))
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -340,7 +348,7 @@ try {
   # READY may arrive in a different order from PUT; both routes remain isolated.
   $case = Start-Case 'shuffled-ready' 'shuffled-ready' 'shuffled-ready' 'long-running' 'shuffled-ready'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   Send-Put $case.Process 'room-b'
@@ -354,7 +362,7 @@ try {
   foreach ($failureMode in @('fatal-immediate', 'room-close-immediate')) {
     $case = Start-Case ("isolated-" + $failureMode) $failureMode 'normal'
     if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw "$failureMode case did not start Q2" }
-    $source = Get-Content (Marker $case.Dir 'q2-source-url')
+    $source = Wait-SourceUrl $case.Dir
     Send-Ice $case.Process
     Send-Put $case.Process 'room-a'
     Send-Put $case.Process 'room-b'
@@ -368,7 +376,7 @@ try {
   # Old events after DROP+PUT cannot affect the replacement target.
   $case = Start-Case 'stale-target' 'stale-after-drop' 'normal'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   if (-not (Wait-SourceCount $source 1)) { throw 'stale case initial target was not ready' }
@@ -392,7 +400,7 @@ try {
   # A pending target timeout removes only that target.
   $case = Start-Case 'target-timeout' 'never-ready' 'normal' 'long-running' 'normal' 300
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   Send-Put $case.Process 'room-b'
@@ -408,7 +416,7 @@ try {
   # Preserve the former bounded q2/q2ded recovery policy across new target ids.
   $case = Start-Case 'bounded-recovery' 'failed-after-ready' 'normal' 'long-running' 'fatal-immediate'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '1')) { throw 'q2 recovery initial PUT missing' }
@@ -447,7 +455,7 @@ try {
   # A partial command from before global recovery is discarded through its newline.
   $case = Start-Case 'partial-recovery'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $firstGateway = Wait-GatewayPid $case.Dir
@@ -468,7 +476,7 @@ try {
   # The discarded remainder remains bounded even when it never supplies a newline.
   $case = Start-Case 'partial-recovery-oversized'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $firstGateway = Wait-GatewayPid $case.Dir
@@ -486,7 +494,7 @@ try {
   # EOF while discarding a recovered partial command is a protocol failure.
   $case = Start-Case 'partial-recovery-eof'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $firstGateway = Wait-GatewayPid $case.Dir
@@ -504,7 +512,7 @@ try {
   # Exactly one global recovery; no payload replay; second crash disables input.
   $case = Start-Case 'global-restart' 'exit-after-ready' 'normal' 'long-running' 'exit-after-ready'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $firstGateway = Wait-GatewayPid $case.Dir
@@ -535,7 +543,7 @@ try {
 
   $case = Start-Case 'owner-hard-kill'
   Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
-  $source = Get-Content (Marker $case.Dir 'q2-source-url')
+  $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   Send-Put $case.Process 'room-b'
