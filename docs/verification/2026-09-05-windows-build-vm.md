@@ -132,6 +132,40 @@ audio: none
 единственный cleanup. VM была выключена командой `VBoxManage controlvm ...
 poweroff`; итоговое состояние — `poweroff`.
 
+## Runtime preflight 2026-09-05
+
+Проверено через headless VM и GuestControl, без host keyboard/mouse injection.
+
+```text
+GuestControl cmd.exe /c ver: PASS
+Windows version: 10.0.26200.9168
+WebView2 Runtime: present, 152.0.4191.62
+C: free space: 31.93 GiB
+interactive user session: none (`query user`: No User exists)
+Q2PRO-X.exe under C:\Users\user: not found
+saved q2 path:
+  C:\Users\user\AppData\Local\Temp\q2dz-rc11-clean-979c25a91cb9462a918f361091f8c869\q2\Q2PRO-X.exe
+  stale / not a usable rc14 live runtime path
+```
+
+Host-side available inputs:
+
+```text
+/home/ssolovey/Downloads/q2pro-x-1.5.rar
+/home/ssolovey/Downloads/q2pro-x-1/
+/home/ssolovey/Games/Quake2-PlayGround-2026/
+/home/ssolovey/Downloads/Telegram Desktop/Quake2 [Sergh's Edition, 2026].rar
+```
+
+Следствие: этот snapshot остаётся хорошей build/headless-test стартовой точкой,
+но Windows Q2PRO-X/WebView2 gameplay gate на нём ещё не готов к запуску. Для
+live runtime нужен отдельный подготовительный шаг: положить в VM актуальный
+Q2PRO-X/game-data tree, сбросить stale `q2-path.txt`, войти в пользовательскую
+GUI-сессию или подготовить отдельный runtime snapshot с интерактивной сессией.
+
+Guest `shutdown.exe /s /t 0` через GuestControl в этом прогоне показал help и не
+выключил VM; финальный cleanup снова выполнен `VBoxManage controlvm ... poweroff`.
+
 ## Старые snapshot
 
 После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
