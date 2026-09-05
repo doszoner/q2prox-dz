@@ -37,8 +37,14 @@ DEFAULT_SIGNAL = "wss://net.js-dos.com:444"
 FIXED_CHALLENGE = "424242"
 
 
-def aliases(count: int) -> list[str]:
-    return [f"room.q2test.server{index:02d}" for index in range(1, count + 1)]
+def aliases(count: int, prefix: str = "room.q2test.server") -> list[str]:
+    return [f"{prefix}{index:02d}" for index in range(1, count + 1)]
+
+
+def _safe_alias_prefix(value: str) -> str:
+    if not value or len(value) > 96 or not all(char.isalnum() or char in ".-_" for char in value):
+        raise argparse.ArgumentTypeError("alias prefix must be a safe token prefix")
+    return value
 
 
 def _safe_count(value: str) -> int:
@@ -277,42 +283,73 @@ def _read_ice_stdin() -> bytes:
     return data
 
 
-def _safe_child_event(alias: str, raw: bytes) -> dict[str, Any] | None:
+def _safe_child_event(expected_aliases: str | list[str], raw: bytes) -> dict[str, Any] | None:
     if len(raw) > MAX_CHILD_LINE:
         return None
     try:
         event = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(event, dict) or event.get("alias") != alias:
+    aliases = {expected_aliases} if isinstance(expected_aliases, str) else set(expected_aliases)
+    if not isinstance(event, dict):
         return None
     kind = event.get("event")
     if kind == "ready":
+        if event.get("alias") not in aliases:
+            return None
         peer = event.get("peer")
         return event if isinstance(peer, int) and peer > 0 else None
     if kind == "request":
+        if (isinstance(expected_aliases, str) and event.get("alias") != expected_aliases) or (
+            not isinstance(expected_aliases, str) and event.get("aliases") != expected_aliases
+        ):
+            return None
         if event.get("kind") not in {"ping", "status"}:
             return None
         peer = event.get("peer")
         size = event.get("bytes")
         return event if isinstance(peer, int) and peer > 0 and isinstance(size, int) and size >= 0 else None
     if kind == "stopped":
+        if event.get("alias") not in aliases:
+            return None
         return event
     if kind == "fatal" and isinstance(event.get("code"), str):
+        if event.get("alias") not in aliases:
+            return None
         return event
     return None
 
 
 class PeerHarness:
-    def __init__(self, count: int, binary: str, signal_url: str, evidence: Evidence) -> None:
+    def __init__(
+        self,
+        count: int,
+        binary: str,
+        signal_url: str,
+        evidence: Evidence,
+        alias_prefix: str = "room.q2test.server",
+        alias_groups: list[list[str]] | None = None,
+    ) -> None:
         self.count = count
         self.binary = str(Path(binary).resolve())
         self.signal_url = signal_url
         self.evidence = evidence
         self.processes: list[subprocess.Popen[bytes]] = []
-        self.aliases = aliases(count)
+        generated_aliases = aliases(count, alias_prefix)
+        self.alias_groups = alias_groups or [[alias] for alias in generated_aliases]
+        self.aliases = [alias for group in self.alias_groups for alias in group]
+        if not self.aliases or any(not group for group in self.alias_groups):
+            raise ValueError("controlled peer alias groups must not be empty")
+        if len(set(self.aliases)) != len(self.aliases):
+            raise ValueError("controlled peer aliases must be unique")
+        self.alias_group = {
+            alias: index
+            for index, group in enumerate(self.alias_groups)
+            for alias in group
+        }
+        self.mode = "webrtc-two-alias" if any(len(group) > 1 for group in self.alias_groups) else "webrtc"
         self.group: int | None = None
-        self.events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(maxsize=MAX_CHILD_EVENTS)
+        self.events: queue.Queue[tuple[str | tuple[str, ...], dict[str, Any]]] = queue.Queue(maxsize=MAX_CHILD_EVENTS)
         self._failure_lock = threading.Lock()
         self._failure_code: str | None = None
         self.readers: list[threading.Thread] = []
@@ -320,9 +357,13 @@ class PeerHarness:
             alias: {"ping": 0, "status": 0, "requests": 0, "bytes": 0}
             for alias in self.aliases
         }
+        self.group_stats = {
+            tuple(group): {"ping": 0, "status": 0, "requests": 0, "bytes": 0}
+            for group in self.alias_groups
+        }
         self.ready: dict[str, int] = {}
 
-    def _read_output(self, alias: str, process: subprocess.Popen[bytes]) -> None:
+    def _read_output(self, expected_aliases: str | list[str], process: subprocess.Popen[bytes]) -> None:
         assert process.stdout is not None
         while True:
             raw = process.stdout.readline(MAX_CHILD_LINE + 1)
@@ -331,11 +372,12 @@ class PeerHarness:
             if len(raw) > MAX_CHILD_LINE or not raw.endswith(b"\n"):
                 self._set_failure("child_event_line_too_long")
                 return
-            event = _safe_child_event(alias, raw[:-1])
+            event = _safe_child_event(expected_aliases, raw[:-1])
             if event is None:
                 continue
             try:
-                self.events.put_nowait((alias, event))
+                source_group = expected_aliases if isinstance(expected_aliases, str) else tuple(expected_aliases)
+                self.events.put_nowait((source_group, event))
             except queue.Full:
                 self._set_failure("child_event_queue_overflow")
                 return
@@ -349,8 +391,13 @@ class PeerHarness:
         with self._failure_lock:
             return self._failure_code
 
-    def _spawn(self, alias: str, leader: bool) -> subprocess.Popen[bytes]:
-        command = [self.binary, "--alias", alias, "--signal", self.signal_url]
+    def _spawn(self, aliases_for_process: list[str], leader: bool) -> subprocess.Popen[bytes]:
+        command = [self.binary]
+        if len(aliases_for_process) > 1:
+            command.append("--diagnostic-two-alias")
+        for alias in aliases_for_process:
+            command.extend(["--alias", alias])
+        command.extend(["--signal", self.signal_url])
         if leader:
             def create_group() -> None:
                 os.setpgid(0, 0)
@@ -385,30 +432,30 @@ class PeerHarness:
     def start(self, ice: bytes) -> None:
         if not os.access(self.binary, os.X_OK):
             raise RuntimeError("controlled peer binary is not executable")
-        for index, alias in enumerate(self.aliases):
+        for index, alias_group in enumerate(self.alias_groups):
             if _STOP.is_set():
                 return
-            process = self._spawn(alias, leader=index == 0)
+            process = self._spawn(alias_group, leader=index == 0)
             process.stdin.write(ice + b"\n")
             process.stdin.flush()
             process.stdin.close()
 
-        for alias, process in zip(self.aliases, self.processes):
-            reader = threading.Thread(target=self._read_output, args=(alias, process), daemon=True)
+        for alias_group, process in zip(self.alias_groups, self.processes):
+            reader = threading.Thread(target=self._read_output, args=(alias_group, process), daemon=True)
             reader.start()
             self.readers.append(reader)
         self.evidence.emit(
             {
                 "event": "started",
-                "mode": "webrtc",
-                "target_count": self.count,
+                "mode": self.mode,
+                "target_count": len(self.aliases),
                 "aliases": self.aliases,
                 "process_group": self.group,
             }
         )
 
-    def _drain(self) -> list[tuple[str, dict[str, Any]]]:
-        events: list[tuple[str, dict[str, Any]]] = []
+    def _drain(self) -> list[tuple[str | tuple[str, ...], dict[str, Any]]]:
+        events: list[tuple[str | tuple[str, ...], dict[str, Any]]] = []
         while True:
             try:
                 events.append(self.events.get_nowait())
@@ -420,24 +467,42 @@ class PeerHarness:
             failure = self.failure_code()
             if failure is not None:
                 raise RuntimeError(failure)
-        for alias, event in self._drain():
+        for source_group, event in self._drain():
             kind = event["event"]
             if kind == "ready":
+                event_alias = event.get("alias")
+                if not isinstance(event_alias, str) or event_alias not in self.alias_group:
+                    continue
                 peer = event["peer"]
-                if alias in self.ready and self.ready[alias] != peer:
-                    raise RuntimeError(f"peer {alias} changed identity")
-                if peer in self.ready.values() and self.ready.get(alias) != peer:
-                    raise RuntimeError("duplicate controlled peer id")
-                self.ready[alias] = peer
-                self.evidence.emit({"event": "peer_ready", "alias": alias, "peer": peer})
+                if event_alias in self.ready and self.ready[event_alias] != peer:
+                    raise RuntimeError(f"peer {event_alias} changed identity")
+                existing_alias = next(
+                    (ready_alias for ready_alias, ready_peer in self.ready.items() if ready_peer == peer),
+                    None,
+                )
+                group_peer = next(
+                    (
+                        ready_peer
+                        for ready_alias, ready_peer in self.ready.items()
+                        if self.alias_group[ready_alias] == self.alias_group[event_alias]
+                    ),
+                    None,
+                )
+                if group_peer is not None and group_peer != peer:
+                    raise RuntimeError("controlled peer aliases changed identity")
+                if existing_alias is not None and existing_alias != event_alias:
+                    if self.alias_group[existing_alias] != self.alias_group[event_alias]:
+                        raise RuntimeError("duplicate controlled peer id")
+                self.ready[event_alias] = peer
+                self.evidence.emit({"event": "peer_ready", "alias": event_alias, "peer": peer})
             elif kind == "request":
-                stats = self.stats[alias]
+                stats = self.stats[source_group] if isinstance(source_group, str) else self.group_stats[source_group]
                 stats[event["kind"]] += 1
                 stats["requests"] += 1
                 stats["bytes"] += event["bytes"]
             elif kind == "fatal":
                 if raise_failure:
-                    raise RuntimeError(f"controlled peer {alias} failed")
+                    raise RuntimeError(f"controlled peer {source_group} failed")
         if raise_failure:
             failure = self.failure_code()
             if failure is not None:
@@ -445,7 +510,7 @@ class PeerHarness:
 
     def wait_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
-        while len(self.ready) < self.count:
+        while len(self.ready) < len(self.aliases):
             if _STOP.is_set():
                 return False
             self._apply_events()
@@ -463,9 +528,9 @@ class PeerHarness:
         self.evidence.emit(
             {
                 "event": "ready",
-                "mode": "webrtc",
-                "target_count": self.count,
-                "peer_count": len(self.ready),
+                "mode": self.mode,
+                "target_count": len(self.aliases),
+                "peer_count": len(set(self.ready.values())),
                 "aliases": self.aliases,
             }
         )
@@ -509,17 +574,19 @@ class PeerHarness:
         for reader in self.readers:
             reader.join(timeout=1.0)
         self._apply_events(raise_failure=False)
-        self.evidence.emit(
-            {
-                "event": "peer_stats",
-                "mode": "webrtc",
-                "targets": self.stats,
-            }
-        )
+        stats = {"event": "peer_stats", "mode": self.mode}
+        if self.mode == "webrtc":
+            stats["targets"] = self.stats
+        else:
+            stats["groups"] = [
+                {"aliases": list(group), **self.group_stats[tuple(group)]}
+                for group in self.alias_groups
+            ]
+        self.evidence.emit(stats)
         self.evidence.emit(
             {
                 "event": "stopped",
-                "mode": "webrtc",
+                "mode": self.mode,
                 "cleanup": "complete",
                 "children_alive": sum(process.poll() is None for process in self.processes),
             }
@@ -545,14 +612,29 @@ def source_main(args: argparse.Namespace, evidence: Evidence) -> int:
         harness.close()
 
 
-def webrtc_main(args: argparse.Namespace, evidence: Evidence) -> int:
+def webrtc_main(
+    args: argparse.Namespace,
+    evidence: Evidence,
+    alias_groups: list[list[str]] | None = None,
+) -> int:
+    mode = "webrtc-two-alias" if alias_groups is not None else "webrtc"
     try:
         ice = _read_ice_stdin()
     except ValueError as error:
-        evidence.emit({"event": "error", "mode": "webrtc", "code": "invalid_ice_input"})
+        evidence.emit({"event": "error", "mode": mode, "code": "invalid_ice_input"})
         print(str(error), file=sys.stderr)
         return 2
-    harness = PeerHarness(args.count, args.peer_binary, args.signal, evidence)
+    count = len(alias_groups) if alias_groups is not None else args.count
+    if alias_groups is None:
+        harness = PeerHarness(
+            count,
+            args.peer_binary,
+            args.signal,
+            evidence,
+            getattr(args, "alias_prefix", "room.q2test.server"),
+        )
+    else:
+        harness = PeerHarness(count, args.peer_binary, args.signal, evidence, alias_groups=alias_groups)
     try:
         harness.start(ice)
         if not harness.wait_ready(args.ready_timeout):
@@ -565,10 +647,10 @@ def webrtc_main(args: argparse.Namespace, evidence: Evidence) -> int:
         evidence.emit(
             {
                 "event": "error",
-                "mode": "webrtc",
+                "mode": harness.mode,
                 "code": "peer_readiness_timeout",
                 "ready_count": len(harness.ready),
-                "target_count": harness.count,
+                "target_count": len(harness.aliases),
             }
         )
         print(str(error), file=sys.stderr)
@@ -579,7 +661,7 @@ def webrtc_main(args: argparse.Namespace, evidence: Evidence) -> int:
         evidence.emit(
             {
                 "event": "error",
-                "mode": "webrtc",
+                "mode": harness.mode,
                 "code": harness.failure_code() or "peer_harness_failed",
             }
         )
@@ -600,17 +682,29 @@ def _parser() -> argparse.ArgumentParser:
 
     webrtc = subparsers.add_parser("webrtc", help="run controlled WebRTC-NET peers")
     webrtc.add_argument("--count", type=_safe_count, default=MAX_TARGETS)
+    webrtc.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2test.server")
     webrtc.add_argument("--peer-binary", required=True)
     webrtc.add_argument("--signal", default=DEFAULT_SIGNAL)
     webrtc.add_argument("--ready-timeout", type=float, default=30.0)
     webrtc.add_argument("--duration", type=_safe_duration)
     webrtc.add_argument("--evidence", help="mirror JSONL evidence to this path")
+
+    diagnostic = subparsers.add_parser(
+        "webrtc-two-alias",
+        help="run one diagnostic WebRTC-NET peer for two aliases",
+    )
+    diagnostic.add_argument("--peer-binary", required=True)
+    diagnostic.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2test.server")
+    diagnostic.add_argument("--signal", default=DEFAULT_SIGNAL)
+    diagnostic.add_argument("--ready-timeout", type=float, default=30.0)
+    diagnostic.add_argument("--duration", type=_safe_duration)
+    diagnostic.add_argument("--evidence", help="mirror JSONL evidence to this path")
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
-    if args.mode == "webrtc" and args.ready_timeout <= 0:
+    if args.mode in {"webrtc", "webrtc-two-alias"} and args.ready_timeout <= 0:
         print("ready-timeout must be positive", file=sys.stderr)
         return 2
     signal.signal(signal.SIGINT, _signal_handler)
@@ -619,6 +713,8 @@ def main() -> int:
     try:
         if args.mode == "source":
             return source_main(args, evidence)
+        if args.mode == "webrtc-two-alias":
+            return webrtc_main(args, evidence, alias_groups=[aliases(2, args.alias_prefix)])
         return webrtc_main(args, evidence)
     finally:
         evidence.close()

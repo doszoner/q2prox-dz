@@ -131,9 +131,11 @@ test("incoming datagram size rejection is bounded", () => {
   assert.equal(transportProtocol.classifyIncomingDatagram(1399), "accepted");
 });
 
-test("routes tagged datagrams by concrete peer and rejects duplicate peers", () => {
+test("routes tagged datagrams by virtual peer and guards duplicate concrete peers", () => {
   const registry = createTargetRegistry();
   const largeTarget = "9007199254740993";
+  const firstRoute = 0x80000001;
+  const secondRoute = 0x80000002;
   assert.equal(normalizeTargetId(largeTarget), largeTarget);
   assert.equal(transportProtocol.parseTargetMessage({
     targetId: "18446744073709551615", alias: "q2.max",
@@ -142,16 +144,21 @@ test("routes tagged datagrams by concrete peer and rejects duplicate peers", () 
   assert.equal(normalizeTargetId("18446744073709551616"), null);
   assert.equal(registry.put({ targetId: largeTarget, alias: "q2.alpha" }), true);
   assert.equal(registry.put({ targetId: "12", alias: "room.q2ded.beta" }), true);
-  assert.equal(registry.bindPeer(largeTarget, 101), "bound");
-  assert.equal(registry.bindPeer("12", 202), "bound");
-  assert.equal(registry.bindPeer("12", 0x80000001), "invalid_peer");
-  assert.equal(registry.bindPeer("12", 101), "duplicate_remote_peer");
+  assert.equal(registry.bindRoute(largeTarget, firstRoute), "bound");
+  assert.equal(registry.bindRoute("12", secondRoute), "bound");
+  assert.equal(registry.reserveConcrete(largeTarget, 101), "reserved");
+  assert.equal(registry.reserveConcrete("12", 202), "reserved");
+  assert.equal(registry.reserveConcrete("12", 0x80000001), "invalid_peer");
+  assert.equal(registry.reserveConcrete("12", 101), "duplicate_remote_peer");
 
   const payload = Uint8Array.from([1, 2, 3]);
   assert.deepEqual(registry.send(largeTarget, payload), {
     type: "udp", targetId: largeTarget, data: bytesToMessage(payload).data,
   });
   assert.deepEqual(registry.receive(202, payload), {
+    type: "drop", reason: "unknown_peer",
+  });
+  assert.deepEqual(registry.receive(secondRoute, payload), {
     type: "udp", targetId: "12", data: bytesToMessage(payload).data,
   });
   assert.deepEqual(registry.receive(999, payload), {
@@ -159,8 +166,10 @@ test("routes tagged datagrams by concrete peer and rejects duplicate peers", () 
   });
 
   assert.equal(registry.close(largeTarget), true);
-  assert.equal(registry.targetForPeer(101), undefined);
-  assert.equal(registry.targetForPeer(202), "12");
+  assert.equal(registry.targetForRoute(firstRoute), undefined);
+  assert.equal(registry.targetForConcrete(101), undefined);
+  assert.equal(registry.targetForRoute(secondRoute), "12");
+  assert.equal(registry.targetForConcrete(202), "12");
   assert.equal(registry.targets.size, 1);
 });
 
@@ -195,7 +204,7 @@ test("keeps OOB probes and close state independent for two targets", () => {
 test("pump work is bounded while per-target probes and ICE precede connections", () => {
   const registry = createTargetRegistry();
   registry.put({ targetId: 1, alias: "q2.alpha" });
-  registry.bindPeer(1, 101);
+  registry.bindRoute(1, 0x80000001);
   let received = 0;
   assert.equal(registry.pump(
     () => ({ peer: 101, data: Uint8Array.of(received++) }),
@@ -207,7 +216,8 @@ test("pump work is bounded while per-target probes and ICE precede connections",
   assert.equal((html.match(/setInterval\(/g) ?? []).length, 1);
   assert.match(html, /new ManagedReadinessProbe/);
   assert.match(html, /const targets = new Map/);
-  assert.match(html, /const remotePeerToTarget = new Map/);
+  assert.match(html, /const routePeerToTarget = new Map/);
+  assert.match(html, /const concretePeerToTarget = new Map/);
   assert.ok(html.indexOf("setIceServers") < html.indexOf("connectTo"));
 });
 
@@ -362,6 +372,18 @@ test("native gateway keeps WebView2 foreground without production browser flags"
   assert.doesNotMatch(source, /<<\s*message|<<\s*configuration_/);
 });
 
+test("native gateway maps resolution failures and established close states", () => {
+  const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
+  assert.match(source, /std::string_view transport_failure_stage\(std::string_view reason\)/);
+  for (const reason of ["peer_bind_failed", "alias_timeout", "duplicate_remote_peer"]) {
+    assert.match(source, new RegExp(`reason == "${reason}"`));
+  }
+  assert.match(source,
+    /emit_failed\(state->target_id, transport_failure_stage\(state->reason\), state->reason\)/);
+  assert.match(source, /state->value == "room-closed"\) emit_closed\(state->target_id, state->reason\)/);
+  assert.match(source, /emit_failed\(1, transport_failure_stage\(\*reason\), \*reason\)/);
+});
+
 test("keeps v1 startup dispatch alongside HUB/2 control dispatch", () => {
   const html = readFileSync(new URL("../assets/transport.html", import.meta.url), "utf8");
   const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
@@ -387,9 +409,12 @@ function createTransportPageHarness() {
   const probeTimers = [];
   const receiveQueue = [];
   const calls = [];
+  const virtualPeers = new Map();
+  const resolvedPeers = new Map();
+  let nextVirtualPeer = 0x80000001;
+  let now = 100;
   const memory = new ArrayBuffer(64 * 1024);
   let nextAllocation = 8;
-  let webRtcOptions;
   const runtime = {
     HEAPU8: new Uint8Array(memory),
     HEAP32: new Int32Array(memory),
@@ -408,7 +433,15 @@ function createTransportPageHarness() {
         return 1;
       };
       if (name === "wait") return () => {};
-      if (name === "myId") return () => 7;
+      if (name === "virtualPeerForAlias") return (alias) => {
+        calls.push([name, alias]);
+        if (!virtualPeers.has(alias)) virtualPeers.set(alias, nextVirtualPeer++);
+        return virtualPeers.get(alias);
+      };
+      if (name === "resolvedPeerForVirtual") return (peer) => {
+        calls.push([name, peer]);
+        return resolvedPeers.get(peer) ?? 0;
+      };
       if (name === "queryAliases") return (query, token) => calls.push([name, query, token]);
       if (name === "sendto") return (pointer, length, peer) => {
         calls.push([name, peer, runtime.HEAPU8.slice(pointer, pointer + length)]);
@@ -417,8 +450,9 @@ function createTransportPageHarness() {
       if (name === "recvfrom") return (pointer, length, peerPointer) => {
         const packet = receiveQueue.shift();
         if (!packet) return 0;
-        runtime.HEAPU8.set(packet.data.subarray(0, length), pointer);
         runtime.HEAP32[peerPointer >> 2] = packet.peer;
+        if (packet.length !== undefined) return packet.length;
+        runtime.HEAPU8.set(packet.data.subarray(0, length), pointer);
         return packet.data.length;
       };
       if (name === "disconnect") return (peer) => calls.push([name, peer]);
@@ -426,8 +460,7 @@ function createTransportPageHarness() {
       throw new Error(`unexpected cwrap ${name}`);
     },
   };
-  function fakeWebRTCNet(options) {
-    webRtcOptions = options;
+  function fakeWebRTCNet() {
     return Promise.resolve(runtime);
   }
   const fakeSetTimeout = (callback, delay) => {
@@ -464,7 +497,7 @@ function createTransportPageHarness() {
     reliableSendMode,
     chrome: { webview },
     window: {},
-    performance: { now: () => 100 },
+    performance: { now: () => now },
     setInterval(callback) { pumpTimers.push(callback); return callback; },
     clearInterval() {},
     setTimeout: fakeSetTimeout,
@@ -483,11 +516,11 @@ function createTransportPageHarness() {
     probeTimers,
     receiveQueue,
     pumpTimers,
-    state: { get webRtcOptions() { return webRtcOptions; } },
+    resolvedPeers,
+    virtualPeers,
     webview,
-    setNextQueryToken(value) {
-      vm.runInNewContext(`nextQueryRequestToken = ${String(value)}`, context);
-    },
+    advanceTime(milliseconds) { now += milliseconds; },
+    now() { return now; },
     async flush() {
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
@@ -497,7 +530,10 @@ function createTransportPageHarness() {
 
 async function runLegacyPageAdmission() {
   const harness = createTransportPageHarness();
-  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const routePeer = 0x80000001;
+  virtualPeers.set("q2.alpha", routePeer);
+  resolvedPeers.set(routePeer, 77);
   webview.listener({ data: {
     version: 1,
     roomId: "room.q2.example.1",
@@ -510,13 +546,10 @@ async function runLegacyPageAdmission() {
   assert.equal(calls[1][0], "connectTo");
   assert.equal(pumpTimers.length, 1);
   pumpTimers[0]();
-  assert.deepEqual(calls.at(-1).slice(0, 2), ["queryAliases", "=q2.alpha"]);
-  const queryToken = calls.at(-1)[2];
-  assert.ok(Number.isInteger(queryToken) && queryToken > 0);
-  harness.state.webRtcOptions.aliasQueryAdd("=q2.alpha", "q2.alpha", 77, queryToken);
-  harness.state.webRtcOptions.onAliasQueryEnd("=q2.alpha", queryToken);
-  pumpTimers[0]();
-  receiveQueue.push({ peer: 77, data: quakeOob("ack") });
+  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 0);
+  assert.ok(calls.some(([name, alias]) => name === "virtualPeerForAlias" && alias === "q2.alpha"));
+  assert.ok(calls.some(([name, peer]) => name === "resolvedPeerForVirtual" && peer === routePeer));
+  receiveQueue.push({ peer: routePeer, data: quakeOob("ack") });
   pumpTimers[0]();
   const ready = posts.find((value) => value.value === "transport-ready");
   assert.equal(JSON.stringify(ready), JSON.stringify({
@@ -527,7 +560,206 @@ async function runLegacyPageAdmission() {
 
 test("v1 page dispatch admits a legacy target and emits tagged ready state", async () => {
   const result = await runLegacyPageAdmission();
-  assert.ok(result.calls.some(([name, peer]) => name === "sendto" && peer === 77));
+  assert.ok(result.calls.some(([name, peer]) => name === "sendto" && peer === 0x80000001));
+});
+
+test("Task 7A resolves a target through a virtual route without AliasQuery", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, pumpTimers, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.virtual";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
+  resolvedPeers.set(routePeer, 77);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+
+  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 0);
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias"), [
+    ["virtualPeerForAlias", alias],
+  ]);
+  assert.ok(calls.some(([name, peer]) => name === "sendto" && peer === routePeer));
+  assert.ok(calls.some(([name, peer]) => name === "resolvedPeerForVirtual" && peer === routePeer));
+});
+
+test("unresolved targets remain resolving until the monotonic 30-second deadline", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.resolve-deadline";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+
+  pumpTimers[0]();
+  assert.equal(posts.some((value) => value.value === "failed"), false);
+  harness.advanceTime(29999);
+  pumpTimers[0]();
+  assert.equal(posts.some((value) => value.value === "failed"), false);
+  harness.advanceTime(1);
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "failed")
+    .map(({ targetId, reason }) => [targetId, reason]), [["1", "alias_timeout"]]);
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === routePeer));
+  assert.equal(resolvedPeers.has(routePeer), false);
+});
+
+test("pre-concrete probe misses keep a target resolving and retry the virtual route", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, probeTimers, pumpTimers, virtualPeers, webview } = harness;
+  const alias = "q2.pre-concrete-miss";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  const initialSends = calls.filter(([name]) => name === "sendto").length;
+  for (let miss = 0; miss < 3; ++miss) {
+    harness.advanceTime(5000);
+    probeTimers.at(-1).callback();
+  }
+
+  assert.equal(posts.some((value) => value.value === "failed" || value.value === "room-closed"), false);
+  assert.ok(calls.filter(([name]) => name === "sendto").length > initialSends);
+  assert.equal(calls.some(([name, peer]) => name === "disconnect" && peer === routePeer), false);
+});
+
+test("negative receive stays resolving before concrete reservation", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, virtualPeers, webview } = harness;
+  const alias = "q2.pre-concrete-close";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  harness.advanceTime(1);
+  receiveQueue.push({ peer: routePeer, length: -1 });
+  pumpTimers[0]();
+
+  assert.equal(posts.some((value) => value.value === "failed" || value.value === "room-closed"), false);
+  assert.equal(calls.some(([name, peer]) => name === "disconnect" && peer === routePeer), false);
+});
+
+test("negative receive closes an established target as transport_closed", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.established-close";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
+  resolvedPeers.set(routePeer, 77);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  harness.advanceTime(1);
+  receiveQueue.push({ peer: routePeer, length: -1 });
+  pumpTimers[0]();
+
+  assert.deepEqual(posts.filter((value) => value.value === "room-closed")
+    .map(({ targetId, reason }) => [targetId, reason]), [["1", "transport_closed"]]);
+  assert.equal(posts.some((value) => value.value === "failed"), false);
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === routePeer));
+});
+
+test("initial unresolved AliasLookup ownership is serialized while ready routes continue", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, pumpTimers, resolvedPeers, virtualPeers, webview } = harness;
+  const firstRoute = 0x80000001;
+  const secondRoute = 0x80000002;
+  virtualPeers.set("q2.serial-first", firstRoute);
+  virtualPeers.set("q2.serial-second", secondRoute);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  for (const [targetId, alias] of [["1", "q2.serial-first"], ["2", "q2.serial-second"]]) {
+    webview.listener({ data: { type: "put", targetId, config: { alias, ordered: false } } });
+  }
+  await harness.flush();
+
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias"), [
+    ["virtualPeerForAlias", "q2.serial-first"],
+  ]);
+
+  resolvedPeers.set(firstRoute, 77);
+  harness.advanceTime(1);
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias"), [
+    ["virtualPeerForAlias", "q2.serial-first"],
+    ["virtualPeerForAlias", "q2.serial-second"],
+  ]);
+  assert.equal(calls.filter(([name]) => name === "sendto").length, 2);
+  pumpTimers[0]();
+  assert.equal(calls.filter(([name]) => name === "virtualPeerForAlias").length, 2);
+});
+
+test("queued targets start their resolve deadline only after route allocation", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const firstRoute = 0x80000001;
+  const secondRoute = 0x80000002;
+  virtualPeers.set("q2.queued-first", firstRoute);
+  virtualPeers.set("q2.queued-second", secondRoute);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  for (const [targetId, alias] of [["1", "q2.queued-first"], ["2", "q2.queued-second"]]) {
+    webview.listener({ data: { type: "put", targetId, config: { alias, ordered: false } } });
+  }
+  await harness.flush();
+
+  pumpTimers[0]();
+  harness.advanceTime(30000);
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "failed")
+    .map(({ targetId, reason }) => [targetId, reason]), [["1", "alias_timeout"]]);
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias"), [
+    ["virtualPeerForAlias", "q2.queued-first"],
+    ["virtualPeerForAlias", "q2.queued-second"],
+  ]);
+
+  harness.advanceTime(29999);
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "failed")
+    .map(({ targetId, reason }) => [targetId, reason]), [["1", "alias_timeout"]]);
+  resolvedPeers.set(secondRoute, 77);
+  pumpTimers[0]();
+  receiveQueue.push({ peer: secondRoute, data: quakeOob("ack") });
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["2", 77]]);
 });
 
 test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor", async () => {
@@ -535,8 +767,13 @@ test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor",
   const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
   const aliases = Array.from({ length: 40 }, (_, index) =>
     index % 2 === 0 ? `q2.room.${index + 1}` : `room.q2ded.room.${index + 1}`);
+  const routePeers = aliases.map((_, index) => 0x80000001 + index);
   const peers = aliases.map((_, index) => 100 + index + 1);
   const iceServers = [{ urls: ["stun:example.invalid"] }];
+  for (let index = 0; index < aliases.length; ++index) {
+    harness.virtualPeers.set(aliases[index], routePeers[index]);
+    harness.resolvedPeers.set(routePeers[index], peers[index]);
+  }
 
   webview.listener({ data: {
     type: "ice", generation: "9007199254740993", iceServers,
@@ -555,29 +792,20 @@ test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor",
   assert.equal(calls[0][1], JSON.stringify(iceServers));
   assert.equal(calls[1][0], "connectTo");
   pumpTimers[0]();
-  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, query]) => query),
-    aliases.map((alias) => `=${alias}`));
-
-  const options = harness.state.webRtcOptions;
-  assert.ok(options);
-  const queryTokens = new Map(calls.filter(([name]) => name === "queryAliases")
-    .map(([, query, token]) => [query, token]));
-  for (let index = 0; index < aliases.length; ++index) {
-    const query = `=${aliases[index]}`;
-    const token = queryTokens.get(query);
-    options.aliasQueryAdd(query, aliases[index], peers[index], token);
-    options.onAliasQueryEnd(query, token);
-  }
-  pumpTimers[0]();
+  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 0);
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias")
+    .map(([, alias]) => alias), aliases);
+  assert.deepEqual(calls.filter(([name]) => name === "resolvedPeerForVirtual")
+    .map(([, peer]) => peer), routePeers);
   assert.equal(calls.filter(([name]) => name === "sendto").length, 40);
 
   // Put an ACK and a uniquely tagged payload beside each other for every
   // target.  The production scheduler must deliver each ACK before its
   // payload while its bounded scan splits the 80-packet burst over ticks.
   for (let index = 0; index < aliases.length; ++index) {
-    receiveQueue.push({ peer: peers[index], data: quakeOob("ack") });
+    receiveQueue.push({ peer: routePeers[index], data: quakeOob("ack") });
     receiveQueue.push({
-      peer: peers[index], data: Uint8Array.of(index + 1, 255 - index),
+      peer: routePeers[index], data: Uint8Array.of(index + 1, 255 - index),
     });
   }
   pumpTimers[0]();
@@ -599,9 +827,10 @@ test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor",
   const beforeDrop = posts.length;
   webview.listener({ data: { type: "drop", targetId: "1" } });
   await harness.flush();
-  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === peers[0]));
-  receiveQueue.push({ peer: peers[0], data: Uint8Array.of(0xd1) });
-  receiveQueue.push({ peer: peers[1], data: Uint8Array.of(0xd2) });
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === routePeers[0]));
+  assert.equal(calls.some(([name, peer]) => name === "disconnect" && peer === peers[0]), false);
+  receiveQueue.push({ peer: routePeers[0], data: Uint8Array.of(0xd1) });
+  receiveQueue.push({ peer: routePeers[1], data: Uint8Array.of(0xd2) });
   pumpTimers[0]();
   const survivor = posts.slice(beforeDrop).filter((value) => value.type === "udp");
   assert.deepEqual(survivor.map(({ type, targetId, data }) => [type, targetId, data]), [[
@@ -611,11 +840,12 @@ test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor",
     value.type === "drop" && value.reason === "unknown_peer"));
 });
 
-test("production page does not let an old alias query bind a replacement target", async () => {
+test("production page holds an early ACK until concrete reservation", async () => {
   const harness = createTransportPageHarness();
-  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
-  const alias = "q2.stale";
-  const query = `=${alias}`;
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.early-ack";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, routePeer);
   webview.listener({ data: {
     type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
   } });
@@ -625,48 +855,65 @@ test("production page does not let an old alias query bind a replacement target"
   } });
   await harness.flush();
   pumpTimers[0]();
-  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
-    [query]);
-  const oldToken = calls.find(([name, value]) => name === "queryAliases" && value === query)[2];
-
-  webview.listener({ data: { type: "drop", targetId: "1" } });
-  await harness.flush();
-  webview.listener({ data: {
-    type: "put", targetId: "1", config: { alias, ordered: false },
-  } });
-  await harness.flush();
+  receiveQueue.push({ peer: routePeer, data: quakeOob("ack") });
   pumpTimers[0]();
-  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 1);
+  assert.equal(posts.filter((value) => value.value === "transport-ready").length, 0);
+  assert.ok(calls.some(([name, peer]) => name === "resolvedPeerForVirtual" && peer === routePeer));
 
-  const options = harness.state.webRtcOptions;
-  options.aliasQueryAdd(query, alias, 11, oldToken);
-  options.onAliasQueryEnd(query, oldToken);
+  resolvedPeers.set(routePeer, 77);
   pumpTimers[0]();
-  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
-    [query, query]);
-  const newToken = calls.at(-1)[2];
-  assert.notEqual(newToken, oldToken);
-
-  // The old query may finish asynchronously after the replacement query has
-  // started.  Its callbacks must not bind or close the fresh token's record.
-  options.aliasQueryAdd(query, alias, 12, oldToken);
-  options.onAliasQueryEnd(query, oldToken);
-
-  options.aliasQueryAdd(query, alias, 22, newToken);
-  options.onAliasQueryEnd(query, newToken);
-  pumpTimers[0]();
-  receiveQueue.push({ peer: 22, data: quakeOob("ack") });
-  pumpTimers[0]();
-  const ready = posts.filter((value) => value.value === "transport-ready");
-  assert.deepEqual(ready.map(({ targetId, peer }) => [targetId, peer]), [["1", 22]]);
-  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === 22) === false);
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["1", 77]]);
+  assert.ok(calls.filter(([name]) => name === "sendto").every(([, peer]) => peer === routePeer));
+  assert.equal(calls.filter(([name]) => name === "queryAliases").length, 0);
 });
 
-test("production page clears a failed target before same-id retry", async () => {
+test("duplicate concrete resolution fails only the newcomer", async () => {
   const harness = createTransportPageHarness();
-  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
-  const alias = "q2.retry";
-  const query = `=${alias}`;
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const firstRoute = 0x80000001;
+  const secondRoute = 0x80000002;
+  virtualPeers.set("q2.first", firstRoute);
+  virtualPeers.set("q2.second", secondRoute);
+  resolvedPeers.set(firstRoute, 0);
+  resolvedPeers.set(secondRoute, 77);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias: "q2.first", ordered: false },
+  } });
+  webview.listener({ data: {
+    type: "put", targetId: "2", config: { alias: "q2.second", ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  assert.deepEqual(calls.filter(([name]) => name === "virtualPeerForAlias"), [
+    ["virtualPeerForAlias", "q2.first"],
+  ]);
+  resolvedPeers.set(firstRoute, 77);
+  harness.advanceTime(1);
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "failed")
+    .map(({ targetId, reason }) => [targetId, reason]), [["2", "duplicate_remote_peer"]]);
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === secondRoute));
+  assert.equal(calls.some(([name, peer]) => name === "disconnect" && peer === firstRoute), false);
+
+  receiveQueue.push({ peer: firstRoute, data: quakeOob("ack") });
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["1", 77]]);
+});
+
+test("stale virtual route traffic cannot bind a replacement target", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.stale";
+  const oldRoute = 0x80000001;
+  const newRoute = 0x80000002;
+  virtualPeers.set(alias, oldRoute);
+  resolvedPeers.set(oldRoute, 11);
   webview.listener({ data: {
     type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
   } });
@@ -676,66 +923,77 @@ test("production page clears a failed target before same-id retry", async () => 
   } });
   await harness.flush();
   pumpTimers[0]();
-  const options = harness.state.webRtcOptions;
-  const firstToken = calls.find(([name, value]) => name === "queryAliases" && value === query)[2];
-  options.aliasQueryAdd(query, alias, 11, firstToken);
-  options.aliasQueryAdd(query, alias, 12, firstToken);
-  options.onAliasQueryEnd(query, firstToken);
-  pumpTimers[0]();
-  assert.ok(posts.some((value) => value.type === "state" && value.value === "failed" &&
-    value.targetId === "1" && value.reason === "alias_not_unique"));
+  webview.listener({ data: { type: "drop", targetId: "1" } });
+  await harness.flush();
+  assert.ok(calls.some(([name, peer]) => name === "disconnect" && peer === oldRoute));
 
+  virtualPeers.set(alias, newRoute);
+  resolvedPeers.set(newRoute, 22);
+  webview.listener({ data: {
+    type: "put", targetId: "2", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  receiveQueue.push({ peer: oldRoute, data: quakeOob("ack") });
+  receiveQueue.push({ peer: newRoute, data: quakeOob("ack") });
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["2", 22]]);
+  assert.ok(posts.some((value) => value.type === "drop" && value.reason === "unknown_peer"));
+});
+
+test("production page clears a failed route before same-id retry", async () => {
+  const harness = createTransportPageHarness();
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const alias = "q2.retry";
+  const routePeer = 0x80000001;
+  virtualPeers.set(alias, 0);
+  webview.listener({ data: {
+    type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
+  } });
+  await harness.flush();
   webview.listener({ data: {
     type: "put", targetId: "1", config: { alias, ordered: false },
   } });
   await harness.flush();
   pumpTimers[0]();
-  assert.deepEqual(calls.filter(([name]) => name === "queryAliases").map(([, value]) => value),
-    [query, query]);
-  const retryToken = calls.at(-1)[2];
-  options.aliasQueryAdd(query, alias, 22, retryToken);
-  options.onAliasQueryEnd(query, retryToken);
+  assert.ok(posts.some((value) => value.type === "state" && value.value === "failed" &&
+    value.targetId === "1" && value.reason === "peer_bind_failed"));
+
+  virtualPeers.set(alias, routePeer);
+  resolvedPeers.set(routePeer, 22);
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
   pumpTimers[0]();
-  receiveQueue.push({ peer: 22, data: quakeOob("ack") });
+  receiveQueue.push({ peer: routePeer, data: quakeOob("ack") });
   pumpTimers[0]();
   assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
     .map(({ targetId, peer }) => [targetId, peer]), [["1", 22]]);
-  assert.equal(posts.filter((value) => value.type === "state" && value.value === "failed")
-    .length, 1);
+  assert.equal(calls.filter(([name]) => name === "virtualPeerForAlias").length, 2);
 });
 
-test("production page normalizes signed uint32 alias callback tokens", async () => {
+test("production page normalizes signed virtual route ids", async () => {
   const harness = createTransportPageHarness();
-  const { calls, posts, pumpTimers, receiveQueue, webview } = harness;
+  const { calls, posts, pumpTimers, receiveQueue, resolvedPeers, virtualPeers, webview } = harness;
+  const signedRoute = -2147483647;
+  const routePeer = signedRoute >>> 0;
+  const alias = "q2.signed-route";
+  virtualPeers.set(alias, signedRoute);
+  resolvedPeers.set(routePeer, 801);
   webview.listener({ data: {
     type: "ice", generation: "1", iceServers: [{ urls: ["stun:example.invalid"] }],
   } });
   await harness.flush();
-
-  const admit = async (targetId, token, peer) => {
-    harness.setNextQueryToken(token);
-    const alias = `q2.token-${targetId}`;
-    const query = `=${alias}`;
-    webview.listener({ data: {
-      type: "put", targetId: String(targetId), config: { alias, ordered: false },
-    } });
-    await harness.flush();
-    pumpTimers[0]();
-    const queryCall = calls.at(-1);
-    assert.deepEqual(queryCall.slice(0, 2), ["queryAliases", query]);
-    assert.equal(queryCall[2], token);
-    const signedToken = token > 0x7fffffff ? token - 0x100000000 : token;
-    const options = harness.state.webRtcOptions;
-    options.aliasQueryAdd(query, alias, peer, signedToken);
-    options.onAliasQueryEnd(query, signedToken);
-    pumpTimers[0]();
-    receiveQueue.push({ peer, data: quakeOob("ack") });
-    pumpTimers[0]();
-    assert.ok(posts.some((value) => value.type === "state" &&
-      value.value === "transport-ready" && value.targetId === String(targetId) &&
-      value.peer === peer));
-  };
-
-  await admit(1, 0x80000000, 801);
-  await admit(2, 0xffffffff, 802);
+  webview.listener({ data: {
+    type: "put", targetId: "1", config: { alias, ordered: false },
+  } });
+  await harness.flush();
+  pumpTimers[0]();
+  receiveQueue.push({ peer: routePeer, data: quakeOob("ack") });
+  pumpTimers[0]();
+  assert.deepEqual(posts.filter((value) => value.value === "transport-ready")
+    .map(({ targetId, peer }) => [targetId, peer]), [["1", 801]]);
+  assert.ok(calls.some(([name, peer]) => name === "sendto" && peer === routePeer));
 });

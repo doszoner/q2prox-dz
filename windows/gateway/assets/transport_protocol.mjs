@@ -41,16 +41,23 @@ function validTargetId(value) {
   return normalizeTargetId(value) !== null;
 }
 
-function validRemotePeerId(value) {
+function validVirtualPeerId(value) {
+  const peer = value >>> 0;
+  return peer >= 0x80000000 && peer <= 0xffffffff;
+}
+
+function validConcretePeerId(value) {
   return Number.isSafeInteger(value) && value > 0 && value < 0x80000000;
 }
 
 export function createTargetRegistry() {
   const targets = new Map();
-  const remotePeerToTarget = new Map();
+  const routePeerToTarget = new Map();
+  const concretePeerToTarget = new Map();
   return {
     targets,
-    remotePeerToTarget,
+    routePeerToTarget,
+    concretePeerToTarget,
     put({ targetId, alias, ...rest } = {}) {
       const normalizedTargetId = normalizeTargetId(targetId);
       if (!normalizedTargetId || typeof alias !== "string" ||
@@ -59,32 +66,48 @@ export function createTargetRegistry() {
         return false;
       }
       targets.set(normalizedTargetId, {
-        ...rest, targetId: normalizedTargetId, alias, remotePeerId: 0, state: "resolving",
+        ...rest, targetId: normalizedTargetId, alias,
+        routePeerId: 0, concretePeerId: 0, state: "resolving",
       });
       return true;
     },
-    bindPeer(targetId, remotePeerId) {
+    bindRoute(targetId, routePeerId) {
       const normalizedTargetId = normalizeTargetId(targetId);
       const target = targets.get(normalizedTargetId);
-      if (!target || !validRemotePeerId(remotePeerId)) return "invalid_peer";
-      const owner = remotePeerToTarget.get(remotePeerId);
-      if (owner !== undefined && owner !== normalizedTargetId) return "duplicate_remote_peer";
-      if (target.remotePeerId !== 0) remotePeerToTarget.delete(target.remotePeerId);
-      target.remotePeerId = remotePeerId;
-      target.state = "probing";
-      remotePeerToTarget.set(remotePeerId, normalizedTargetId);
+      const normalizedRoutePeerId = routePeerId >>> 0;
+      if (!target || !validVirtualPeerId(normalizedRoutePeerId)) return "invalid_peer";
+      const owner = routePeerToTarget.get(normalizedRoutePeerId);
+      if (owner !== undefined && owner !== normalizedTargetId) return "duplicate_route_peer";
+      if (target.routePeerId !== 0) routePeerToTarget.delete(target.routePeerId);
+      target.routePeerId = normalizedRoutePeerId;
+      routePeerToTarget.set(normalizedRoutePeerId, normalizedTargetId);
       return "bound";
     },
-    targetForPeer(remotePeerId) {
-      return remotePeerToTarget.get(remotePeerId);
+    reserveConcrete(targetId, concretePeerId) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      const target = targets.get(normalizedTargetId);
+      if (!target || !validConcretePeerId(concretePeerId)) return "invalid_peer";
+      const owner = concretePeerToTarget.get(concretePeerId);
+      if (owner !== undefined && owner !== normalizedTargetId) return "duplicate_remote_peer";
+      if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
+      target.concretePeerId = concretePeerId;
+      target.state = "probing";
+      concretePeerToTarget.set(concretePeerId, normalizedTargetId);
+      return "reserved";
+    },
+    targetForRoute(routePeerId) {
+      return routePeerToTarget.get(routePeerId >>> 0);
+    },
+    targetForConcrete(concretePeerId) {
+      return concretePeerToTarget.get(concretePeerId);
     },
     send(targetId, datagram) {
       const target = targets.get(normalizeTargetId(targetId));
-      if (!target || target.remotePeerId === 0) throw new Error("transport_not_ready");
+      if (!target || target.routePeerId === 0) throw new Error("transport_not_ready");
       return { ...bytesToMessage(datagram), targetId: target.targetId };
     },
-    receive(remotePeerId, datagram) {
-      const targetId = remotePeerToTarget.get(remotePeerId);
+    receive(routePeerId, datagram) {
+      const targetId = routePeerToTarget.get(routePeerId >>> 0);
       if (targetId === undefined) return { type: "drop", reason: "unknown_peer" };
       return { ...bytesToMessage(datagram), targetId };
     },
@@ -92,7 +115,8 @@ export function createTargetRegistry() {
       const normalizedTargetId = normalizeTargetId(targetId);
       const target = targets.get(normalizedTargetId);
       if (!target) return false;
-      if (target.remotePeerId !== 0) remotePeerToTarget.delete(target.remotePeerId);
+      if (target.routePeerId !== 0) routePeerToTarget.delete(target.routePeerId);
+      if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
       targets.delete(normalizedTargetId);
       return true;
     },

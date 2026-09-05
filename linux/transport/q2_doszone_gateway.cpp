@@ -1,5 +1,4 @@
 #include "common.hpp"
-#include "alias_query_mailbox.hpp"
 #include "gateway_options.h"
 #include "json.hpp"
 #include "multiroom_state.hpp"
@@ -20,7 +19,6 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#include <memory>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
@@ -208,11 +206,10 @@ struct TargetRuntime {
     q2dz::UniqueFd socket;
     std::string alias;
     std::uint64_t resolve_deadline = 0;
-    std::uint64_t resolution_token = 0;
     std::uint64_t next_probe = 0;
     std::uint64_t probe_sent_at = 0;
     unsigned probe_failures = 0;
-    bool alias_query_pending = false;
+    bool ack_pending = false;
 };
 
 class Gateway {
@@ -258,9 +255,8 @@ public:
             if (network_.initialized) {
                 // One runtime-thread pump services every active peer.
                 (void)humblenet_p2p_wait(0);
-                process_alias_query_results();
-                process_transport();
                 process_resolutions();
+                process_transport();
                 process_probes();
             }
             process_udp(poll_data);
@@ -440,17 +436,15 @@ private:
         TargetRuntime runtime;
         runtime.socket = std::move(socket_fd.value());
         runtime.alias = std::move(alias.value());
-        runtime.resolve_deadline = q2dz::monotonic_millis() + kResolveTimeoutMs;
-        runtime.resolution_token = next_resolution_token_++;
-        if (runtime.resolution_token == 0) runtime.resolution_token = next_resolution_token_++;
+        runtime.resolve_deadline = 0;
         targets_.emplace(id, std::move(runtime));
     }
 
     void drop_target(q2dz::TargetId id) {
         const auto state_target = state_.find(id);
         if (state_target == nullptr) return;
-        if (state_target->remote_peer != 0 && network_.initialized) {
-            (void)humblenet_p2p_disconnect(state_target->remote_peer);
+        if (state_target->route_peer != 0 && network_.initialized) {
+            (void)humblenet_p2p_disconnect(state_target->route_peer);
         }
         static_cast<void>(state_.drop(id));
         erase_runtime(id);
@@ -475,8 +469,8 @@ private:
                      std::string_view code) {
         const auto target = state_.find(id);
         if (target == nullptr) return;
-        if (target->remote_peer != 0 && network_.initialized) {
-            (void)humblenet_p2p_disconnect(target->remote_peer);
+        if (target->route_peer != 0 && network_.initialized) {
+            (void)humblenet_p2p_disconnect(target->route_peer);
         }
         static_cast<void>(state_.mark_failed(id, std::string(code)));
         emit_failed(id, stage, code);
@@ -486,8 +480,8 @@ private:
     void close_target(q2dz::TargetId id, std::string_view reason) {
         const auto target = state_.find(id);
         if (target == nullptr) return;
-        if (target->remote_peer != 0 && network_.initialized) {
-            (void)humblenet_p2p_disconnect(target->remote_peer);
+        if (target->route_peer != 0 && network_.initialized) {
+            (void)humblenet_p2p_disconnect(target->route_peer);
         }
         static_cast<void>(state_.mark_closed(id, std::string(reason)));
         emit(q2dz::GatewayEventType::RoomClosed,
@@ -534,13 +528,16 @@ private:
                 const q2dz::UdpSource udp_source{source.sin_addr.s_addr, source.sin_port};
                 if (!state_.source_allowed(id, udp_source)) continue;
                 const auto current = state_.find(id);
-                if (current == nullptr || current->remote_peer == 0) continue;
+                if (current == nullptr || current->route_peer == 0) continue;
                 const int sent = humblenet_p2p_sendto(
                     udp_buffer_.data(), static_cast<std::uint32_t>(size),
-                    current->remote_peer, SEND_RELIABLE, 0);
+                    current->route_peer, SEND_RELIABLE, 0);
                 if (sent < 0) {
-                    close_target(id, "transport_send_failed");
-                    break;
+                    if (current->concrete_peer != 0) {
+                        close_target(id, "transport_closed");
+                        break;
+                    }
+                    continue;
                 }
                 if (sent == static_cast<int>(size)) state_.record_udp_to_webrtc(id, size);
             }
@@ -556,7 +553,12 @@ private:
             if (length == 0) break;
             if (length < 0) {
                 const auto id = state_.target_for_peer(from_peer);
-                if (id) close_target(*id, "transport_closed");
+                if (id) {
+                    const auto target = state_.find(*id);
+                    if (target != nullptr && target->concrete_peer != 0) {
+                        close_target(*id, "transport_closed");
+                    }
+                }
                 else if (from_peer != 0) {
                     (void)state_.route_inbound(from_peer, 0);
                 } else {
@@ -585,15 +587,11 @@ private:
             if (q2dz::probe_ack_is_outstanding(ack, probe.probe_sent_at)) {
                 probe.probe_sent_at = 0;
                 probe.probe_failures = 0;
-                if (target->state == q2dz::TargetState::probing && state_.mark_ready(*routed)) {
-                    probe.resolve_deadline = 0;
-                    emit(q2dz::GatewayEventType::TransportReady,
-                         {{"id", std::to_string(*routed)},
-                          {"udp", "127.0.0.1:" + std::to_string(target->udp_port)},
-                          {"peer", std::to_string(target->remote_peer)}});
-                }
+                if (target->concrete_peer == 0) probe.ack_pending = true;
+                else accept_probe_ack(*routed, probe);
                 continue;
             }
+            if (target->concrete_peer == 0) continue;
             if (target->state != q2dz::TargetState::ready || !target->captured_source) continue;
             sockaddr_in destination{};
             destination.sin_family = AF_INET;
@@ -611,91 +609,75 @@ private:
         }
     }
 
-    void process_alias_query_results() {
-        auto batch = alias_query_mailbox_->drain();
-        if (batch.overflowed) {
-            for (const auto id : state_.target_ids()) {
-                const auto target = state_.find(id);
-                const auto runtime = targets_.find(id);
-                if (target == nullptr || runtime == targets_.end() ||
-                    target->state != q2dz::TargetState::resolving ||
-                    !runtime->second.alias_query_pending) continue;
-                fail_target(id, "resolve", "alias_query_overflow");
-            }
-        }
-        for (const auto& result : batch.results) {
-            finish_alias_query(result.target_id, result.resolution_token,
-                               result.alias, result.matches);
-        }
-    }
-
     void process_resolutions() {
         const auto now = q2dz::monotonic_millis();
         const auto ids = state_.target_ids();
+        bool resolution_slot_occupied = false;
         for (const auto id : ids) {
             const auto state_target = state_.find(id);
             const auto runtime = targets_.find(id);
             if (state_target == nullptr || runtime == targets_.end() ||
-                state_target->state != q2dz::TargetState::resolving) continue;
-            const auto action = q2dz::resolution_action(
-                now, runtime->second.resolve_deadline,
-                runtime->second.alias_query_pending,
-                humblenet_p2p_get_my_peer_id() != 0);
-            switch (action) {
-                case q2dz::ResolutionAction::timeout:
-                    fail_target(id, "resolve", "alias_timeout");
-                    break;
-                case q2dz::ResolutionAction::wait_for_alias_callback:
-                case q2dz::ResolutionAction::wait_for_peer:
-                    break;
-                case q2dz::ResolutionAction::query_alias:
-                    start_alias_query(id, runtime->second);
-                    break;
+                state_target->state == q2dz::TargetState::failed ||
+                state_target->state == q2dz::TargetState::closed ||
+                state_target->concrete_peer != 0) continue;
+            if (state_target->route_peer != 0 && runtime->second.resolve_deadline != 0 &&
+                now >= runtime->second.resolve_deadline) {
+                fail_target(id, "resolve", "alias_timeout");
+                continue;
+            }
+
+            if (state_target->route_peer == 0 && resolution_slot_occupied) continue;
+            if (state_target->route_peer == 0) {
+                const PeerId route_peer = humblenet_p2p_virtual_peer_for_alias(
+                    runtime->second.alias.c_str());
+                if (route_peer == 0 || !state_.bind_route_peer(id, route_peer)) {
+                    fail_target(id, "resolve", "peer_bind_failed");
+                    continue;
+                }
+                runtime->second.resolve_deadline =
+                    q2dz::monotonic_millis() + kResolveTimeoutMs;
+                resolution_slot_occupied = true;
+            } else {
+                resolution_slot_occupied = true;
+            }
+
+            if (runtime->second.probe_sent_at == 0 && runtime->second.next_probe == 0) {
+                continue;
+            }
+            const auto current = state_.find(id);
+            if (current == nullptr || current->route_peer == 0) continue;
+            const PeerId concrete_peer = humblenet_p2p_resolved_peer_for_virtual_peer(
+                current->route_peer);
+            if (concrete_peer == 0) continue;
+            if (!state_.reserve_concrete_peer(id, concrete_peer)) {
+                const auto failed = state_.find(id);
+                const bool duplicate = failed != nullptr &&
+                    failed->failure_code == "duplicate_remote_peer";
+                fail_target(id, "resolve", duplicate ? "duplicate_remote_peer" : "peer_bind_failed");
+                resolution_slot_occupied = false;
+                continue;
+            }
+            resolution_slot_occupied = false;
+            runtime->second.resolve_deadline = 0;
+            if (runtime->second.ack_pending) {
+                accept_probe_ack(id, runtime->second);
             }
         }
     }
 
-    void start_alias_query(q2dz::TargetId id, TargetRuntime& runtime) {
-        const auto token = runtime.resolution_token;
-        const std::string alias = runtime.alias;
-        const std::string query = "=" + alias;
-        const auto mailbox = alias_query_mailbox_;
-        runtime.alias_query_pending = true;
-        const bool queued = humblenet_p2p_alias_query(
-            query.c_str(),
-            [mailbox, id, token, alias](
-                std::vector<std::pair<std::string, PeerId>> matches) mutable {
-                static_cast<void>(mailbox->push(q2dz::AliasQueryResult{
-                    id, token, std::move(alias), std::move(matches)}));
-            });
-        if (!queued) runtime.alias_query_pending = false;
-    }
-
-    void finish_alias_query(
-        q2dz::TargetId id, std::uint64_t token, std::string_view alias,
-        const std::vector<std::pair<std::string, PeerId>>& matches) {
-        const auto runtime = targets_.find(id);
+    void accept_probe_ack(q2dz::TargetId id, TargetRuntime& runtime) {
         const auto target = state_.find(id);
-        if (runtime == targets_.end() || target == nullptr ||
-            runtime->second.resolution_token != token || runtime->second.alias != alias ||
-            !runtime->second.alias_query_pending ||
-            target->state != q2dz::TargetState::resolving) return;
-        runtime->second.alias_query_pending = false;
-
-        const auto resolved = q2dz::select_exact_alias_match(alias, matches);
-        if (!resolved) {
-            fail_target(id, "resolve", resolved.error().message);
+        if (target == nullptr || target->concrete_peer == 0) {
+            runtime.ack_pending = true;
             return;
         }
-        if (!state_.bind_peer(id, resolved.value())) {
-            const auto current = state_.find(id);
-            const bool duplicate = current != nullptr &&
-                current->failure_code == "duplicate_remote_peer";
-            fail_target(id, "resolve", duplicate ? "duplicate_remote_peer" : "peer_bind_failed");
-            return;
+        runtime.ack_pending = false;
+        if (target->state == q2dz::TargetState::probing && state_.mark_ready(id)) {
+            emit(q2dz::GatewayEventType::TransportReady,
+                 {{"id", std::to_string(id)},
+                  {"udp", "127.0.0.1:" + std::to_string(target->udp_port)},
+                  {"peer", std::to_string(target->concrete_peer)}});
         }
-        runtime->second.resolve_deadline = q2dz::monotonic_millis() + kResolveTimeoutMs;
-        runtime->second.next_probe = 0;
     }
 
     void process_probes() {
@@ -704,30 +686,28 @@ private:
         for (const auto id : state_.target_ids()) {
             const auto target = state_.find(id);
             const auto runtime = targets_.find(id);
-            if (target == nullptr || runtime == targets_.end() || target->remote_peer == 0 ||
-                (target->state != q2dz::TargetState::probing &&
+            if (target == nullptr || runtime == targets_.end() || target->route_peer == 0 ||
+                (target->state != q2dz::TargetState::resolving &&
+                 target->state != q2dz::TargetState::probing &&
                  target->state != q2dz::TargetState::ready)) continue;
             auto& probe = runtime->second;
-            if (target->state == q2dz::TargetState::probing &&
-                probe.resolve_deadline != 0 && now >= probe.resolve_deadline) {
-                close_target(id, "probe_timeout");
-                continue;
-            }
             if (probe.probe_sent_at != 0 && now >= probe.probe_sent_at + kProbeTimeoutMs) {
                 probe.probe_sent_at = 0;
-                ++probe.probe_failures;
-                if (probe.probe_failures >= kProbeFailures) {
+                if (target->concrete_peer != 0) {
+                    ++probe.probe_failures;
+                }
+                if (target->concrete_peer != 0 && probe.probe_failures >= kProbeFailures) {
                     close_target(id, "probe_timeout");
                     continue;
                 }
             }
             if (probe.probe_sent_at != 0 || (probe.next_probe != 0 && now < probe.next_probe)) continue;
             const int sent = humblenet_p2p_sendto(
-                ping.data(), static_cast<std::uint32_t>(ping.size()), target->remote_peer,
+                ping.data(), static_cast<std::uint32_t>(ping.size()), target->route_peer,
                 SEND_RELIABLE, 0);
             probe.next_probe = now + kProbeIntervalMs;
             if (sent < 0) {
-                close_target(id, "transport_closed");
+                if (target->concrete_peer != 0) close_target(id, "transport_closed");
             } else if (sent == static_cast<int>(ping.size())) {
                 probe.probe_sent_at = now;
             }
@@ -760,8 +740,6 @@ private:
 
     GatewayOptions options_;
     q2dz::UniqueFd event_output_;
-    std::shared_ptr<q2dz::AliasQueryMailbox> alias_query_mailbox_ =
-        std::make_shared<q2dz::AliasQueryMailbox>();
     HumbleNetSession network_;
     q2dz::MultiroomState state_;
     std::unordered_map<q2dz::TargetId, TargetRuntime> targets_;
@@ -771,7 +749,6 @@ private:
     std::vector<unsigned char> transport_buffer_;
     std::uint64_t ice_generation_ = 0;
     std::uint64_t next_heartbeat_ = 0;
-    std::uint64_t next_resolution_token_ = 1;
     bool control_eof_ = false;
     bool stop_requested_ = false;
 };
@@ -804,7 +781,7 @@ int run_legacy_gateway(const GatewayOptions& options) {
     std::cout.setf(std::ios::unitbuf);
 
     PeerId own_peer = 0;
-    PeerId remote_peer = 0;
+    PeerId route_peer = 0;
     sockaddr_in client{};
     bool have_client = false;
     std::uint64_t udp_to_webrtc = 0;
@@ -820,8 +797,8 @@ int run_legacy_gateway(const GatewayOptions& options) {
         if (own_peer == 0) {
             own_peer = humblenet_p2p_get_my_peer_id();
             if (own_peer != 0) {
-                remote_peer = humblenet_p2p_virtual_peer_for_alias(options.alias.c_str());
-                if (remote_peer == 0) throw std::runtime_error("alias failed");
+                route_peer = humblenet_p2p_virtual_peer_for_alias(options.alias.c_str());
+                if (route_peer == 0) throw std::runtime_error("alias failed");
                 std::cout << "GATEWAY_READY bind=127.0.0.1:" << options.port
                           << " own_peer_id=" << own_peer << " alias="
                           << options.alias << '\n';
@@ -843,7 +820,7 @@ int run_legacy_gateway(const GatewayOptions& options) {
                 ++oversized_udp_drops;
             } else if (have_client && !same_client(client, source)) {
                 std::cout << "DROP second_udp_source\n";
-            } else if (remote_peer != 0) {
+            } else if (route_peer != 0) {
                 if (!have_client) {
                     client = source;
                     have_client = true;
@@ -851,7 +828,7 @@ int run_legacy_gateway(const GatewayOptions& options) {
                 }
                 const int sent = humblenet_p2p_sendto(
                     buffer.data(), static_cast<std::uint32_t>(size),
-                    remote_peer, SEND_RELIABLE, 0);
+                    route_peer, SEND_RELIABLE, 0);
                 if (sent < 0) throw humblenet_error();
                 if (sent == static_cast<int>(size)) {
                     ++udp_to_webrtc;

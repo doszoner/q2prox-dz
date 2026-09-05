@@ -16,32 +16,8 @@ void count_max(std::size_t& maximum, std::size_t length) noexcept {
 
 }  // namespace
 
-Result<RemotePeerId> select_exact_alias_match(
-    std::string_view alias,
-    const std::vector<std::pair<std::string, RemotePeerId>>& matches) {
-    std::optional<RemotePeerId> peer;
-    for (const auto& [matched_alias, matched_peer] : matches) {
-        if (matched_alias != alias) continue;
-        if (peer) return Result<RemotePeerId>::fail("alias_ambiguous");
-        peer = matched_peer;
-    }
-    if (!peer || *peer == 0) return Result<RemotePeerId>::fail("alias_not_found");
-    return Result<RemotePeerId>::ok(*peer);
-}
-
 bool probe_ack_is_outstanding(bool is_ack, std::uint64_t probe_sent_at) noexcept {
     return is_ack && probe_sent_at != 0;
-}
-
-ResolutionAction resolution_action(
-    std::uint64_t now, std::uint64_t resolve_deadline,
-    bool alias_query_pending, bool peer_ready) noexcept {
-    if (resolve_deadline != 0 && now >= resolve_deadline) {
-        return ResolutionAction::timeout;
-    }
-    if (alias_query_pending) return ResolutionAction::wait_for_alias_callback;
-    if (!peer_ready) return ResolutionAction::wait_for_peer;
-    return ResolutionAction::query_alias;
 }
 
 Result<void> MultiroomState::put(TargetId id, std::uint16_t udp_port) {
@@ -57,32 +33,58 @@ Result<void> MultiroomState::put(TargetId id, std::uint16_t udp_port) {
                                                 return item.second.udp_port == udp_port;
                                             });
     if (endpoint_taken) return Result<void>::fail("target UDP endpoint is already in use");
-    targets_.emplace(id, Target{id, udp_port, 0, TargetState::resolving, std::nullopt, {}, {}});
+    targets_.emplace(id, Target{id, udp_port, 0, 0, TargetState::resolving,
+                                 std::nullopt, {}, {}});
     return Result<void>::ok();
 }
 
 bool MultiroomState::drop(TargetId id) noexcept {
     const auto it = targets_.find(id);
     if (it == targets_.end()) return false;
-    if (it->second.remote_peer != 0) peers_.erase(it->second.remote_peer);
+    if (it->second.route_peer != 0) route_peers_.erase(it->second.route_peer);
+    if (it->second.concrete_peer != 0) concrete_peers_.erase(it->second.concrete_peer);
     targets_.erase(it);
     return true;
 }
 
-bool MultiroomState::bind_peer(TargetId id, RemotePeerId peer) {
+bool MultiroomState::bind_route_peer(TargetId id, RemotePeerId route_peer) {
     Target* target = lookup(targets_, id);
-    if (target == nullptr || peer == 0 || target->state == TargetState::failed ||
+    if (target == nullptr || route_peer == 0 || (route_peer & 0x80000000U) == 0 ||
+        target->state == TargetState::failed ||
         target->state == TargetState::closed) return false;
-    if (target->remote_peer == peer) return true;
-    if (target->remote_peer != 0) return false;
-    const auto existing = peers_.find(peer);
-    if (existing != peers_.end() && existing->second != id) {
+    if (target->route_peer == route_peer) return true;
+    if (target->route_peer != 0) return false;
+    const auto unresolved_route = std::find_if(
+        targets_.begin(), targets_.end(), [id](const auto& item) {
+            const auto& other = item.second;
+            return item.first != id && other.route_peer != 0 &&
+                other.concrete_peer == 0 && other.state != TargetState::failed &&
+                other.state != TargetState::closed;
+        });
+    if (unresolved_route != targets_.end()) return false;
+    const auto existing = route_peers_.find(route_peer);
+    if (existing != route_peers_.end() && existing->second != id) return false;
+    target->route_peer = route_peer;
+    route_peers_[route_peer] = id;
+    return true;
+}
+
+bool MultiroomState::reserve_concrete_peer(TargetId id, RemotePeerId concrete_peer) {
+    Target* target = lookup(targets_, id);
+    if (target == nullptr || concrete_peer == 0 || (concrete_peer & 0x80000000U) != 0 ||
+        target->route_peer == 0 || target->state == TargetState::failed ||
+        target->state == TargetState::closed) return false;
+    if (target->concrete_peer == concrete_peer) return true;
+    if (target->concrete_peer != 0) return false;
+
+    const auto existing = concrete_peers_.find(concrete_peer);
+    if (existing != concrete_peers_.end() && existing->second != id) {
         target->state = TargetState::failed;
         target->failure_code = "duplicate_remote_peer";
         return false;
     }
-    target->remote_peer = peer;
-    peers_[peer] = id;
+    target->concrete_peer = concrete_peer;
+    concrete_peers_[concrete_peer] = id;
     target->state = TargetState::probing;
     target->failure_code.clear();
     return true;
@@ -100,7 +102,7 @@ bool MultiroomState::mark_probing(TargetId id) noexcept {
 
 bool MultiroomState::mark_ready(TargetId id) noexcept {
     Target* target = lookup(targets_, id);
-    if (target == nullptr || target->remote_peer == 0 ||
+    if (target == nullptr || target->route_peer == 0 || target->concrete_peer == 0 ||
         target->state == TargetState::failed || target->state == TargetState::closed) {
         return false;
     }
@@ -112,8 +114,10 @@ bool MultiroomState::mark_closed(TargetId id, std::string reason) {
     Target* target = lookup(targets_, id);
     if (target == nullptr || target->state == TargetState::closed ||
         target->state == TargetState::failed) return false;
-    if (target->remote_peer != 0) peers_.erase(target->remote_peer);
-    target->remote_peer = 0;
+    if (target->route_peer != 0) route_peers_.erase(target->route_peer);
+    if (target->concrete_peer != 0) concrete_peers_.erase(target->concrete_peer);
+    target->route_peer = 0;
+    target->concrete_peer = 0;
     target->state = TargetState::closed;
     target->failure_code = std::move(reason);
     return true;
@@ -121,10 +125,12 @@ bool MultiroomState::mark_closed(TargetId id, std::string reason) {
 
 bool MultiroomState::mark_failed(TargetId id, std::string code) {
     Target* target = lookup(targets_, id);
-    if (target == nullptr || target->state == TargetState::closed ||
-        target->state == TargetState::failed) return false;
-    if (target->remote_peer != 0) peers_.erase(target->remote_peer);
-    target->remote_peer = 0;
+    if (target == nullptr || target->state == TargetState::closed) return false;
+    if (target->route_peer != 0) route_peers_.erase(target->route_peer);
+    if (target->concrete_peer != 0) concrete_peers_.erase(target->concrete_peer);
+    target->route_peer = 0;
+    target->concrete_peer = 0;
+    if (target->state == TargetState::failed) return false;
     target->state = TargetState::failed;
     target->failure_code = std::move(code);
     return true;
@@ -138,8 +144,8 @@ const Target* MultiroomState::find(TargetId id) const noexcept {
 }
 
 std::optional<TargetId> MultiroomState::target_for_peer(RemotePeerId peer) const {
-    const auto it = peers_.find(peer);
-    if (it == peers_.end() || !targets_.contains(it->second)) return std::nullopt;
+    const auto it = route_peers_.find(peer);
+    if (it == route_peers_.end() || !targets_.contains(it->second)) return std::nullopt;
     return it->second;
 }
 
@@ -183,7 +189,7 @@ std::optional<RemotePeerId> MultiroomState::route_outbound(TargetId id, UdpSourc
                                                             std::size_t length,
                                                             std::size_t maximum) {
     Target* target = lookup(targets_, id);
-    if (target == nullptr || target->remote_peer == 0 ||
+    if (target == nullptr || target->route_peer == 0 ||
         target->state == TargetState::failed || target->state == TargetState::closed) {
         return std::nullopt;
     }
@@ -193,7 +199,7 @@ std::optional<RemotePeerId> MultiroomState::route_outbound(TargetId id, UdpSourc
     }
     if (!source_allowed(id, source)) return std::nullopt;
     record_udp_to_webrtc(id, length);
-    return target->remote_peer;
+    return target->route_peer;
 }
 
 std::optional<TargetId> MultiroomState::route_inbound(RemotePeerId peer, std::size_t length) {

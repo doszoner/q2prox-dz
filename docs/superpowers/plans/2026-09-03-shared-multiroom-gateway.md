@@ -679,10 +679,19 @@ server handler остаётся inference. Сервер Dos.Zone не меняе
 возвращается к штатному AliasLookup, который запускается первой отправкой на
 virtual PeerId.
 
+Execution status на 2026-09-05: код Task 7A реализован на Linux и Windows
+gateway paths; deterministic проверки и one-peer live/status gate пройдены и
+зафиксированы в `docs/verification/1.0.0-rc14.md`. Multi-alias/two-target live
+registration через controlled peer оказался внешне нестабилен до gateway и не
+засчитан как release PASS. Следующий минимальный шаг — не переписывать routing,
+а пройти реальные Linux/Windows two-target package gates, когда доступны fresh
+комнаты.
+
 **Files:** in WebRTC-NET modify
 `src/humblenet/include/humblenet_p2p.h`,
 `src/humblenet/HumbleNet_API.json`,
 `src/humblenet/src/humblenet_p2p.cpp`,
+`src/humblenet/src/humblenet_p2p_signaling.cpp`,
 `src/humblenet/src/humblenet_alias.h`,
 `src/humblenet/src/humblenet_alias.cpp`, `webrtcnet/src/main.cpp`,
 `tests/CMakeLists.txt`; create `tests/test_alias_state.cpp`. In q2prox modify
@@ -692,7 +701,9 @@ virtual PeerId.
 `windows/gateway/assets/transport.html`,
 `windows/gateway/assets/transport_protocol.mjs`,
 `windows/gateway/tests/transport_protocol.test.mjs`,
-`tests/tools/q2dz-controlled-peer.cpp`, `deps.lock.json` and the existing
+`windows/gateway/src/main.cpp`, `tests/tools/q2dz-controlled-peer.cpp`,
+`tests/tools/controlled-room-set.py`,
+`tests/tools/test_controlled_room_set.py`, `deps.lock.json` and the existing
 `docs/verification/1.0.0-rc14.md`; delete
 `linux/transport/alias_query_mailbox.hpp` after its production/test wiring is
 gone.
@@ -752,11 +763,13 @@ replacement. Native host, bridge и HUB/2 contract не меняются.
 - [ ] **Step 5: controlled peer и live correction gates.**
 
 Controlled peer использует `humblenet_p2p_is_alias_registered(alias)`, не HTTP
-`/lookup` и не `AliasQuery`. Пройти последовательно: один peer READY/status;
-один peer с двумя aliases — ровно один target READY, второй FAILED duplicate,
-survivor продолжает status; `DROP -> PUT` того же alias; две разные цели,
-isolated close и ICE refresh без runtime restart. Затем повторить существующие
-40-target и Linux/Windows resource gates Task 7.
+`/lookup` и не `AliasQuery`. По умолчанию harness создаёт нейтральные
+`room.q2test.serverNN`; для live product-schema проверок используется
+`--alias-prefix q2.<safe-prefix>`. Пройти последовательно: один peer
+READY/status; один peer с двумя aliases — ровно один target READY, второй
+FAILED duplicate, survivor продолжает status; `DROP -> PUT` того же alias; две
+разные цели, isolated close и ICE refresh без runtime restart. Затем повторить
+существующие 40-target и Linux/Windows resource gates Task 7.
 
 - [ ] **Step 6: pin, reachability, evidence и commits.**
 

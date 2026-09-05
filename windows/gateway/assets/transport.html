@@ -9,7 +9,6 @@ import {
   classifyIncomingDatagram,
   createCadenceCounter,
   createFairReceiveScheduler,
-  exactAliasQuery,
   maxDatagram,
   maxTargets,
   maxPumpPacketsPerTick,
@@ -31,9 +30,10 @@ let fromPeerBuffer;
 let receive;
 let send;
 let wait;
-let myId;
 let setIceServers;
 let connectTo;
+let virtualPeerForAlias;
+let resolvedPeerForVirtual;
 let disconnect;
 let shutdown;
 let runtimeStarting;
@@ -42,31 +42,12 @@ let commonIce;
 let iceGeneration = 0n;
 let lastCadenceReport = 0;
 const targets = new Map();
-const remotePeerToTarget = new Map();
-const queryTargets = new Map();
-const queryTargetsByToken = new Map();
-const queryRestarts = new Map();
+const routePeerToTarget = new Map();
+const concretePeerToTarget = new Map();
+const resolveDeadlineMs = 30000;
 const receiveScheduler = createFairReceiveScheduler();
 const cadence = createCadenceCounter();
 const controlChain = { value: Promise.resolve() };
-let nextQueryRequestToken = 1;
-
-function validQueryToken(value) {
-  return Number.isInteger(value) && value > 0 && value <= 0xffffffff;
-}
-
-function normalizeQueryToken(value) {
-  if (!Number.isInteger(value)) return null;
-  return value >>> 0;
-}
-
-function allocateQueryToken() {
-  for (;;) {
-    const token = nextQueryRequestToken;
-    nextQueryRequestToken = token === 0xffffffff ? 1 : token + 1;
-    if (!queryTargetsByToken.has(token)) return token;
-  }
-}
 
 function post(message) {
   globalThis.chrome.webview.postMessage(message);
@@ -121,20 +102,12 @@ function postTargetState(target, value, extra = {}) {
 function removeTarget(target, value, reason, emit = true) {
   if (!targets.has(target.targetId)) return;
   if (target.probe) target.probe.stop();
-  if (target.remotePeerId !== 0) {
-    remotePeerToTarget.delete(target.remotePeerId);
-    try { disconnect?.(target.remotePeerId); } catch {}
+  if (target.routePeerId !== 0) {
+    routePeerToTarget.delete(target.routePeerId);
+    try { disconnect?.(target.routePeerId); } catch {}
   }
+  if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
   receiveScheduler.drop(target.targetId);
-  const query = exactAliasQuery(target.alias);
-  const active = queryTargets.get(query);
-  if (active) {
-    active.accepting = false;
-    active.targets.delete(target);
-  }
-  const waiting = queryRestarts.get(query);
-  waiting?.delete(target);
-  if (waiting?.size === 0) queryRestarts.delete(query);
   targets.delete(target.targetId);
   if (emit) postTargetState(target, value, { reason });
 }
@@ -147,22 +120,46 @@ function failTarget(target, reason) {
   removeTarget(target, "failed", reason);
 }
 
+function validVirtualPeerId(value) {
+  const peer = value >>> 0;
+  return peer >= 0x80000000 && peer <= 0xffffffff;
+}
+
+function validConcretePeerId(value) {
+  const peer = value >>> 0;
+  return peer > 0 && peer < 0x80000000;
+}
+
+function isProbeAck(datagram) {
+  return datagram && typeof datagram.length === "number" && datagram.length >= 7 &&
+    datagram[0] === 0xff && datagram[1] === 0xff &&
+    datagram[2] === 0xff && datagram[3] === 0xff &&
+    datagram[4] === 0x61 && datagram[5] === 0x63 && datagram[6] === 0x6b &&
+    (datagram.length === 7 || datagram[7] === 0 || datagram[7] === 10 || datagram[7] === 13);
+}
+
 function makeProbe(target) {
   return new ManagedReadinessProbe({
     send(datagram) {
-      if (!runtimeConnected || target.remotePeerId === 0) return false;
+      if (!runtimeConnected || target.routePeerId === 0) return false;
       webRtcModule.HEAPU8.set(datagram, receiveBuffer);
       cadence.probeSend();
-      return send(receiveBuffer, datagram.length, target.remotePeerId, reliableSendMode) === datagram.length;
+      return send(receiveBuffer, datagram.length, target.routePeerId, reliableSendMode) === datagram.length;
     },
     onReady() {
-      if (targets.get(target.targetId) === target) {
+      if (targets.get(target.targetId) === target && target.concretePeerId !== 0) {
         target.state = "ready";
-        postTargetState(target, "transport-ready", { peer: target.remotePeerId });
+        postTargetState(target, "transport-ready", { peer: target.concretePeerId });
       }
     },
     onRoomClosed(reason) {
-      if (targets.get(target.targetId) === target) closeTarget(target, reason);
+      if (targets.get(target.targetId) !== target) return;
+      if (target.concretePeerId === 0) {
+        target.probe = makeProbe(target);
+        if (target.routePeerId !== 0) target.probe.channelOpened();
+        return;
+      }
+      closeTarget(target, reason);
     },
   });
 }
@@ -173,11 +170,11 @@ function putTarget(value, targetId) {
   if (targets.size >= maxTargets) throw new Error("target_capacity_exceeded");
   const target = {
     ...config,
-    remotePeerId: 0,
+    routePeerId: 0,
+    concretePeerId: 0,
     state: "resolving",
-    queried: false,
-    queryFinished: false,
-    matches: [],
+    resolveDeadline: 0,
+    pendingProbeAck: undefined,
     probe: undefined,
   };
   target.probe = makeProbe(target);
@@ -194,48 +191,14 @@ async function ensureRuntime(iceServers) {
     webRtcModule = await WebRTCNet({
       print: () => {},
       printErr: () => fail("runtime_error"),
-      aliasQueryAdd: (seenQuery, alias, peer, token) => {
-        const requestToken = normalizeQueryToken(token);
-        const active = queryTargets.get(seenQuery);
-        if (!active || !validQueryToken(requestToken) || active.token !== requestToken ||
-            queryTargetsByToken.get(requestToken) !== active) return;
-        for (const target of active.targets) {
-          if (targets.get(target.targetId) === target && alias === target.alias) {
-            const concretePeer = peer >>> 0;
-            if (concretePeer > 0 && concretePeer < 0x80000000) {
-              target.matches.push({ alias, peer: concretePeer });
-            }
-          }
-        }
-      },
-      onAliasQueryEnd: (seenQuery, token) => {
-        const requestToken = normalizeQueryToken(token);
-        const active = queryTargets.get(seenQuery);
-        if (!active || !validQueryToken(requestToken) || active.token !== requestToken ||
-            queryTargetsByToken.get(requestToken) !== active) return;
-        for (const target of active.targets) {
-          if (targets.get(target.targetId) === target) target.queryFinished = true;
-        }
-        queryTargets.delete(seenQuery);
-        queryTargetsByToken.delete(requestToken);
-        const waiting = queryRestarts.get(seenQuery);
-        if (waiting) {
-          queryRestarts.delete(seenQuery);
-          for (const target of waiting) {
-            if (targets.get(target.targetId) !== target) continue;
-            target.queried = false;
-            target.queryFinished = false;
-            target.matches = [];
-          }
-        }
-      },
     });
 
     startupStage = "bind_runtime";
     setIceServers = webRtcModule.cwrap("setIceServers", "number", ["string"]);
     connectTo = webRtcModule.cwrap("connectTo", "number", ["string", "string", "string"]);
     wait = webRtcModule.cwrap("wait", null, ["number"]);
-    myId = webRtcModule.cwrap("myId", "number", []);
+    virtualPeerForAlias = webRtcModule.cwrap("virtualPeerForAlias", "number", ["string"]);
+    resolvedPeerForVirtual = webRtcModule.cwrap("resolvedPeerForVirtual", "number", ["number"]);
     send = webRtcModule.cwrap("sendto", "number", ["number", "number", "number", "number"]);
     receive = webRtcModule.cwrap("recvfrom", "number", ["number", "number", "number"]);
     disconnect = webRtcModule.cwrap("disconnect", null, ["number"]);
@@ -273,55 +236,79 @@ async function applyIce(value) {
   }
 }
 
-function startAliasQueries() {
-  if (!runtimeConnected || myId() === 0) return;
+function hasUnresolvedRoute() {
+  return [...targets.values()].some((target) =>
+    target.routePeerId !== 0 && target.concretePeerId === 0);
+}
+
+function allocateTargetRoute() {
+  if (!runtimeConnected || hasUnresolvedRoute()) return false;
   for (const target of targets.values()) {
-    if (target.queried) continue;
-    const query = exactAliasQuery(target.alias);
-    let active = queryTargets.get(query);
-    if (!active) {
-      active = {
-        token: allocateQueryToken(),
-        accepting: true,
-        targets: new Set([target]),
-      };
-      queryTargets.set(query, active);
-      queryTargetsByToken.set(active.token, active);
-    } else if (active.accepting) {
-      active.targets.add(target);
-    } else {
-      let waiting = queryRestarts.get(query);
-      if (!waiting) queryRestarts.set(query, waiting = new Set());
-      waiting.add(target);
-      target.queried = true;
+    if (target.routePeerId !== 0) continue;
+    let routePeerId;
+    try {
+      routePeerId = virtualPeerForAlias(target.alias) >>> 0;
+    } catch {
+      failTarget(target, "peer_bind_failed");
       continue;
     }
-    target.queried = true;
-    if (active.targets.size === 1) {
-      cadence.aliasPoll();
-      webRtcModule.cwrap("queryAliases", null, ["string", "number"])(query, active.token);
+    if (!validVirtualPeerId(routePeerId) ||
+        (routePeerToTarget.has(routePeerId) && routePeerToTarget.get(routePeerId) !== target.targetId)) {
+      failTarget(target, "peer_bind_failed");
+      continue;
     }
+    target.routePeerId = routePeerId;
+    routePeerToTarget.set(routePeerId, target.targetId);
+    target.resolveDeadline = performance.now() + resolveDeadlineMs;
+    target.probe.channelOpened();
+    return true;
   }
+  return false;
 }
 
 function resolveTargets() {
   for (const target of [...targets.values()]) {
-    if (!target.queryFinished || target.remotePeerId !== 0) continue;
-    const matches = target.matches.filter((match) => match.alias === target.alias && match.peer !== 0);
-    if (matches.length !== 1) {
-      failTarget(target, "alias_not_unique");
+    if (target.routePeerId === 0 || target.concretePeerId !== 0) continue;
+    cadence.aliasPoll();
+    let concretePeerId;
+    try {
+      concretePeerId = resolvedPeerForVirtual(target.routePeerId) >>> 0;
+    } catch {
       continue;
     }
-    const peer = matches[0].peer;
-    const owner = remotePeerToTarget.get(peer);
+    if (!validConcretePeerId(concretePeerId)) continue;
+    const owner = concretePeerToTarget.get(concretePeerId);
     if (owner !== undefined && owner !== target.targetId) {
       failTarget(target, "duplicate_remote_peer");
       continue;
     }
-    target.remotePeerId = peer;
+    concretePeerToTarget.set(concretePeerId, target.targetId);
+    target.concretePeerId = concretePeerId;
     target.state = "probing";
-    remotePeerToTarget.set(peer, target.targetId);
-    target.probe.channelOpened();
+    if (target.pendingProbeAck) {
+      const ack = target.pendingProbeAck;
+      target.pendingProbeAck = undefined;
+      if (target.probe.packetReceived(ack)) cadence.probeAck();
+    }
+  }
+}
+
+function expireUnresolvedTargets() {
+  const now = performance.now();
+  for (const target of [...targets.values()]) {
+    if (target.routePeerId !== 0 && target.concretePeerId === 0 &&
+        now >= target.resolveDeadline) {
+      failTarget(target, "alias_timeout");
+    }
+  }
+}
+
+function pumpTargetRoutes() {
+  if (!runtimeConnected) return;
+  for (;;) {
+    resolveTargets();
+    expireUnresolvedTargets();
+    if (hasUnresolvedRoute() || !allocateTargetRoute()) return;
   }
 }
 
@@ -331,19 +318,18 @@ function pump() {
     cadence.timerTick();
     cadence.waitCall();
     wait(0);
-    startAliasQueries();
-    resolveTargets();
+    pumpTargetRoutes();
     const receivePacket = () => {
       webRtcModule.HEAP32[fromPeerBuffer >> 2] = 0;
       const length = receive(receiveBuffer, maxDatagram + 1, fromPeerBuffer);
       if (length === 0) return null;
-      const remotePeerId = webRtcModule.HEAP32[fromPeerBuffer >> 2] >>> 0;
-      if (length < 0) return { peer: remotePeerId, length, data: null };
+      const routePeerId = webRtcModule.HEAP32[fromPeerBuffer >> 2] >>> 0;
+      if (length < 0) return { peer: routePeerId, length, data: null };
       if (classifyIncomingDatagram(length) !== "accepted") {
-        return { peer: remotePeerId, length, data: null, oversized: true };
+        return { peer: routePeerId, length, data: null, oversized: true };
       }
       return {
-        peer: remotePeerId,
+        peer: routePeerId,
         length,
         data: webRtcModule.HEAPU8.slice(receiveBuffer, receiveBuffer + length),
       };
@@ -356,7 +342,8 @@ function pump() {
       const target = targets.get(targetId);
       if (!target) return;
       if (packet.length < 0) {
-        failTarget(target, "connection_closed");
+        if (target.concretePeerId !== 0) closeTarget(target, "transport_closed");
+        return;
       } else if (packet.oversized) {
         post({ type: "drop", targetId, reason: "oversized_transport" });
       } else {
@@ -365,10 +352,14 @@ function pump() {
     };
     receiveScheduler.pump(
       receivePacket,
-      (remotePeerId) => remotePeerToTarget.get(remotePeerId),
+      (routePeerId) => routePeerToTarget.get(routePeerId),
       (targetId, datagram) => {
         const target = targets.get(targetId);
         if (!target) return;
+        if (target.concretePeerId === 0 && isProbeAck(datagram)) {
+          target.pendingProbeAck = datagram;
+          return;
+        }
         if (target.probe.packetReceived(datagram)) {
           cadence.probeAck();
         } else {
@@ -436,13 +427,13 @@ async function dispatch(value) {
       return;
     }
     const target = targets.get(targetId);
-    if (!target || target.remotePeerId === 0) {
+    if (!target || target.routePeerId === 0) {
       post({ type: "drop", targetId, reason: "transport_not_ready" });
       return;
     }
     const datagram = messageToBytes(value);
     webRtcModule.HEAPU8.set(datagram, receiveBuffer);
-    if (send(receiveBuffer, datagram.length, target.remotePeerId, reliableSendMode) === datagram.length) {
+    if (send(receiveBuffer, datagram.length, target.routePeerId, reliableSendMode) === datagram.length) {
       cadence.nativeToDc(datagram.length);
     } else {
       post({ type: "drop", targetId, reason: "transport_not_ready" });

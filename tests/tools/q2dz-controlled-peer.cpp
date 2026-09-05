@@ -5,17 +5,15 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cctype>
 #include <csignal>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -26,6 +24,7 @@ constexpr std::string_view kGameSecret = "quake2-secret";
 constexpr std::size_t kMaxIceBytes = 64U * 1024U;
 constexpr std::size_t kMaxDatagram = 64U * 1024U;
 constexpr std::uint8_t kChannel = 0;
+constexpr auto kAliasReadyTimeout = std::chrono::seconds(30);
 
 volatile std::sig_atomic_t running = 1;
 
@@ -39,14 +38,11 @@ void secure_clear(std::string& value) noexcept {
 }
 
 bool valid_alias(std::string_view alias) noexcept {
-    constexpr std::string_view prefix = "room.q2test.server";
-    if (alias.size() != prefix.size() + 2U || !alias.starts_with(prefix)) return false;
-    const auto suffix = alias.substr(prefix.size());
-    if (!std::isdigit(static_cast<unsigned char>(suffix[0])) ||
-        !std::isdigit(static_cast<unsigned char>(suffix[1]))) return false;
-    const unsigned number = static_cast<unsigned>(suffix[0] - '0') * 10U +
-                            static_cast<unsigned>(suffix[1] - '0');
-    return number >= 1U && number <= 40U;
+    if (alias.size() < 5U || alias.size() > 128U) return false;
+    if (!alias.starts_with("q2.") && !alias.starts_with("room.q2ded.")) return false;
+    return std::all_of(alias.begin(), alias.end(), [](unsigned char value) {
+        return std::isalnum(value) || value == '.' || value == '-' || value == '_';
+    });
 }
 
 bool valid_signal(std::string_view signal) noexcept {
@@ -81,13 +77,9 @@ bool read_ice(std::string& value) {
 }
 
 struct Options {
-    std::string alias;
+    std::vector<std::string> aliases;
     std::string signal = std::string(kDefaultSignal);
-};
-
-struct AliasConfirmation {
-    std::atomic_bool finished{false};
-    std::atomic_bool confirmed{false};
+    bool diagnostic_two_alias = false;
 };
 
 void emit_record(std::string_view line) noexcept {
@@ -100,19 +92,31 @@ void emit_record(std::string_view line) noexcept {
 bool parse_options(int argc, char** argv, Options& options) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
-        if (argument == "--alias" || argument == "--signal") {
+        if (argument == "--alias") {
             if (index + 1 >= argc) return false;
-            const std::string value(argv[++index]);
-            if (argument == "--alias") options.alias = value;
-            else options.signal = value;
+            if (options.aliases.size() >= 2U) return false;
+            options.aliases.emplace_back(argv[++index]);
+        } else if (argument == "--signal") {
+            if (index + 1 >= argc) return false;
+            options.signal = argv[++index];
+        } else if (argument == "--diagnostic-two-alias") {
+            options.diagnostic_two_alias = true;
         } else if (argument == "--help") {
-            emit_record("Usage: q2dz-controlled-peer --alias room.q2test.server01 [--signal URL]\n");
+            emit_record("Usage: q2dz-controlled-peer --alias q2.server01 [--signal URL]\n"
+                        "       q2dz-controlled-peer --diagnostic-two-alias --alias q2.server01"
+                        " --alias q2.server02 [--signal URL]\n");
             return false;
         } else {
             return false;
         }
     }
-    return valid_alias(options.alias) && valid_signal(options.signal);
+    const bool alias_count_valid = options.diagnostic_two_alias ? options.aliases.size() == 2U
+                                                                : options.aliases.size() == 1U;
+    const bool aliases_distinct = options.aliases.size() < 2U || options.aliases[0] != options.aliases[1];
+    return alias_count_valid && aliases_distinct &&
+           std::all_of(options.aliases.begin(), options.aliases.end(),
+                       [](const std::string& alias) { return valid_alias(alias); }) &&
+           valid_signal(options.signal);
 }
 
 void emit_fatal(std::string_view code) {
@@ -122,9 +126,9 @@ void emit_fatal(std::string_view code) {
     emit_record(line);
 }
 
-void emit_ready(const Options& options, PeerId peer) {
+void emit_ready(std::string_view alias, PeerId peer) {
     std::string line = "{\"event\":\"ready\",\"alias\":\"";
-    line += options.alias;
+    line += alias;
     line += "\",\"peer\":";
     line += std::to_string(peer);
     line += "}\n";
@@ -132,9 +136,22 @@ void emit_ready(const Options& options, PeerId peer) {
 }
 
 void emit_request(const Options& options, std::string_view kind, PeerId peer, int length) {
-    std::string line = "{\"event\":\"request\",\"alias\":\"";
-    line += options.alias;
-    line += "\",\"kind\":\"";
+    std::string line = "{\"event\":\"request\",";
+    if (options.aliases.size() == 1U) {
+        line += "\"alias\":\"";
+        line += options.aliases.front();
+        line += "\"";
+    } else {
+        line += "\"aliases\":[";
+        for (std::size_t index = 0; index != options.aliases.size(); ++index) {
+            if (index != 0U) line += ',';
+            line += "\"";
+            line += options.aliases[index];
+            line += "\"";
+        }
+        line += "]";
+    }
+    line += ",\"kind\":\"";
     line += kind;
     line += "\",\"peer\":";
     line += std::to_string(peer);
@@ -145,7 +162,8 @@ void emit_request(const Options& options, std::string_view kind, PeerId peer, in
 }
 
 std::string server_status(const Options& options) {
-    std::string server = options.alias.substr(options.alias.size() - 2U);
+    const std::string& alias = options.aliases.front();
+    std::string server = alias.substr(alias.size() - 2U);
     return std::string("\xff\xff\xff\xffprint\n") +
            "\\hostname\\server" + server + "\\game\\3zb2\\gamedir\\3zb2" +
            "\\mapname\\q2dm1\\levelname\\q2dm1\\protocol\\35" +
@@ -163,6 +181,12 @@ std::string_view oob_command(const std::array<unsigned char, kMaxDatagram>& pack
     while (end < length && packet[end] != '\n') ++end;
     while (end > 4U && (packet[end - 1U] == '\r' || packet[end - 1U] == '\0')) --end;
     return std::string_view(reinterpret_cast<const char*>(packet.data() + 4U), end - 4U);
+}
+
+bool aliases_registered(const Options& options) {
+    return std::all_of(options.aliases.begin(), options.aliases.end(), [](const std::string& alias) {
+        return humblenet_p2p_is_alias_registered(alias.c_str()) != 0;
+    });
 }
 
 }  // namespace
@@ -198,58 +222,44 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, stop);
     std::signal(SIGTERM, stop);
     const std::string status = server_status(options);
+    const auto alias_ready_deadline = std::chrono::steady_clock::now() + kAliasReadyTimeout;
     PeerId own_peer = 0;
     bool registration_requested = false;
-    bool alias_query_started = false;
-    const auto confirmation = std::make_shared<AliasConfirmation>();
     bool ready_emitted = false;
     std::uint64_t request_count = 0;
     int exit_code = 0;
 
     while (running != 0) {
         (void)humblenet_p2p_wait(100);
-        if (own_peer == 0) {
-            own_peer = humblenet_p2p_get_my_peer_id();
-        }
+        own_peer = humblenet_p2p_get_my_peer_id();
         if (own_peer != 0 && !registration_requested) {
-            if (!humblenet_p2p_register_alias(options.alias.c_str())) {
-                emit_fatal("alias_registration_failed");
-                exit_code = 1;
-                break;
+            for (const auto& alias : options.aliases) {
+                if (!humblenet_p2p_register_alias(alias.c_str())) {
+                    emit_fatal("alias_registration_failed");
+                    exit_code = 1;
+                    break;
+                }
             }
+            if (exit_code != 0) break;
             registration_requested = true;
         }
-        if (registration_requested && !alias_query_started) {
-            const std::string query = "=" + options.alias;
-            const std::string expected_alias = options.alias;
-            const PeerId expected_peer = own_peer;
-            alias_query_started = humblenet_p2p_alias_query(
-                query.c_str(), [confirmation, expected_alias, expected_peer](
-                    std::vector<std::pair<std::string, PeerId>> matches) {
-                    const bool confirmed = matches.size() == 1U &&
-                        matches.front().first == expected_alias &&
-                        matches.front().second == expected_peer;
-                    confirmation->confirmed.store(confirmed, std::memory_order_release);
-                    confirmation->finished.store(true, std::memory_order_release);
-                });
-            if (!alias_query_started) {
-                emit_fatal("alias_query_failed");
+        if (registration_requested && !ready_emitted) {
+            if (aliases_registered(options)) {
+                own_peer = humblenet_p2p_get_my_peer_id();
+                if (own_peer != 0) {
+                    ready_emitted = true;
+                    for (const auto& alias : options.aliases) emit_ready(alias, own_peer);
+                }
+            }
+        }
+        if (!ready_emitted) {
+            if (std::chrono::steady_clock::now() >= alias_ready_deadline) {
+                emit_fatal("alias_registration_timeout");
                 exit_code = 1;
                 break;
             }
+            continue;
         }
-        const bool alias_query_finished = confirmation->finished.load(std::memory_order_acquire);
-        const bool alias_confirmed = confirmation->confirmed.load(std::memory_order_acquire);
-        if (alias_query_finished && !alias_confirmed) {
-            emit_fatal("alias_confirmation_failed");
-            exit_code = 1;
-            break;
-        }
-        if (alias_query_finished && alias_confirmed && !ready_emitted) {
-            ready_emitted = true;
-            emit_ready(options, own_peer);
-        }
-        if (!ready_emitted) continue;
 
         for (unsigned packet = 0; packet != 64U; ++packet) {
             std::array<unsigned char, kMaxDatagram> buffer{};
@@ -278,7 +288,7 @@ int main(int argc, char** argv) {
 
     humblenet_shutdown();
     std::string stopped = "{\"event\":\"stopped\",\"alias\":\"";
-    stopped += options.alias;
+    stopped += options.aliases.front();
     stopped += "\",\"requests\":";
     stopped += std::to_string(request_count);
     stopped += "}\n";

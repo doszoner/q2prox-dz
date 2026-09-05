@@ -1,6 +1,5 @@
 #include "common.hpp"
 #include "content.hpp"
-#include "alias_query_mailbox.hpp"
 #include "gateway_options.h"
 #include "multiroom_state.hpp"
 #include "json.hpp"
@@ -17,7 +16,6 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 #include <string_view>
 #include <vector>
 
@@ -325,27 +323,6 @@ static void test_hub_queue_capacity() {
     assert(bounded.queued_line_count() == 0);
 }
 
-static void test_exact_alias_match() {
-    const std::vector<std::pair<std::string, q2dz::RemotePeerId>> one = {
-        {"q2.alpha", 701}
-    };
-    const auto resolved = q2dz::select_exact_alias_match("q2.alpha", one);
-    assert(resolved && resolved.value() == 701);
-
-    const auto missing = q2dz::select_exact_alias_match(
-        "q2.alpha", {{"q2.other", 701}});
-    assert(!missing && missing.error().message == "alias_not_found");
-    const auto zero = q2dz::select_exact_alias_match(
-        "q2.alpha", {{"q2.alpha", 0}});
-    assert(!zero && zero.error().message == "alias_not_found");
-    const auto ambiguous = q2dz::select_exact_alias_match(
-        "q2.alpha", {{"q2.alpha", 701}, {"q2.alpha", 702}});
-    assert(!ambiguous && ambiguous.error().message == "alias_ambiguous");
-    const auto mismatched = q2dz::select_exact_alias_match(
-        "q2.alpha", {{"q2.alpha.extra", 701}, {"q2.other", 702}});
-    assert(!mismatched && mismatched.error().message == "alias_not_found");
-}
-
 static void test_probe_ack_routing() {
     assert(!q2dz::probe_ack_is_outstanding(false, 0));
     assert(!q2dz::probe_ack_is_outstanding(false, 17));
@@ -353,46 +330,7 @@ static void test_probe_ack_routing() {
     assert(q2dz::probe_ack_is_outstanding(true, 17));
 }
 
-static void test_resolution_action_order() {
-    assert(q2dz::resolution_action(100, 100, true, true) ==
-           q2dz::ResolutionAction::timeout);
-    assert(q2dz::resolution_action(99, 100, true, true) ==
-           q2dz::ResolutionAction::wait_for_alias_callback);
-    assert(q2dz::resolution_action(99, 100, false, false) ==
-           q2dz::ResolutionAction::wait_for_peer);
-    assert(q2dz::resolution_action(99, 100, false, true) ==
-           q2dz::ResolutionAction::query_alias);
-}
-
-static void test_alias_query_mailbox() {
-    q2dz::AliasQueryMailbox mailbox;
-    std::thread callback([&mailbox] {
-        for (std::size_t index = 0;
-             index != q2dz::AliasQueryMailbox::max_results + 1U; ++index) {
-            q2dz::AliasQueryResult result;
-            result.target_id = index == 0 ? 17U : static_cast<q2dz::TargetId>(index);
-            result.resolution_token = index == 0 ? 42U : static_cast<std::uint64_t>(index);
-            result.alias = index == 0 ? "q2.alpha" : "q2.other";
-            if (index == 0) result.matches.emplace_back("q2.alpha", 701U);
-            static_cast<void>(mailbox.push(std::move(result)));
-        }
-    });
-    callback.join();
-
-    assert(mailbox.size() == q2dz::AliasQueryMailbox::max_results);
-    const auto batch = mailbox.drain();
-    assert(batch.overflowed);
-    assert(batch.results.size() == q2dz::AliasQueryMailbox::max_results);
-    assert(batch.results.front().target_id == 17U);
-    assert(batch.results.front().resolution_token == 42U);
-    assert(batch.results.front().alias == "q2.alpha");
-    assert(batch.results.front().matches.size() == 1);
-    assert(batch.results.front().matches.front().second == 701U);
-    const auto empty = mailbox.drain();
-    assert(!empty.overflowed && empty.results.empty());
-}
-
-static void test_multiroom_state_red() {
+static void test_multiroom_state_virtual_routing() {
     q2dz::MultiroomState state;
     assert(state.put(11, 27911));
     assert(state.put(12, 27912));
@@ -403,12 +341,30 @@ static void test_multiroom_state_red() {
     assert(state.find(12) != nullptr);
     assert(state.find(11)->udp_port != state.find(12)->udp_port);
 
-    assert(state.bind_peer(11, 101));
-    assert(state.bind_peer(12, 102));
-    assert(!state.bind_peer(13, 101));
+    constexpr q2dz::RemotePeerId route_a = 0x80000001U;
+    constexpr q2dz::RemotePeerId route_b = 0x80000002U;
+    assert(state.bind_route_peer(11, route_a));
+    assert(!state.bind_route_peer(12, route_b));
+    assert(state.find(11)->route_peer == route_a);
+    assert(state.find(11)->concrete_peer == 0);
+    assert(state.find(12)->route_peer == 0);
+    assert(state.route_inbound(route_a, 64).value() == 11);
+    assert(state.route_outbound(
+               11, q2dz::UdpSource{htonl(INADDR_LOOPBACK), htons(31011)}, 64, 1400)
+               .value() == route_a);
+
+    assert(state.reserve_concrete_peer(11, 101));
+    assert(state.bind_route_peer(12, route_b));
+    assert(state.reserve_concrete_peer(12, 102));
+    assert(!state.bind_route_peer(13, 103));
+    assert(state.find(13)->route_peer == 0);
+    assert(!state.bind_route_peer(13, route_a));
+    assert(state.bind_route_peer(13, 0x80000003U));
+    assert(!state.reserve_concrete_peer(13, 101));
     assert(state.find(13)->failure_code == "duplicate_remote_peer");
-    assert(state.target_for_peer(101).value() == 11);
-    assert(state.target_for_peer(102).value() == 12);
+    assert(state.find(11)->concrete_peer == 101);
+    assert(state.target_for_peer(route_a).value() == 11);
+    assert(state.target_for_peer(route_b).value() == 12);
 
     const q2dz::UdpSource first{htonl(INADDR_LOOPBACK), htons(31011)};
     const q2dz::UdpSource second{htonl(INADDR_LOOPBACK), htons(31012)};
@@ -421,13 +377,13 @@ static void test_multiroom_state_red() {
     assert(state.find(11)->counters.second_udp_source_drops == 1);
     assert(state.find(12)->counters.second_udp_source_drops == 1);
 
-    assert(state.route_inbound(101, 64).value() == 11);
+    assert(state.route_inbound(route_a, 64).value() == 11);
     assert(state.route_inbound(999, 64) == std::nullopt);
     assert(state.counters().unknown_peer_drops == 1);
     state.record_udp_to_webrtc(11, 64);
     state.record_webrtc_to_udp(11, 48);
     state.record_udp_to_webrtc(11, 64);
-    assert(state.find(11)->counters.udp_to_webrtc == 2);
+    assert(state.find(11)->counters.udp_to_webrtc == 3);
     assert(state.find(11)->counters.webrtc_to_udp == 1);
     assert(state.find(11)->counters.max_udp_to_transport_datagram == 64);
     assert(state.find(11)->counters.max_transport_to_udp_datagram == 48);
@@ -436,11 +392,30 @@ static void test_multiroom_state_red() {
     assert(state.find(11) == nullptr);
     assert(state.find(12) != nullptr);
     assert(state.find(13) != nullptr);
-    assert(state.target_for_peer(101) == std::nullopt);
-    assert(state.route_inbound(101, 64) == std::nullopt);
+    assert(state.target_for_peer(route_a) == std::nullopt);
+    assert(state.route_inbound(route_a, 64) == std::nullopt);
     assert(state.find(12)->counters.udp_to_webrtc == 0);
     assert(!state.drop(11));
-    assert(!state.bind_peer(999, 103));
+    assert(!state.bind_route_peer(999, 0x80000004U));
+}
+
+static void test_gateway_resolution_deadline_contract() {
+    const auto source_path = fs::path(__FILE__).parent_path() /
+        "../transport/q2_doszone_gateway.cpp";
+    std::ifstream input(source_path, std::ios::binary);
+    assert(input);
+    const std::string source((std::istreambuf_iterator<char>(input)), {});
+    assert(source.find("runtime.resolve_deadline = 0;") != std::string::npos);
+    assert(source.find("kResolveTimeoutMs = 30'000U") != std::string::npos);
+    const auto bind = source.find("state_.bind_route_peer(id, route_peer)");
+    assert(bind != std::string::npos);
+    const auto deadline = source.find("runtime->second.resolve_deadline =", bind);
+    assert(deadline != std::string::npos);
+    assert(source.find("q2dz::monotonic_millis() + kResolveTimeoutMs", deadline) !=
+           std::string::npos);
+    assert(source.find(
+               "state_target->route_peer != 0 && runtime->second.resolve_deadline != 0") !=
+           std::string::npos);
 }
 
 static void test_content() {
@@ -518,11 +493,9 @@ int main() {
     test_hub_command_move_wipes_source();
     test_short_payload_formatter();
     test_hub_queue_capacity();
-    test_exact_alias_match();
     test_probe_ack_routing();
-    test_resolution_action_order();
-    test_alias_query_mailbox();
-    test_multiroom_state_red();
+    test_multiroom_state_virtual_routing();
+    test_gateway_resolution_deadline_contract();
     test_content();
     test_child_environment_scrubs_credential_names();
     std::cout << "q2dz unit tests: PASS\n";

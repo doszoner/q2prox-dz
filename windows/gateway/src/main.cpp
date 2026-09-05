@@ -54,6 +54,12 @@ constexpr char page_ready[] =
     "{\"type\":\"state\",\"value\":\"page-ready\",\"reason\":\"\"}";
 std::atomic<HWND> gateway_window{nullptr};
 
+std::string_view transport_failure_stage(std::string_view reason) noexcept {
+    if (reason == "peer_bind_failed" || reason == "alias_timeout" ||
+        reason == "duplicate_remote_peer") return "resolve";
+    return "transport";
+}
+
 BOOL WINAPI console_control_handler(DWORD event) {
     if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT &&
         event != CTRL_CLOSE_EVENT) return FALSE;
@@ -958,7 +964,9 @@ private:
             }
             const bool was_legacy = legacy_mode_;
             if (state->value == "room-closed") emit_closed(state->target_id, state->reason);
-            else if (state->value == "failed") emit_failed(state->target_id, "transport", state->reason);
+            else if (state->value == "failed") {
+                emit_failed(state->target_id, transport_failure_stage(state->reason), state->reason);
+            }
             close_target(state->target_id);
             if (was_legacy && state->value == "failed") {
                 failed_ = true;
@@ -985,7 +993,7 @@ private:
                 return;
             }
             if (const auto reason = parse_transport_failed_reason(message)) {
-                emit_failed(1, "transport", *reason);
+                emit_failed(1, transport_failure_stage(*reason), *reason);
                 close_target(1);
                 failed_ = true;
                 exit_code_ = 2;

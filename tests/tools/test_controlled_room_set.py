@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 HARNESS = Path(__file__).with_name("controlled-room-set.py")
+CONTROLLED_PEER = Path(__file__).with_name("q2dz-controlled-peer.cpp")
 OOB = b"\xff\xff\xff\xff"
 ICE = b'[{"urls":["stun:example.invalid"]}]\n'
 
@@ -47,19 +48,23 @@ def _write_fake_peer(directory: Path, body: str) -> Path:
     return path
 
 
-def _run_webrtc_process(peer_binary: Path, count: int = 1) -> subprocess.Popen[str]:
+def _run_webrtc_process(
+    peer_binary: Path,
+    count: int = 1,
+    mode: str = "webrtc",
+    duration: float | None = None,
+    alias_prefix: str | None = None,
+) -> subprocess.Popen[str]:
+    command = [sys.executable, str(HARNESS), mode]
+    if mode == "webrtc":
+        command.extend(["--count", str(count)])
+    if alias_prefix is not None:
+        command.extend(["--alias-prefix", alias_prefix])
+    command.extend(["--peer-binary", str(peer_binary), "--ready-timeout", "2"])
+    if duration is not None:
+        command.extend(["--duration", str(duration)])
     process = subprocess.Popen(
-        [
-            sys.executable,
-            str(HARNESS),
-            "webrtc",
-            "--count",
-            str(count),
-            "--peer-binary",
-            str(peer_binary),
-            "--ready-timeout",
-            "2",
-        ],
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -189,7 +194,14 @@ def _run_stopped_timeout_regression() -> None:
     class FakeHarness:
         last: "FakeHarness | None" = None
 
-        def __init__(self, _count: int, _binary: str, _signal: str, evidence: FakeEvidence) -> None:
+        def __init__(
+            self,
+            _count: int,
+            _binary: str,
+            _signal: str,
+            evidence: FakeEvidence,
+            _alias_prefix: str = "room.q2test.server",
+        ) -> None:
             self.ready: dict[str, int] = {}
             self.count = 1
             self.evidence = evidence
@@ -249,6 +261,217 @@ def _run_queue_overflow_regression() -> None:
     assert harness.failure_code() == "child_event_queue_overflow"
 
 
+def _run_controlled_peer_readiness_contract_regression() -> None:
+    source = CONTROLLED_PEER.read_text(encoding="utf-8")
+    assert "humblenet_p2p_is_alias_registered(" in source
+    assert "humblenet_p2p_alias_query" not in source
+    assert '\\"aliases\\":[' in source
+    assert "std::chrono::steady_clock" in source
+    assert "alias_registration_timeout" in source
+    assert source.count("own_peer = humblenet_p2p_get_my_peer_id();") >= 2
+
+
+def _run_two_alias_diagnostic_regression() -> None:
+    peer_source = CONTROLLED_PEER.read_text(encoding="utf-8")
+    assert "--diagnostic-two-alias" in peer_source
+
+    spec = importlib.util.spec_from_file_location("controlled_room_set_two_alias", HARNESS)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeProcess:
+        def __init__(self, output: bytes) -> None:
+            self.stdout = io.BytesIO(output)
+
+    class NoopEvidence:
+        def emit(self, _event: dict[str, object]) -> None:
+            return
+
+    first = "room.q2test.server01"
+    second = "room.q2test.server02"
+    assert module._safe_child_event(
+        [first, second],
+        json.dumps(
+            {"event": "request", "alias": first, "kind": "ping", "peer": 9, "bytes": 8},
+            separators=(",", ":"),
+        ).encode("ascii"),
+    ) is None
+    output = "\n".join(
+        [
+            json.dumps({"event": "ready", "alias": first, "peer": 7}, separators=(",", ":")),
+            json.dumps({"event": "ready", "alias": second, "peer": 7}, separators=(",", ":")),
+            json.dumps({"event": "request", "aliases": [first, second], "kind": "ping", "peer": 9, "bytes": 8}, separators=(",", ":")),
+            json.dumps({"event": "request", "aliases": [first, second], "kind": "status", "peer": 9, "bytes": 9}, separators=(",", ":")),
+        ]
+    ).encode("ascii") + b"\n"
+    diagnostic = module.PeerHarness(
+        1,
+        "/bin/true",
+        module.DEFAULT_SIGNAL,
+        NoopEvidence(),
+        alias_groups=[[first, second]],
+    )
+    diagnostic._read_output([first, second], FakeProcess(output))
+    diagnostic._apply_events()
+    assert diagnostic.ready == {first: 7, second: 7}
+    assert diagnostic.group_stats[(first, second)] == {
+        "bytes": 17,
+        "ping": 1,
+        "requests": 2,
+        "status": 1,
+    }
+    assert diagnostic.stats[first]["requests"] == 0
+    assert diagnostic.stats[second]["requests"] == 0
+
+    mismatched = module.PeerHarness(
+        1,
+        "/bin/true",
+        module.DEFAULT_SIGNAL,
+        NoopEvidence(),
+        alias_groups=[[first, second]],
+    )
+    mismatched._read_output([first, second], FakeProcess(
+        "\n".join(
+            [
+                json.dumps({"event": "ready", "alias": first, "peer": 7}, separators=(",", ":")),
+                json.dumps({"event": "ready", "alias": second, "peer": 8}, separators=(",", ":")),
+            ]
+        ).encode("ascii") + b"\n"
+    ))
+    try:
+        mismatched._apply_events()
+    except RuntimeError as error:
+        assert str(error) == "controlled peer aliases changed identity"
+    else:
+        raise AssertionError("diagnostic aliases must share one peer identity")
+
+    ordinary = module.PeerHarness(2, "/bin/true", module.DEFAULT_SIGNAL, NoopEvidence())
+    ordinary._read_output(first, FakeProcess(
+        (json.dumps({"event": "ready", "alias": first, "peer": 7}, separators=(",", ":")) + "\n").encode("ascii")
+    ))
+    ordinary._read_output(second, FakeProcess(
+        (json.dumps({"event": "ready", "alias": second, "peer": 7}, separators=(",", ":")) + "\n").encode("ascii")
+    ))
+    try:
+        ordinary._apply_events()
+    except RuntimeError as error:
+        assert str(error) == "duplicate controlled peer id"
+    else:
+        raise AssertionError("ordinary peers must retain duplicate identity rejection")
+
+
+def _run_two_alias_diagnostic_process_regression(directory: Path) -> None:
+    expected_command = [
+        "--diagnostic-two-alias",
+        "--alias",
+        "room.q2test.server01",
+        "--alias",
+        "room.q2test.server02",
+        "--signal",
+        "wss://net.js-dos.com:444",
+    ]
+    fake_peer = _write_fake_peer(
+        directory,
+        "import json\n"
+        "import sys\n"
+        "import time\n"
+        f"if sys.argv[1:] != {expected_command!r}: raise SystemExit(3)\n"
+        "sys.stdin.buffer.readline()\n"
+        "for alias in (\"room.q2test.server01\", \"room.q2test.server02\"):\n"
+        "    print(json.dumps({\"event\": \"ready\", \"alias\": alias, \"peer\": 7}, separators=(\",\", \":\")), flush=True)\n"
+        "for kind, size in [(\"ping\", 8), (\"status\", 9)]:\n"
+        "    print(json.dumps({\"event\": \"request\", \"aliases\": [\"room.q2test.server01\", \"room.q2test.server02\"], \"kind\": kind, \"peer\": 9, \"bytes\": size}, separators=(\",\", \":\")), flush=True)\n"
+        "time.sleep(60)\n",
+    )
+    process = _run_webrtc_process(fake_peer, mode="webrtc-two-alias", duration=0.2)
+    try:
+        assert process.stdout is not None
+        started = read_line(process.stdout)
+        assert started["event"] == "started"
+        output, error = process.communicate(timeout=5)
+        events = _parse_events(json.dumps(started, sort_keys=True, separators=(",", ":")) + "\n" + output)
+        assert process.returncode == 0
+        assert not error
+        assert {event.get("alias") for event in events if event.get("event") == "peer_ready"} == {
+            "room.q2test.server01",
+            "room.q2test.server02",
+        }
+        stats = [event for event in events if event.get("event") == "peer_stats"]
+        assert stats and "targets" not in stats[-1]
+        assert stats and stats[-1]["groups"] == [{
+            "aliases": ["room.q2test.server01", "room.q2test.server02"],
+            "bytes": 17,
+            "ping": 1,
+            "requests": 2,
+            "status": 1,
+        }]
+        assert [
+            event for event in events
+            if event.get("event") == "ready" and event.get("mode") == "webrtc-two-alias"
+        ] == [
+            {
+                "aliases": ["room.q2test.server01", "room.q2test.server02"],
+                "event": "ready",
+                "mode": "webrtc-two-alias",
+                "peer_count": 1,
+                "target_count": 2,
+            }
+        ]
+        stopped = [event for event in events if event.get("event") == "stopped"]
+        assert stopped and stopped[-1] == {
+            "children_alive": 0,
+            "cleanup": "complete",
+            "event": "stopped",
+            "mode": "webrtc-two-alias",
+        }
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _run_alias_prefix_process_regression(directory: Path) -> None:
+    expected_command = [
+        "--alias",
+        "room.q2ded.server01",
+        "--signal",
+        "wss://net.js-dos.com:444",
+    ]
+    fake_peer = _write_fake_peer(
+        directory,
+        "import json\n"
+        "import sys\n"
+        "import time\n"
+        f"if sys.argv[1:] != {expected_command!r}: raise SystemExit(3)\n"
+        "sys.stdin.buffer.readline()\n"
+        "print(json.dumps({\"event\": \"ready\", \"alias\": \"room.q2ded.server01\", \"peer\": 7}, separators=(\",\", \":\")), flush=True)\n"
+        "time.sleep(60)\n",
+    )
+    process = _run_webrtc_process(
+        fake_peer,
+        count=1,
+        duration=0.2,
+        alias_prefix="room.q2ded.server",
+    )
+    try:
+        assert process.stdout is not None
+        started = read_line(process.stdout)
+        assert started["event"] == "started"
+        output, error = process.communicate(timeout=5)
+        events = _parse_events(json.dumps(started, sort_keys=True, separators=(",", ":")) + "\n" + output)
+        assert process.returncode == 0
+        assert not error
+        assert [event.get("alias") for event in events if event.get("event") == "peer_ready"] == [
+            "room.q2ded.server01"
+        ]
+        _assert_stopped(events)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def main() -> int:
     process = subprocess.Popen(
         [sys.executable, str(HARNESS), "source", "--count", "40", "--duration", "10"],
@@ -297,8 +520,12 @@ def main() -> int:
             _run_sigterm_regression(directory)
             _run_overlong_line_regression(directory)
             _run_readiness_timeout_regression(directory)
+            _run_two_alias_diagnostic_process_regression(directory)
+            _run_alias_prefix_process_regression(directory)
         _run_stopped_timeout_regression()
         _run_queue_overflow_regression()
+        _run_controlled_peer_readiness_contract_regression()
+        _run_two_alias_diagnostic_regression()
         print("controlled-room-set source self-check: PASS")
         return 0
     finally:

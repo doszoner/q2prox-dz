@@ -37,30 +37,16 @@ struct DatagramCounters {
 struct Target {
     TargetId id = 0;
     std::uint16_t udp_port = 0;
-    RemotePeerId remote_peer = 0;
+    RemotePeerId route_peer = 0;
+    RemotePeerId concrete_peer = 0;
     TargetState state = TargetState::resolving;
     std::optional<UdpSource> captured_source;
     std::string failure_code;
     DatagramCounters counters;
 };
 
-Result<RemotePeerId> select_exact_alias_match(
-    std::string_view alias,
-    const std::vector<std::pair<std::string, RemotePeerId>>& matches);
-
 [[nodiscard]] bool probe_ack_is_outstanding(
     bool is_ack, std::uint64_t probe_sent_at) noexcept;
-
-enum class ResolutionAction {
-    timeout,
-    wait_for_alias_callback,
-    wait_for_peer,
-    query_alias,
-};
-
-[[nodiscard]] ResolutionAction resolution_action(
-    std::uint64_t now, std::uint64_t resolve_deadline,
-    bool alias_query_pending, bool peer_ready) noexcept;
 
 class MultiroomState {
 public:
@@ -68,7 +54,8 @@ public:
 
     [[nodiscard]] Result<void> put(TargetId id, std::uint16_t udp_port);
     [[nodiscard]] bool drop(TargetId id) noexcept;
-    [[nodiscard]] bool bind_peer(TargetId id, RemotePeerId peer);
+    [[nodiscard]] bool bind_route_peer(TargetId id, RemotePeerId route_peer);
+    [[nodiscard]] bool reserve_concrete_peer(TargetId id, RemotePeerId concrete_peer);
     [[nodiscard]] bool mark_probing(TargetId id) noexcept;
     [[nodiscard]] bool mark_ready(TargetId id) noexcept;
     [[nodiscard]] bool mark_closed(TargetId id, std::string reason);
@@ -95,7 +82,8 @@ public:
 
 private:
     std::unordered_map<TargetId, Target> targets_;
-    std::unordered_map<RemotePeerId, TargetId> peers_;
+    std::unordered_map<RemotePeerId, TargetId> route_peers_;
+    std::unordered_map<RemotePeerId, TargetId> concrete_peers_;
     DatagramCounters counters_;
 };
 
