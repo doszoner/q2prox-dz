@@ -32,6 +32,7 @@ FILES = {
     "CHANGELOG.md": REPO / "CHANGELOG.md",
     "INSTALLATION.md": REPO / "INSTALLATION.md",
     "README.md": REPO / "README.md",
+    "docs/RELEASE.md": REPO / "docs/RELEASE.md",
     "tests/tools/controlled-room-set.py": REPO / "tests/tools/controlled-room-set.py",
     f"q2prox-dz-{VERSION}-linux-x86_64.tar.gz": REPO
     / "linux/dist"
