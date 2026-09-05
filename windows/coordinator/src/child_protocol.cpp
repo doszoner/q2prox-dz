@@ -456,6 +456,7 @@ ParseResult parse_v1_event(std::string_view line) {
 }
 
 ParseResult parse_v2_event(std::string_view line) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.remove_suffix(1);
     if (line.empty() || line.size() > max_hub_line_bytes || !valid_utf8(line) || has_forbidden_control(line) || !line.starts_with(hub_prefix)) {
         return {{}, "invalid HUB/2 event framing"};
     }
@@ -665,6 +666,7 @@ bool HubCommandFramer::feed(std::string_view bytes) {
         }
         if (pending_.size() > max_line_bytes || newline > max_line_bytes - pending_.size()) return fail(Error::line_too_long);
         pending_.append(bytes.data(), newline);
+        if (!pending_.empty() && pending_.back() == '\r') pending_.pop_back();
         bytes.remove_prefix(newline + 1U);
         if (!enqueue(std::move(pending_))) return fail(Error::queue_overflow);
         pending_.clear();

@@ -82,7 +82,32 @@ function Assert-ProcessAlive([int]$processId, [string]$label) {
 
 function Room-Json([string]$id) {
   '{"version":1,"roomId":"' + $id + '","alias":"q2.' + $id +
-    '","ordered":false,"iceServers":[],"credential":"q2dz-test-canary-' + $id + '"}'
+    '","ordered":false,"iceServers":[],"map":"q2dm1","game":"3zb2"}'
+}
+
+function Case-Diagnostics([object]$case) {
+  $markers = @()
+  if (Test-Path -LiteralPath $case.Dir) {
+    $markers = Get-ChildItem -LiteralPath $case.Dir -Filter '*.marker' -ErrorAction SilentlyContinue |
+      Sort-Object Name |
+      ForEach-Object {
+        $value = ''
+        try { $value = (Get-Content -LiteralPath $_.FullName -Raw).Trim() } catch { }
+        "$($_.Name)=$value"
+      }
+  }
+  $exit = if ($case.Process.HasExited) { [string]$case.Process.ExitCode } else { 'running' }
+  if (-not $case.Process.HasExited) {
+    try { $case.Process.StandardInput.Close() } catch { }
+    $case.Process.WaitForExit(3000) | Out-Null
+  }
+  $stderr = ''
+  $stdout = ''
+  if ($case.Process.HasExited) {
+    try { $stderr = $case.Process.StandardError.ReadToEnd().Trim() } catch { }
+    try { $stdout = $case.Process.StandardOutput.ReadToEnd().Trim() } catch { }
+  }
+  return "case=$($case.Name) coordinator=$exit markers=[$($markers -join '; ')] stderr=[$stderr] stdout=[$stdout]"
 }
 
 function Send-Command([Diagnostics.Process]$process, [string]$line) {
@@ -101,6 +126,17 @@ function Send-Ice([Diagnostics.Process]$process) {
 
 function Send-Put([Diagnostics.Process]$process, [string]$roomId) {
   Send-Command $process ('Q2DZ/ROOMS/2 PUT room=' + $roomId + ' json=' + (Room-Json $roomId))
+}
+
+function Retry-PutUntilGatewayCount([Diagnostics.Process]$process, [string]$dir, [string]$roomId,
+  [string]$count, [int]$timeoutMs = 10000) {
+  $deadline = [Environment]::TickCount + $timeoutMs
+  do {
+    Send-Put $process $roomId
+    if (Wait-MarkerValue $dir 'gateway-put-count' $count 100) { return $true }
+    Start-Sleep -Milliseconds 50
+  } while ([Environment]::TickCount -lt $deadline)
+  return $false
 }
 
 function Send-Drop([Diagnostics.Process]$process, [string]$roomId) {
@@ -250,9 +286,9 @@ try {
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $gatewayPid = Wait-GatewayPid $case.Dir
-  if (-not (Wait-SourceCount $source 1)) { throw 'source did not publish room A' }
+  if (-not (Wait-SourceCount $source 1)) { throw ('source did not publish room A; ' + (Case-Diagnostics $case)) }
   Send-Put $case.Process 'room-b'
-  if (-not (Wait-SourceCount $source 2)) { throw 'source did not publish room B' }
+  if (-not (Wait-SourceCount $source 2)) { throw ('source did not publish room B; ' + (Case-Diagnostics $case)) }
   Assert-ProcessAlive $gatewayPid 'shared gateway'
   Assert-ProcessAlive $q2Pid 'Q2'
   Send-Put $case.Process 'room-a'
@@ -376,18 +412,15 @@ try {
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '1')) { throw 'q2 recovery initial PUT missing' }
-  Send-Put $case.Process 'room-a'
-  if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '2')) { throw 'q2 recovery retry missing' }
+  if (-not (Retry-PutUntilGatewayCount $case.Process $case.Dir 'room-a' '2')) { throw 'q2 recovery retry missing' }
   Send-Put $case.Process 'room-a'
   Start-Sleep -Milliseconds 250
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '2')) { throw 'q2 recovery was unbounded' }
   if (-not (Wait-MarkerValue $case.Dir 'gateway-last-put-id' '2')) { throw 'q2 recovery did not replace target id' }
   Send-Put $case.Process 'room.q2ded.server'
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '3')) { throw 'q2ded initial PUT missing' }
-  Send-Put $case.Process 'room.q2ded.server'
-  if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '4')) { throw 'q2ded first retry missing' }
-  Send-Put $case.Process 'room.q2ded.server'
-  if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '5')) { throw 'q2ded second retry missing' }
+  if (-not (Retry-PutUntilGatewayCount $case.Process $case.Dir 'room.q2ded.server' '4')) { throw 'q2ded first retry missing' }
+  if (-not (Retry-PutUntilGatewayCount $case.Process $case.Dir 'room.q2ded.server' '5')) { throw 'q2ded second retry missing' }
   Send-Put $case.Process 'room.q2ded.server'
   Start-Sleep -Milliseconds 250
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '5')) { throw 'q2ded recovery was unbounded' }
@@ -404,10 +437,8 @@ try {
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '1')) { throw 'q2 CLOSED was retried' }
   Send-Put $case.Process 'room.q2ded.server'
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '2')) { throw 'q2ded CLOSED initial PUT missing' }
-  Send-Put $case.Process 'room.q2ded.server'
-  if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '3')) { throw 'q2ded CLOSED first retry missing' }
-  Send-Put $case.Process 'room.q2ded.server'
-  if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '4')) { throw 'q2ded CLOSED second retry missing' }
+  if (-not (Retry-PutUntilGatewayCount $case.Process $case.Dir 'room.q2ded.server' '3')) { throw 'q2ded CLOSED first retry missing' }
+  if (-not (Retry-PutUntilGatewayCount $case.Process $case.Dir 'room.q2ded.server' '4')) { throw 'q2ded CLOSED second retry missing' }
   Send-Put $case.Process 'room.q2ded.server'
   Start-Sleep -Milliseconds 250
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '4')) { throw 'q2ded CLOSED recovery was unbounded' }

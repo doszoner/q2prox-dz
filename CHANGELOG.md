@@ -33,6 +33,13 @@
 - Исправлено сохранение pending datagram state в WebRTC-NET, когда flush не
   смог передать пакет сразу; такие пакеты теперь остаются pending до следующей
   возможности отправки.
+- Windows coordinator теперь принимает CRLF-строки управления и terminal events
+  от PowerShell/child pipes без ложного protocol failure.
+- Windows lifecycle matrix больше не использует устаревшее поле
+  `credential` в тестовом `ROOMS/2 PUT` и устойчивее ждёт bounded recovery
+  после terminal events.
+- Windows release smoke проверяет текущий heartbeat-контракт launcher
+  (`ICE`/`DROP`/`PUT`) вместо удалённых старых helper-имён.
 
 ## [1.0.0-rc13] - 2026-09-03
 

@@ -348,7 +348,9 @@ private:
 
     void read_hub_bytes(std::string_view bytes, std::string &pending) {
         pending.append(bytes.data(), bytes.size());
-        while (const auto newline = pending.find('\n'); newline != std::string::npos) {
+        for (;;) {
+            const auto newline = pending.find('\n');
+            if (newline == std::string::npos) break;
             std::string line = pending.substr(0, newline);
             std::string remainder = pending.substr(newline + 1U);
             secure_clear(pending);

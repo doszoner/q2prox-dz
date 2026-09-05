@@ -156,6 +156,11 @@ void hub_framer_boundary_tests() {
     CHECK(cleared.feed("Q2DZ/HUB/2 STOP\npartial"));
     cleared.clear();
     CHECK(cleared.queued_line_count() == 0 && cleared.pending_byte_count() == 0);
+
+    q2dz::HubCommandFramer crlf;
+    CHECK(crlf.feed("Q2DZ/ROOMS/2 ICE generation=1 json=[]\r\n"));
+    const auto crlf_lines = crlf.drain();
+    CHECK(crlf_lines.size() == 1 && crlf_lines.front().view() == "Q2DZ/ROOMS/2 ICE generation=1 json=[]");
 }
 
 void hub_command_move_wipes_source_tests() {
@@ -180,6 +185,16 @@ void short_payload_formatter_tests() {
     command.id_or_generation = 42;
     command.json = {'{', '"', 'x', '"', ':', '1', '}'};
     CHECK(q2dz::format_hub_command(command) == "Q2DZ/HUB/2 PUT id=42 json={\"x\":1}");
+}
+
+void lifecycle_room_command_tests() {
+    q2dz::HubCommandParser rooms(q2dz::HubCommandChannel::rooms);
+    CHECK(rooms.parse("Q2DZ/ROOMS/2 ICE generation=1 json=[]").command.has_value());
+    const auto parsed = rooms.parse(
+        "Q2DZ/ROOMS/2 PUT room=room-a json={\"version\":1,\"roomId\":\"room-a\","
+        "\"alias\":\"q2.room-a\",\"ordered\":false,\"iceServers\":[],\"map\":\"q2dm1\","
+        "\"game\":\"3zb2\"}");
+    CHECK(parsed.command.has_value());
 }
 
 void hub_queue_capacity_tests() {
@@ -276,6 +291,12 @@ void framer_tests() {
     CHECK(legal.queued_line_count()==0);
     CHECK(legal.queued_byte_count()==0);
 
+    q2dz::ChildEventFramer hub_ready;
+    CHECK(hub_ready.feed("Q2DZ/HUB/2 READY id=1 udp=127.0.0.1:27911 peer=101\n"));
+    const auto hub_ready_events = hub_ready.drain();
+    CHECK(hub_ready_events.size() == 1);
+    CHECK(q2dz::parse_child_event(hub_ready_events.front()).event.has_value());
+
     q2dz::ChildEventFramer by_count;
     for (std::size_t i=0; i<q2dz::ChildEventFramer::max_queued_lines; ++i) {
         if (!by_count.feed("Q2DZ/1 HEARTBEAT\n")) break;
@@ -319,7 +340,7 @@ void session_safety_tests() {
 }
 
 int main() {
-    protocol_tests(); framer_tests(); shared_hub_fixture_red(); shared_hub_fixture(); hub_framer_boundary_tests(); hub_command_move_wipes_source_tests(); short_payload_formatter_tests(); hub_queue_capacity_tests(); session_safety_tests();
+    protocol_tests(); framer_tests(); shared_hub_fixture_red(); shared_hub_fixture(); hub_framer_boundary_tests(); hub_command_move_wipes_source_tests(); short_payload_formatter_tests(); lifecycle_room_command_tests(); hub_queue_capacity_tests(); session_safety_tests();
     if (failures) { std::cerr << failures << " test(s) failed\n"; return EXIT_FAILURE; }
     std::cout << "q2dz-core-tests: PASS\n";
     return EXIT_SUCCESS;

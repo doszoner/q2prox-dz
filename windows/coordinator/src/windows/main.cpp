@@ -263,6 +263,7 @@ private:
         for (auto lines = framer_.drain(); !lines.empty(); lines.pop_front()) {
             auto parsed = parser_.parse(lines.front().view());
             if (!parsed.command) {
+                std::cerr << "q2dz-session: control protocol error: " << parsed.error << '\n';
                 protocol_error_ = true;
                 clear_commands();
                 return;
@@ -868,7 +869,10 @@ bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTarge
     for (auto& line : gateway.events.drain()) {
         const auto parsed = gateway.event_parser.parse(line);
         secure_clear_string(line);
-        if (!parsed.event) return false;
+        if (!parsed.event) {
+            std::cerr << "q2dz-session: gateway event protocol error: " << parsed.error << '\n';
+            return false;
+        }
         const auto& event = *parsed.event;
         if (event.type == q2dz::ChildEventType::heartbeat) continue;
         const auto id_field = event.fields.find("id");

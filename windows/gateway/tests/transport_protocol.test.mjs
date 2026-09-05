@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import * as vm from "node:vm";
 
@@ -296,9 +297,10 @@ test("startup burst capacity admits ICE plus all bounded targets before page-rea
 test("native gateway exposes only the managed non-sensitive startup contract", () => {
   const source = readFileSync(new URL("../src/main.cpp", import.meta.url), "utf8");
   const cmake = readFileSync(new URL("../CMakeLists.txt", import.meta.url), "utf8");
-  const wasmSource = readFileSync(
-    new URL("../../../../WebRTC-NET-q2prox-shared/webrtcnet/src/main.cpp", import.meta.url),
-    "utf8");
+  const wasmSourcePath = process.env.WEBRTC_NET_SOURCE_DIR
+    ? join(process.env.WEBRTC_NET_SOURCE_DIR, "webrtcnet", "src", "main.cpp")
+    : new URL("../../../../WebRTC-NET-q2prox-shared/webrtcnet/src/main.cpp", import.meta.url);
+  const wasmSource = readFileSync(wasmSourcePath, "utf8");
   for (const option of ["--managed-session", "--udp-port", "--owner-handle", "--user-data-dir"]) {
     assert.match(source, new RegExp(option));
   }
