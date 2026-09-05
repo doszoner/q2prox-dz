@@ -14,6 +14,8 @@
 #include <vector>
 
 namespace {
+constexpr std::size_t max_source_endpoints = 256;
+
 std::wstring env(const wchar_t* name) {
     const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
     if (required == 0) return {};
@@ -116,7 +118,7 @@ bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
         std::string_view line = body.substr(start, end - start);
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         if (!line.empty()) {
-            if (!endpoint_line(line) || endpoints.size() == 2) return false;
+            if (!endpoint_line(line) || endpoints.size() == max_source_endpoints) return false;
             endpoints.emplace_back(line);
         }
         if (end_line == std::string_view::npos) break;
