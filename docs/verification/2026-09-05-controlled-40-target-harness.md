@@ -74,6 +74,40 @@ errors: 0
 final cleanup children_alive: 0
 ```
 
+## 60-second controlled resource smoke
+
+After the rc14 bundle refresh, the WebRTC controlled-peer harness was run once
+more for 60 seconds. This used public signaling and neutral
+`room.q2ded.testserverNN` aliases. It did not start Q2PRO-X or use the desktop.
+
+```bash
+python3 tests/tools/controlled-room-set.py webrtc \
+  --count 40 \
+  --peer-binary linux/build-release/q2dz-controlled-peer \
+  --duration 60 \
+  --evidence <temp>/evidence.jsonl
+```
+
+Result:
+
+```text
+status: PASS
+started target_count: 40
+peer_ready events: 40
+unique ready aliases: 40
+errors: 0
+final cleanup children_alive: 0
+stderr: empty
+resource samples: 12
+sample max RSS sum: 667.7 MiB
+sample max CPU sum: 562.3%
+```
+
+Boundary: this is a harness/process-fanout smoke. The high CPU sample is from
+forty separate controlled peer processes during startup/idle, not from one
+shared q2prox-dz gateway process. It does not replace the planned 30-minute
+shared-gateway resource gate.
+
 ## Boundary
 
 This evidence does not replace:
