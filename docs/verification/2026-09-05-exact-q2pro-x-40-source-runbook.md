@@ -66,19 +66,9 @@ In Q2PRO-X:
 Check the evidence:
 
 ```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
-
-path = Path('../noncommit/q2prox-dz-gates/manual-q2pro-40/source-events.jsonl')
-events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-status = [e for e in events if e.get('event') == 'udp_request' and e.get('command') == 'status']
-targets = {e.get('target') for e in status}
-sources = {e.get('source') for e in status}
-connect = [e for e in events if e.get('event') == 'udp_request' and e.get('command') in {'getchallenge', 'connect'}]
-print({'status_targets': len(targets), 'status_sources': sorted(sources), 'connect_events': connect})
-raise SystemExit(0 if len(targets) == 40 and len(sources) == 1 and connect else 1)
-PY
+python3 tests/tools/controlled-room-set.py source-check \
+  --count 40 \
+  --evidence ../noncommit/q2prox-dz-gates/manual-q2pro-40/source-events.jsonl
 ```
 
 ## Windows
@@ -102,8 +92,11 @@ logged-in user is not valid for this gate.
 
 5. In Q2PRO-X, open `Join online -> Custom`, press `Refresh`, select one row,
    press `Enter`, then exit.
-6. Run the same Python evidence check as in the Linux section, using
-   `source-events.jsonl`.
+6. Run:
+
+   ```cmd
+   python controlled-room-set.py source-check --count 40 --evidence source-events.jsonl
+   ```
 
 ## Notes
 

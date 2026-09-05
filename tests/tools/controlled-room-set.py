@@ -671,6 +671,41 @@ def webrtc_main(
         harness.close()
 
 
+def source_check_main(args: argparse.Namespace, evidence: Evidence) -> int:
+    del evidence
+    events: list[dict[str, Any]] = []
+    try:
+        with Path(args.evidence_file).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    events.append(json.loads(line))
+    except (OSError, json.JSONDecodeError) as error:
+        print(json.dumps({"result": "FAIL", "code": "invalid_evidence", "error": str(error)}, separators=(",", ":")))
+        return 1
+
+    requests = [event for event in events if event.get("event") == "udp_request"]
+    status = [event for event in requests if event.get("command") == "status"]
+    connect = [event for event in requests if event.get("command") in {"getchallenge", "connect"}]
+    status_targets = {target for event in status if isinstance((target := event.get("target")), str)}
+    status_sources = {source for event in status if isinstance((source := event.get("source")), str)}
+    connect_sources = {source for event in connect if isinstance((source := event.get("source")), str)}
+    ok = (
+        len(status_targets) == args.count
+        and len(status_sources) == 1
+        and bool(connect)
+        and connect_sources <= status_sources
+    )
+    result = {
+        "result": "PASS" if ok else "FAIL",
+        "expected_status_targets": args.count,
+        "status_targets": len(status_targets),
+        "status_sources": sorted(status_sources),
+        "connect_events": len(connect),
+    }
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0 if ok else 1
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -699,6 +734,10 @@ def _parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--ready-timeout", type=float, default=30.0)
     diagnostic.add_argument("--duration", type=_safe_duration)
     diagnostic.add_argument("--evidence", help="mirror JSONL evidence to this path")
+
+    source_check = subparsers.add_parser("source-check", help="check source-mode evidence")
+    source_check.add_argument("--count", type=_safe_count, default=MAX_TARGETS)
+    source_check.add_argument("--evidence", dest="evidence_file", required=True)
     return parser
 
 
@@ -709,10 +748,12 @@ def main() -> int:
         return 2
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
-    evidence = Evidence(args.evidence)
+    evidence = Evidence(getattr(args, "evidence", None))
     try:
         if args.mode == "source":
             return source_main(args, evidence)
+        if args.mode == "source-check":
+            return source_check_main(args, evidence)
         if args.mode == "webrtc-two-alias":
             return webrtc_main(args, evidence, alias_groups=[aliases(2, args.alias_prefix)])
         return webrtc_main(args, evidence)

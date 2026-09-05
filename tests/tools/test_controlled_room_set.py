@@ -472,6 +472,72 @@ def _run_alias_prefix_process_regression(directory: Path) -> None:
             process.wait(timeout=5)
 
 
+def _run_source_check_regression(directory: Path) -> None:
+    evidence = directory / "source-events.jsonl"
+    evidence.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "ready", "endpoint_count": 2}, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "event": "udp_request",
+                        "target": "server01",
+                        "source": "127.0.0.1:50000",
+                        "command": "status",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "event": "udp_request",
+                        "target": "server02",
+                        "source": "127.0.0.1:50000",
+                        "command": "status",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "event": "udp_request",
+                        "target": "server02",
+                        "source": "127.0.0.1:50000",
+                        "command": "getchallenge",
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "event": "udp_request",
+                        "target": "server02",
+                        "source": "127.0.0.1:50000",
+                        "command": "connect",
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ok = subprocess.run(
+        [sys.executable, str(HARNESS), "source-check", "--count", "2", "--evidence", str(evidence)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert ok.returncode == 0
+    assert '"result":"PASS"' in ok.stdout
+
+    bad = subprocess.run(
+        [sys.executable, str(HARNESS), "source-check", "--count", "3", "--evidence", str(evidence)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert bad.returncode == 1
+    assert '"result":"FAIL"' in bad.stdout
+
+
 def main() -> int:
     process = subprocess.Popen(
         [sys.executable, str(HARNESS), "source", "--count", "40", "--duration", "10"],
@@ -522,6 +588,7 @@ def main() -> int:
             _run_readiness_timeout_regression(directory)
             _run_two_alias_diagnostic_process_regression(directory)
             _run_alias_prefix_process_regression(directory)
+            _run_source_check_regression(directory)
         _run_stopped_timeout_regression()
         _run_queue_overflow_regression()
         _run_controlled_peer_readiness_contract_regression()
