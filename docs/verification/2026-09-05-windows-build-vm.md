@@ -75,14 +75,41 @@ SHA-256: 2263ac2bcf6f197041f095eb65f034db9e139a7fd5507f592b99498362cf3d2b
 
 ## Snapshot
 
-Актуальная стартовая точка должна хранить окружение, а не конкретный смысл
-текущего кода. Код в `C:\Users\user\q2prox-work\...\q2prox-dz` можно заменить
-новым checkout или свежей копией перед следующим прогоном.
+Актуальная стартовая точка хранит окружение, а не конкретный смысл текущего
+кода. Код в `C:\Users\user\q2prox-work\...\q2prox-dz` нужно заменить новым
+checkout или свежей копией перед следующим прогоном.
 
 ```text
 snapshot: q2prox-build-env-ready-20260905
 uuid: 4baf70e7-c6f0-47ee-ac02-9d14130de3a3
 purpose: GuestControl + Windows build toolchain + locked local dependencies
+```
+
+Использование:
+
+```bash
+VBoxManage snapshot 9a57e185-2b98-458b-b58f-c9e23e666ce9 restore q2prox-build-env-ready-20260905
+VBoxManage startvm 9a57e185-2b98-458b-b58f-c9e23e666ce9 --type headless
+```
+
+Восстановление snapshot отбрасывает текущее состояние VM после snapshot. Перед
+restore сохранить нужные логи и артефакты на host.
+
+## Cleanup 2026-09-05
+
+Удалены только явно мёртвые VirtualBox-объекты:
+
+```text
+deleted VM: Windows.11.28000.21.13.MR.Bumerino
+deleted folder: /home/ssolovey/VirtualBox VMs/Windows 11 25H2 _ LTSC (x64) 28in1 Clone
+closed stale medium: /home/ssolovey/VirtualBox VMs/Windows/Windows_1.vdi
+```
+
+После очистки зарегистрирована только рабочая VM:
+
+```text
+Windows 11 25H2 + LTSC (x64) 28in1
+9a57e185-2b98-458b-b58f-c9e23e666ce9
 ```
 
 ## Старые snapshot
@@ -96,6 +123,6 @@ q2prox-dz-clean-runtime-20260830
 guest-additions-ready-20260905
 ```
 
-Удалять старые snapshot только после проверки, что новый
-`q2prox-build-env-ready-20260905` существует и VM успешно стартует из него.
-Не удалять другие VM без отдельного подтверждения.
+Они оставлены как цепочка отката основной VM. Удалять их только отдельным
+шагом после проверки, что `q2prox-build-env-ready-20260905` стартует и больше
+не нужен откат к чистому runtime/доинструментальному состоянию.

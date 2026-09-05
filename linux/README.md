@@ -19,15 +19,16 @@ Q2PRO-X сохраняет обычную настройку запуска. Е�
 достаточно обычного `Refresh` во вкладке `Custom`. Q2PRO-X перезапускать не
 нужно.
 
-This package lets an existing Windows x64 `Q2PRO-X.exe` join a currently
-running public Quake II room on Dos.Zone through Wine. It does not include
-Q2PRO-X, Quake II game data, maps or PAK files, and it does not create rooms.
+This package lets an existing Windows x64 `Q2PRO-X.exe` join currently running
+public Quake II rooms and dedicated servers on Dos.Zone through Wine. It does
+not include Q2PRO-X, Quake II game data, maps or PAK files, and it does not
+create rooms.
 
 ```text
 Q2PRO-X.exe under Wine
-  -> UDP 127.0.0.1:<random-session-port>
-  -> bundled managed UDP/WebRTC gateway
-  -> existing Dos.Zone browser-host room
+  -> Custom list of 127.0.0.1:<per-target-port>
+  -> bundled shared UDP/WebRTC gateway
+  -> existing Dos.Zone rooms and dedicated servers
 ```
 
 ## Requirements

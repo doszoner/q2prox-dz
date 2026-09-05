@@ -4,21 +4,21 @@ This directory closes the process-lifecycle gap identified by the Windows runtim
 
 ## Implemented
 
-- one hub session containing up to five independent rooms;
+- one hub session containing one shared gateway and up to `256` room targets;
 - direct child launch without shell expansion;
-- one root Windows Job Object for hard session cleanup and one nested Job per
-  gateway, all with `KILL_ON_JOB_CLOSE`;
-- each gateway starts suspended, is assigned to the Job, then resumed;
+- one root Windows Job Object for hard session cleanup, with `KILL_ON_JOB_CLOSE`;
+- the shared gateway starts suspended, is assigned to the Job, then resumed;
 - bounded room configurations from stdin to child stdin only;
-- a separate inherited owner pipe and event reader for every room;
+- a separate inherited owner pipe and event reader for the shared gateway;
 - strict, non-sensitive gateway event protocol;
 - Q2 starts only after all selected rooms have either produced `TRANSPORT_READY` or been removed, with validated loopback endpoints;
 - Q2 starts with `+set game 3zb2`, session-only `cl_timeout 20` and a bounded
   `cl_serverbrowser_custom_source`; the coordinator sends no menu command and
   leaves Q2PRO-X's ordinary startup preference unchanged;
-- a room failure closes only that room; Q2, the other room and the common Job continue;
+- a room failure closes only that room target; Q2, other targets and the common
+  Job continue;
 - Q2, owner stop or an empty hub stops all rooms;
-- unique WebView2 user-data directory per room and stale-session cleanup;
+- unique WebView2 user-data directory per hub session and stale-session cleanup;
 - an out-of-Job cleanup guardian removes the session directory after hard owner termination;
 - no CFG edits and no game installation changes;
 - `/Brepro` and hardening flags;
@@ -38,11 +38,11 @@ The exact tested WebView2 gateway must implement `MANAGED-GATEWAY-PROTOCOL.md`. 
 
 ## Hub invocation
 
-A launcher/catalog component writes up to five fresh room JSON objects to stdin,
-one object per non-empty line:
+A launcher/catalog component writes fresh room updates to stdin before and
+while Q2PRO-X is running:
 
 ```powershell
-$roomJsonLines | ./out/release/q2dz-session.exe `
+$roomUpdates | ./out/release/q2dz-session.exe `
   --gateway C:\path\q2dz-gateway.exe `
   --q2 C:\path\Q2PRO-X.exe
 ```
@@ -52,6 +52,6 @@ user opens Q2PRO-X `Join online` → `Custom`; Q2PRO-X owns room selection. The 
 single-room direct-connect behavior is retained only in historical release
 artifacts, not in the current executable.
 
-Legacy `q2` rooms keep the existing tombstone policy. A `room.q2ded.*` binding
+Legacy `q2` rooms keep the existing tombstone policy. A `room.q2ded.*` target
 may start twice more after failure or `ROOM_CLOSED`; successful readiness does
 not reset this budget. Closing one room never closes Q2PRO-X or sibling rooms.
