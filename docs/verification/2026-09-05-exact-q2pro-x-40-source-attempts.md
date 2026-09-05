@@ -102,6 +102,29 @@ known supported user contract is the normal menu path: open `Join online`,
 select `Custom`, press `Refresh`, then select a row. Command-driven refresh is
 not sufficient evidence for this gate.
 
+## Linux isolated Xvnc attempt 4
+
+A fourth bounded Xvnc attempt used the same 40-row source fixture, a private
+`homedir`, `twm` and the exact Q2PRO-X executable:
+
+```text
+run: noncommit/q2prox-dz-gates/20260905-exact-q2pro-x-xvnc-attempt4
+source fixture: ready, 40 endpoints
+Q2PRO-X args: +set homedir <run>/q2home +set game 3zb2 +set cl_timeout 20
+  +set s_initsound 0 +set cl_serverbrowser_default_source custom
+  +set cl_serverbrowser_custom_source http://127.0.0.1:<port>/servers
+Q2PRO-X log: reached FS_Init and R_Init
+HTTP GETs: 0
+UDP status targets: 0
+cleanup: owned processes stopped
+```
+
+This attempt does not prove a product failure. It also does not prove an Xvnc
+server failure: a later diagnostic command and cleanup were started in parallel,
+so `xwininfo`/screenshot errors from that moment are not reliable display-state
+evidence. The useful observation is only that this unattended Xvnc shape again
+failed to produce ordinary `Custom` menu traffic before cleanup.
+
 ## Windows VM non-interactive attempt
 
 The prepared Windows VM was started headless:
