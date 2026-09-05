@@ -23,6 +23,8 @@ FILES = {
     / "docs/verification/2026-09-05-exact-q2pro-x-40-source-attempts.md",
     "2026-09-05-exact-q2pro-x-40-source-runbook.md": REPO
     / "docs/verification/2026-09-05-exact-q2pro-x-40-source-runbook.md",
+    "2026-09-05-live-gameplay-gates-runbook.md": REPO
+    / "docs/verification/2026-09-05-live-gameplay-gates-runbook.md",
     "2026-09-05-windows-headless-interactive-gate-preflight.md": REPO
     / "docs/verification/2026-09-05-windows-headless-interactive-gate-preflight.md",
     "2026-09-05-remaining-release-gates.md": REPO
