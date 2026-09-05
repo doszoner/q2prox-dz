@@ -542,11 +542,16 @@ def reconcile_targets(targets, rows, make_config, map_available=lambda _row: Tru
             continue
         map_name = row["createSettings"]["map"]
         config_text = _config_text(make_config(row))
-        changed = config_text != target.config
+        previous_config = json.loads(target.config)
+        fresh_config = json.loads(config_text)
+        # ICE is refreshed separately; rotating TURN credentials must not drop a room.
+        previous_config.pop("iceServers", None)
+        fresh_config.pop("iceServers", None)
+        changed = fresh_config != previous_config
         map_changed = bool(target.map_name) and target.map_name != map_name
         if changed and map_changed and not map_available(row):
             raise LaunchError("map content check failed")
-        updated[room_id] = HubTarget(room_id, config_text if changed else target.config, 0, map_name)
+        updated[room_id] = HubTarget(room_id, config_text, 0, map_name)
         if changed:
             drops.add(room_id)
 
@@ -743,7 +748,7 @@ def _installed_paths():
     root = Path(__file__).resolve().parent
     return {
         "session": Path(os.environ.get("Q2DZ_SESSION_BIN", root / "q2dz-session")),
-        "managed": Path(os.environ.get("Q2DZ_MANAGED_GATEWAY", root / "q2dz-managed-gateway")),
+        "managed": Path(os.environ.get("Q2DZ_MANAGED_GATEWAY", root / "q2dz-webrtc-gateway")),
         "legacy": Path(os.environ.get("Q2DZ_LEGACY_GATEWAY", root / "q2dz-webrtc-gateway")),
         "adapter": Path(os.environ.get("Q2DZ_ADAPTER_CONFIG", root.parent / "config" / "legacy-gateway.json")),
         "content": Path(os.environ.get("Q2DZ_CONTENT_CHECK", root / "q2dz-content-check")),

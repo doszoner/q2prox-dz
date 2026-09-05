@@ -159,6 +159,20 @@ def decoded_lines(process):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_default_hub_launch_uses_direct_multiroom_transport(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            paths = launch._installed_paths()
+        started = []
+        launch.run_hub(
+            launch.TargetPlan({}, []), "/games/Q2PRO-X.exe",
+            session=paths["session"], managed=paths["managed"],
+            legacy=paths["legacy"], adapter=paths["adapter"],
+            popen=lambda args, **kwargs: started.append(args) or FakeProcess(),
+            refresh=lambda *_args: launch.TargetPlan({}, []), poll_interval=0,
+        )
+        args = started[0]
+        self.assertEqual(Path(args[args.index("--gateway") + 1]).name, "q2dz-webrtc-gateway")
+
     def _execute_heartbeat_scenario(self, case):
         name = case["name"]
         payload = case.get("payload", {})
@@ -478,6 +492,15 @@ class LauncherTests(unittest.TestCase):
             lambda row: launch.make_room_config(row, lookup_for([row]), rtc_rows()),
         )
         self.assertEqual(plan.drops, ())
+
+    def test_fresh_ice_does_not_drop_unchanged_room(self):
+        selected = room()
+        first = launch.make_room_config(selected, lookup_for([selected]), rtc_rows())
+        fresh = dict(first, iceServers=[{"urls": ["turn:example.invalid"], "username": "new", "credential": "rotated"}])
+        target = launch.HubTarget(selected["room"], launch._config_text(first), map_name="q2dm1")
+        plan = launch.reconcile_targets({target.room_id: target}, [selected], lambda _row: fresh)
+        self.assertEqual(plan.drops, ())
+        self.assertEqual(json.loads(plan.targets[target.room_id].config)["iceServers"], fresh["iceServers"])
 
     def test_changed_transport_emits_drop_before_put(self):
         old = room("room.q2.transport.1", "1", map_name="q2dm1")
