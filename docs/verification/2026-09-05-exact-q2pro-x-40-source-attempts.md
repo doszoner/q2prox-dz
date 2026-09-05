@@ -51,6 +51,57 @@ Conclusion: these attempts do not prove a product failure. They prove that the
 current Linux/Xvnc automation is not a valid unattended exact-client gate for
 this check.
 
+## Linux isolated command-refresh attempts
+
+Two more bounded attempts checked whether the exact client can be driven
+without manual menu input by using built-in commands found in the executable:
+
+```text
+serverbrowser_open
+serverbrowser_refresh
+serverbrowser_connect
+```
+
+Attempt 1 used startup arguments:
+
+```text
++serverbrowser_open +serverbrowser_refresh
+```
+
+Evidence:
+
+```text
+run: noncommit/q2prox-dz-gates/20260905-q2pro-40-command-refresh
+Q2PRO-X initialized: yes
+HTTP GETs: 0
+UDP status targets: 0
+```
+
+Attempt 2 used an isolated `Xvnc` display plus `twm`, bound F12 to:
+
+```text
+serverbrowser_open; serverbrowser_refresh
+```
+
+and tried to send F12 with `xdotool` inside the isolated display.
+
+Evidence:
+
+```text
+run: noncommit/q2prox-dz-gates/20260905-q2pro-40-twm-f12-refresh
+HTTP GETs: 0
+UDP requests: 0
+result: invalid automation attempt
+```
+
+The second attempt timed out before reliable key delivery and had to be
+cleaned up by exact process group. It is not counted as product behavior.
+
+Conclusion: the exact-client 40-row gate should stay manual/interactive. The
+known supported user contract is the normal menu path: open `Join online`,
+select `Custom`, press `Refresh`, then select a row. Command-driven refresh is
+not sufficient evidence for this gate.
+
 ## Windows VM non-interactive attempt
 
 The prepared Windows VM was started headless:

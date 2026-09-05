@@ -111,3 +111,8 @@ Do not use `+serverbrowser_open_modern` for this gate. Earlier rc11 checks
 showed that forced auto-opening can leave a black screen with some source
 states. The product contract is the ordinary user path: start Q2PRO-X, open
 `Join online -> Custom`, press `Refresh`.
+
+Do not replace the manual refresh with startup `+serverbrowser_open
++serverbrowser_refresh` or a bound-key script. The 2026-09-05 isolated attempts
+did not produce Custom-source HTTP traffic. The release gate is the ordinary
+visible menu flow above.
