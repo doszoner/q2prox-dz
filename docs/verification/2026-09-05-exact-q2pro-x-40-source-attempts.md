@@ -1,0 +1,113 @@
+# Exact Q2PRO-X 40-endpoint Custom source attempts, rc15
+
+Date: 2026-09-05.
+
+Purpose: try to close the remaining exact Q2PRO-X Custom-source/menu gate for
+the shared multiroom gateway. The expected proof is:
+
+1. exact Q2PRO-X 1.5 receives a 40-row `cl_serverbrowser_custom_source`;
+2. `Join online -> Custom` / refresh causes ordinary Quake II `status` traffic
+   to all 40 loopback endpoints;
+3. the evidence records the real client behavior, not a fake Q2 fixture.
+
+The verified exact executable remains:
+
+```text
+/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+SHA-256: 831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d
+Q2PRO-X 1.5 by ly, 2026-08-25
+```
+
+## Linux isolated Xvnc attempts
+
+Three isolated Linux runs were attempted under private Xvnc displays and
+private `homedir` roots:
+
+```text
+noncommit/q2prox-dz-gates/20260905-q2pro-40-source-run1
+noncommit/q2prox-dz-gates/20260905-q2pro-40-source-run2
+noncommit/q2prox-dz-gates/20260905-q2pro-40-source-run3
+```
+
+The fixture was the retained 40-row source harness:
+
+```text
+tests/tools/controlled-room-set.py source --count 40
+```
+
+Observed results:
+
+```text
+run1: http_gets=0 status_target_count=0 window_found=false
+run2: http_gets=0 status_target_count=0 window_found=false
+run3: http_gets=0 status_target_count=0 window_found=true
+```
+
+The Q2 logs show slow Wine/Xvnc renderer startup. In the useful run, Q2 reached
+`R_Init`, but the client had not completed initialization and did not request
+the Custom source before cleanup.
+
+Conclusion: these attempts do not prove a product failure. They prove that the
+current Linux/Xvnc automation is not a valid unattended exact-client gate for
+this check.
+
+## Windows VM non-interactive attempt
+
+The prepared Windows VM was started headless:
+
+```text
+VM: Windows 11 25H2 + LTSC (x64) 28in1
+UUID: 9a57e185-2b98-458b-b58f-c9e23e666ce9
+snapshot: q2prox-rc15-fixture-ready-20260905
+```
+
+The guest had no logged-on interactive user:
+
+```text
+query user
+No User exists for *
+```
+
+The 40-row fixture and exact Q2PRO-X were launched through GuestControl. The
+guest-side summary was copied back to:
+
+```text
+noncommit/q2prox-dz-gates/20260905-windows-q2pro-40-source/summary.json
+```
+
+Result:
+
+```json
+{
+  "result": "FAIL",
+  "q2WindowSeen": false,
+  "httpGets": 0,
+  "statusRequestCount": 0,
+  "statusTargetCount": 0,
+  "statusSourceCount": 0
+}
+```
+
+This is a GuestControl-session limitation, not a product gate result:
+non-interactive Q2PRO-X process start is insufficient evidence for the menu
+contract.
+
+Post-run process check found no remaining `Q2PRO-X`, fixture Python process,
+`q2dz-session`, or WebView2 gateway process.
+
+## Current verdict
+
+`PENDING` for the exact Q2PRO-X 40-endpoint Custom-source/menu gate.
+
+Already proven nearby:
+
+- exact Q2PRO-X Custom source/status/connect behavior for two endpoints:
+  [2026-08-29-q2pro-x-custom-source.md](2026-08-29-q2pro-x-custom-source.md);
+- Windows coordinator-level 40-target source publication with fake Q2:
+  [2026-09-05-windows-coordinator-40-target.md](2026-09-05-windows-coordinator-40-target.md);
+- Windows 30-minute 40-target resource/churn fixture gate:
+  [2026-09-05-windows-resource-40-target.md](2026-09-05-windows-resource-40-target.md).
+
+The smallest valid next action is an interactive exact-client gate in a logged
+in Windows session or an operator-owned Linux GUI session. It should reuse the
+existing 40-row fixture and collect both screenshot and UDP evidence.
