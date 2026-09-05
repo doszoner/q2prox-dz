@@ -112,6 +112,24 @@ Windows 11 25H2 + LTSC (x64) 28in1
 9a57e185-2b98-458b-b58f-c9e23e666ce9
 ```
 
+## Snapshot smoke 2026-09-05
+
+Проверено после cleanup:
+
+```text
+VBoxManage list runningvms: empty before start
+VBoxManage startvm 9a57e185-2b98-458b-b58f-c9e23e666ce9 --type headless: PASS
+Guest Additions visible: 7.2.16
+GuestControl cmd.exe /c ver: PASS
+Windows version: 10.0.26200.9168
+audio: none
+```
+
+`acpipowerbutton` не выключил гостя за ограниченное окно ожидания, поэтому
+конкретно этот unattended workflow не должен полагаться на ACPI shutdown как на
+единственный cleanup. VM была выключена командой `VBoxManage controlvm ...
+poweroff`; итоговое состояние — `poweroff`.
+
 ## Старые snapshot
 
 Найденные старые точки этой VM:
