@@ -75,7 +75,7 @@ SHA-256: 2263ac2bcf6f197041f095eb65f034db9e139a7fd5507f592b99498362cf3d2b
 
 ## Snapshot
 
-Актуальная стартовая точка хранит окружение, а не конкретный смысл текущего
+Стартовая точка для сборок хранит окружение, а не конкретный смысл текущего
 кода. Код в `C:\Users\user\q2prox-work\...\q2prox-dz` нужно заменить новым
 checkout или свежей копией перед следующим прогоном.
 
@@ -83,7 +83,6 @@ checkout или свежей копией перед следующим прог
 snapshot: q2prox-build-env-ready-20260905
 uuid: 4baf70e7-c6f0-47ee-ac02-9d14130de3a3
 purpose: GuestControl + Windows build toolchain + locked local dependencies
-current: yes
 vm state after preparation: poweroff
 ```
 
@@ -284,29 +283,27 @@ product processes after gate: 0
 `q2prox-rc14-live-ready-20260905`, чтобы оставить чистую стартовую точку для
 ручного gameplay live gate.
 
-## Старые snapshot
+## Active snapshots after cleanup
 
-После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
+После cleanup 2026-09-05 у этой VM остались только три точки, которые имеют
 понятное назначение:
 
 ```text
-q2prox-dz-clean-runtime-20260830
-guest-additions-ready-20260905
 q2prox-build-env-ready-20260905
 q2prox-runtime-ready-20260905
 q2prox-rc14-live-ready-20260905
 ```
 
 `q2prox-build-env-ready-20260905` — штатная точка для быстрых headless-сборок.
-`q2prox-dz-clean-runtime-20260830` и `guest-additions-ready-20260905` оставлены
-как минимальный откат к runtime/GuestControl-состоянию, если понадобится чистая
-проверка без build tools. `q2prox-runtime-ready-20260905` — ближайшая стартовая
-точка для Windows live gameplay gate. `q2prox-rc14-live-ready-20260905` уже
-содержит разложенные rc14 portable/setup. Это не отработанные мёртвые образы.
+`q2prox-runtime-ready-20260905` — ближайшая стартовая точка для Windows live
+gameplay gate без привязки к конкретной rc-поставке. `q2prox-rc14-live-ready-20260905`
+уже содержит разложенные rc14 portable/setup.
 
-Удалены как отработанные старые rollback-точки:
+Удалены как отработанные старые rollback/smoke-точки:
 
 ```text
+q2prox-dz-clean-runtime-20260830
+guest-additions-ready-20260905
 clean-windows-25h2-pre-product-20260822
 clean-installed-20260822
 ```
@@ -316,22 +313,7 @@ clean-installed-20260822
 ```text
 registered VMs: Windows 11 25H2 + LTSC (x64) 28in1 only
 running VMs: none
-current snapshot: q2prox-build-env-ready-20260905
-remaining snapshots: q2prox-dz-clean-runtime-20260830,
-  guest-additions-ready-20260905,
-  q2prox-build-env-ready-20260905
-```
-
-После подготовки runtime snapshot текущая точка изменилась:
-
-```text
-current snapshot: q2prox-runtime-ready-20260905
-running VMs: none
-```
-
-После подготовки rc14 live-ready snapshot текущая точка изменилась:
-
-```text
 current snapshot: q2prox-rc14-live-ready-20260905
-running VMs: none
+VM directory size: 67 GiB
+Snapshots directory size: 15 GiB
 ```
