@@ -1,6 +1,7 @@
 #include "multiroom_state.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace q2dz {
 namespace {
@@ -18,6 +19,11 @@ void count_max(std::size_t& maximum, std::size_t length) noexcept {
 
 bool probe_ack_is_outstanding(bool is_ack, std::uint64_t probe_sent_at) noexcept {
     return is_ack && probe_sent_at != 0;
+}
+
+bool probe_send_delivered(int sent, std::size_t expected) noexcept {
+    return expected <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+        sent == static_cast<int>(expected);
 }
 
 Result<void> MultiroomState::put(TargetId id, std::uint16_t udp_port) {

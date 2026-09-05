@@ -11,6 +11,22 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc15] - 2026-09-05
+
+### Fixed
+
+- Linux shared gateway больше не оставляет target в промежуточном состоянии,
+  если readiness probe через HumbleNet/WebRTC-NET вернул short или zero send
+  после получения concrete peer. Такой target теперь получает ограниченное
+  число probe attempts и завершает readiness через `READY` либо
+  `CLOSED reason=probe_timeout`.
+
+### Verified
+
+- Повторный Linux controlled gate с 40 одновременно зарегистрированными
+  neutral `q2ded` peers получил `40/40 READY` через один
+  `q2dz-webrtc-gateway`.
+
 ## [1.0.0-rc14] - 2026-09-05
 
 ### Added
@@ -189,7 +205,8 @@
 - Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
   PAK-файлы пользователя.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc14...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc15...HEAD
+[1.0.0-rc15]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc14...v1.0.0-rc15
 [1.0.0-rc14]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...v1.0.0-rc14
 [1.0.0-rc13]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...v1.0.0-rc13
 [1.0.0-rc12]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...v1.0.0-rc12

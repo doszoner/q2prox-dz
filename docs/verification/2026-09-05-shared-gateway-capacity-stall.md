@@ -82,6 +82,25 @@ regression around many resolving targets and bounded terminal events, then fix
 the shared gateway so every admitted target reaches `READY` or a terminal event
 inside the configured deadline.
 
+## Follow-up in 1.0.0-rc15
+
+The immediate liveness defect was fixed in `1.0.0-rc15`. Root cause: readiness
+probe send handling treated a short/zero `humblenet_p2p_sendto()` result for an
+already concrete peer as neither delivered nor failed. The gateway now counts
+that case as a bounded probe miss.
+
+Fresh controlled rerun:
+
+```text
+controlled peers: 40/40 ready
+gateway READY: 40/40
+FAILED events: 0
+CLOSED events: 0
+```
+
+The broader 30-minute resource/churn gate is still separate and is not marked
+passed by this correction rerun.
+
 ## Cleanup
 
 No `q2dz-controlled-peer`, `controlled-room-set.py` or

@@ -113,6 +113,6 @@ guardian очищает весь набор по session marker и удаляе�
 
 [ADR 0004](adr/0004-q2pro-x-custom-source-room-hub.md) описывает текущий путь:
 штатная вкладка `Custom`, стабильный loopback HTTP source и room hub. Кандидат
-`1.0.0-rc14` проверяется по указанным в ADR live, lifecycle и package gates;
+`1.0.0-rc15` проверяется по указанным в ADR live, lifecycle и package gates;
 фактически пройденные проверки приведены в
-[rc14 verification](verification/1.0.0-rc14.md).
+[rc15 verification](verification/1.0.0-rc15.md).

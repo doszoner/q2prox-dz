@@ -53,8 +53,8 @@ registered the connected player. Historical rc6/rc7 results remain preserved
 in their own verification records and are not promoted to rc8 by inference.
 Exact rc8 package hashes and results are recorded in
 `docs/verification/1.0.0-rc8.md`; it remains the historical rollback release.
-The current rc14 candidate is fail-closed in
-`docs/verification/1.0.0-rc14.md`.
+The current rc15 candidate is fail-closed in
+`docs/verification/1.0.0-rc15.md`.
 
 If Q2PRO-X is not installed, get the current release from the official landing
 page: <https://q2pro-x.com/>. Install or update it separately, start it once
@@ -66,9 +66,9 @@ the game client.
 Keep the archive and its adjacent `.sha256` file in the same directory:
 
 ```bash
-sha256sum -c q2prox-dz-1.0.0-rc14-linux-x86_64.tar.gz.sha256
-tar -xzf q2prox-dz-1.0.0-rc14-linux-x86_64.tar.gz
-cd q2prox-dz-1.0.0-rc14
+sha256sum -c q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz.sha256
+tar -xzf q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc15
 ./install.sh
 ```
 

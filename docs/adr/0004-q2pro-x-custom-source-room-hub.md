@@ -1,6 +1,6 @@
 # ADR 0004: комнаты Dos.Zone во встроенном server browser Q2PRO-X
 
-- **Status:** Accepted for rc14 gateway-layer; full release acceptance pending
+- **Status:** Accepted for rc15 gateway-layer; full release acceptance pending
 - **Date:** 2026-08-23
 - **Related:** [Архитектура](../ARCHITECTURE.md),
   [ADR 0002](0002-launcher-owned-session-lifecycle.md),
@@ -46,7 +46,7 @@ maintainer не потребовались. Следовательно, базо
 Целевое пользовательское подключение реализуется только через launcher-owned
 **room hub** и вкладку `Custom` Q2PRO-X. Отдельный picker и single-room ветка
 координатора удаляются, чтобы не поддерживать два интерфейса и два lifecycle.
-Кандидат `1.0.0-rc14` использует общий многокомнатный gateway по
+Кандидат `1.0.0-rc15` использует общий многокомнатный gateway по
 [дизайну shared runtime](../design/2026-09-03-shared-multiroom-gateway.md). До
 прохождения всех live/package gates он остаётся кандидатом для проверки, а не
 готовой публичной поставкой.
@@ -322,8 +322,10 @@ content checker. Несовместимая комната не показыва
 
 ### Один многокомнатный gateway
 
-Принят в `1.0.0-rc14`: это устраняет линейное размножение WebView2/native
-runtime на каждую комнату и сохраняет отдельный loopback endpoint на target.
+Принят в `1.0.0-rc14`; correction candidate `1.0.0-rc15` сохраняет тот же
+дизайн и исправляет Linux readiness liveness. Это устраняет линейное
+размножение WebView2/native runtime на каждую комнату и сохраняет отдельный
+loopback endpoint на target.
 
 ## Последствия
 
@@ -369,6 +371,6 @@ runtime на каждую комнату и сохраняет отдельны�
 До прохождения gates 1–8 live-hub candidate не считается готовым к широкому
 распространению. Текущие статусы и отделение компонентной
 проверки exact клиента от проверки поставки приведены в
-[`1.0.0-rc14 verification`](../verification/1.0.0-rc14.md). Rollback — это
+[`1.0.0-rc15 verification`](../verification/1.0.0-rc15.md). Rollback — это
 возврат к предыдущему проверенному архиву; gateways и transport backend при
 этом не меняются.

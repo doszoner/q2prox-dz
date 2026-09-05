@@ -328,6 +328,10 @@ static void test_probe_ack_routing() {
     assert(!q2dz::probe_ack_is_outstanding(false, 17));
     assert(!q2dz::probe_ack_is_outstanding(true, 0));
     assert(q2dz::probe_ack_is_outstanding(true, 17));
+    assert(!q2dz::probe_send_delivered(-1, 9));
+    assert(!q2dz::probe_send_delivered(0, 9));
+    assert(!q2dz::probe_send_delivered(8, 9));
+    assert(q2dz::probe_send_delivered(9, 9));
 }
 
 static void test_multiroom_state_virtual_routing() {

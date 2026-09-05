@@ -47,6 +47,7 @@ struct Target {
 
 [[nodiscard]] bool probe_ack_is_outstanding(
     bool is_ack, std::uint64_t probe_sent_at) noexcept;
+[[nodiscard]] bool probe_send_delivered(int sent, std::size_t expected) noexcept;
 
 class MultiroomState {
 public:

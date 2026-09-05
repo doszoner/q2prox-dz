@@ -708,9 +708,15 @@ private:
             probe.next_probe = now + kProbeIntervalMs;
             if (sent < 0) {
                 if (target->concrete_peer != 0) close_target(id, "transport_closed");
-            } else if (sent == static_cast<int>(ping.size())) {
-                probe.probe_sent_at = now;
+                continue;
             }
+            if (!q2dz::probe_send_delivered(sent, ping.size())) {
+                if (target->concrete_peer != 0 && ++probe.probe_failures >= kProbeFailures) {
+                    close_target(id, "probe_timeout");
+                }
+                continue;
+            }
+            probe.probe_sent_at = now;
         }
     }
 
