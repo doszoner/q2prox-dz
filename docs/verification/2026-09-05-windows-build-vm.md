@@ -205,6 +205,60 @@ VBoxManage snapshot 9a57e185-2b98-458b-b58f-c9e23e666ce9 restore q2prox-runtime-
 VBoxManage startvm 9a57e185-2b98-458b-b58f-c9e23e666ce9 --type headless
 ```
 
+## RC14 live-ready snapshot 2026-09-05
+
+Подготовлен следующий snapshot: runtime tree плюс exact rc14 Windows
+поставки, уже разложенные для ручного live gate.
+
+```text
+snapshot: q2prox-rc14-live-ready-20260905
+uuid: 8110ebf4-1666-427c-82a9-458ee95d297b
+parent/current previous point: q2prox-runtime-ready-20260905
+vm state after snapshot: poweroff
+```
+
+В VM находятся:
+
+```text
+C:\Users\user\q2dz-release\rc14\input\
+  q2prox-dz-1.0.0-rc14-windows-x64-portable.zip
+  q2prox-dz-1.0.0-rc14-windows-x64-portable.zip.sha256
+  q2prox-dz-1.0.0-rc14-windows-x64-setup.zip
+  q2prox-dz-1.0.0-rc14-windows-x64-setup.zip.sha256
+
+C:\Users\user\q2dz-release\rc14\portable\Run.cmd
+C:\Users\user\q2dz-release\rc14\setup\Install.cmd
+C:\Users\user\Desktop\Run Q2PROX-DZ rc14 portable.cmd
+```
+
+Проверенные SHA-256 внутри VM:
+
+```text
+portable: bcfd29076621d00e51a434e231baa1e05aa6940d4f9cbfd3320c8eb67dca7a50
+setup:    2263ac2bcf6f197041f095eb65f034db9e139a7fd5507f592b99498362cf3d2b
+```
+
+При подготовке обнаружена особенность `VBoxManage guestcontrol copyto`:
+guest destination path должен передаваться в форме `C:/Users/.../file`, иначе
+backslash path может не попасть в ожидаемый каталог. Это VM workflow issue, не
+изменение продукта.
+
+Использование для следующего Windows live gate:
+
+```bash
+VBoxManage snapshot 9a57e185-2b98-458b-b58f-c9e23e666ce9 restore q2prox-rc14-live-ready-20260905
+VBoxManage startvm 9a57e185-2b98-458b-b58f-c9e23e666ce9 --type gui
+```
+
+После входа в Windows запустить с рабочего стола:
+
+```text
+Run Q2PROX-DZ rc14 portable.cmd
+```
+
+Граница доказанного: поставка разложена и проверена по SHA-256, но gameplay
+live gate ещё не выполнен.
+
 ## Старые snapshot
 
 После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
@@ -215,13 +269,15 @@ q2prox-dz-clean-runtime-20260830
 guest-additions-ready-20260905
 q2prox-build-env-ready-20260905
 q2prox-runtime-ready-20260905
+q2prox-rc14-live-ready-20260905
 ```
 
 `q2prox-build-env-ready-20260905` — штатная точка для быстрых headless-сборок.
 `q2prox-dz-clean-runtime-20260830` и `guest-additions-ready-20260905` оставлены
 как минимальный откат к runtime/GuestControl-состоянию, если понадобится чистая
 проверка без build tools. `q2prox-runtime-ready-20260905` — ближайшая стартовая
-точка для Windows live gameplay gate. Это не отработанные мёртвые образы.
+точка для Windows live gameplay gate. `q2prox-rc14-live-ready-20260905` уже
+содержит разложенные rc14 portable/setup. Это не отработанные мёртвые образы.
 
 Удалены как отработанные старые rollback-точки:
 
@@ -245,5 +301,12 @@ remaining snapshots: q2prox-dz-clean-runtime-20260830,
 
 ```text
 current snapshot: q2prox-runtime-ready-20260905
+running VMs: none
+```
+
+После подготовки rc14 live-ready snapshot текущая точка изменилась:
+
+```text
+current snapshot: q2prox-rc14-live-ready-20260905
 running VMs: none
 ```
