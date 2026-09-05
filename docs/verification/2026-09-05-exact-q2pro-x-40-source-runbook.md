@@ -3,7 +3,8 @@
 Purpose: close the exact-client gate that cannot be proven by fake Q2 or by a
 non-interactive VM session.
 
-This runbook uses the existing retained fixture:
+This runbook uses the retained fixture included in the repository and in the
+test-group bundle:
 
 ```text
 tests/tools/controlled-room-set.py source --count 40
@@ -27,7 +28,7 @@ Use a temporary `homedir`.
 
 ## Linux
 
-From the repository root:
+From the repository root or extracted test-group bundle root:
 
 ```bash
 mkdir -p ../noncommit/q2prox-dz-gates/manual-q2pro-40
@@ -76,7 +77,8 @@ python3 tests/tools/controlled-room-set.py source-check \
 Run this only in a logged-in Windows desktop session. GuestControl without a
 logged-in user is not valid for this gate.
 
-1. Copy `tests/tools/controlled-room-set.py` to a temporary directory.
+1. Copy `tests/tools/controlled-room-set.py` from the extracted test-group
+   bundle or repository checkout to a temporary directory.
 2. Start it in `cmd.exe`:
 
    ```cmd
