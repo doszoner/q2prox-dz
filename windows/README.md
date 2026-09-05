@@ -8,31 +8,31 @@ Windows-поставка состоит из трёх небольших час�
 
 ## Текущий режим
 
-`q2dz-launch.ps1` получает и проверяет каталог Dos.Zone, поддерживает до трёх
-dedicated-серверов и двух обычных комнат и передаёт независимые команды слотов
+`q2dz-launch.ps1` получает и проверяет каталог Dos.Zone, публикует все
+совместимые комнаты в пределах `256` targets и передаёт полный heartbeat
 координатору через `stdin`.
-Координатор запускает один gateway на комнату и один неизменённый Q2PRO-X со
+Координатор запускает один shared gateway и один неизменённый Q2PRO-X со
 стабильным локальным HTTP-источником для штатной вкладки `Custom`. Отдельного
 окна выбора комнаты нет.
 
 Launcher опрашивает каталог примерно раз в 15 секунд. Пользователь нажимает
 обычную кнопку `Refresh` в `Custom`, чтобы увидеть новую комнату после
 очередного успешного опроса или закрытую после двух опросов, в которых её уже
-нет. Q2PRO-X перезапускать не нужно. Заполненная активная комната сохраняется,
-а лишний endpoint не вытесняет уже занятый слот другого вида. Ошибка каталога
-сохраняет текущие комнаты. Ручное редактирование CFG, Favorites или аргументов
-запуска не требуется.
+нет. Q2PRO-X перезапускать не нужно. Заполненная активная комната сохраняется.
+Ошибка каталога сохраняет текущие комнаты. Ручное редактирование CFG,
+Favorites или аргументов запуска не требуется.
 
-При закрытии одного endpoint удаляется только его gateway; Q2PRO-X и остальные
-endpoint продолжают работать. Выход Q2PRO-X или жёсткое завершение владельца
+При закрытии одного endpoint удаляется только его target; Q2PRO-X и остальные
+endpoints продолжают работать. Выход Q2PRO-X или жёсткое завершение владельца
 останавливает всю сессию. Отдельный внутренний очиститель ждёт завершения
 coordinator и удаляет его session directory даже при жёстком завершении.
 
 Граница компонентов:
 
-- PowerShell: опрос, проверка каталога и выбор пяти стабильных слотов;
+- PowerShell: опрос, проверка каталога и полный heartbeat совместимых комнат;
 - C++ coordinator: владение Q2PRO-X/gateway и локальный HTTP-источник;
-- gateway: существующий transport для одной комнаты;
+- gateway: общий WebView2 transport runtime с отдельным loopback endpoint на
+  target;
 - Q2PRO-X: штатные `Custom` и `Refresh`.
 
 ## Local development
@@ -51,7 +51,7 @@ ctest --test-dir .\windows\gateway\build -C Release --output-on-failure
 
 The locked external inputs are WebView2 SDK NuGet package `1.0.4129.50` and the
 public WebRTC-NET repository `https://github.com/doszoner/WebRTC-NET.git` at
-immutable commit `1b8c145b8fb00e8a1599ec311118cd38aad44e7a`; no tag is
+immutable commit `62fe52cd20bae55baf03339afee60c895f1aee90`; no tag is
 required. The WebRTC-NET release directory must contain the matching
 `webrtcnet.mjs` and `webrtcnet.wasm` files.
 

@@ -1,6 +1,6 @@
 # Общий многокомнатный шлюз q2prox-dz
 
-- **Статус:** проект решения; amendment: virtual routing + concrete duplicate guard
+- **Статус:** реализуется; Linux gateway-layer PASS, Windows runtime gate pending
 - **Дата:** 2026-09-03
 - **Область:** Windows и Linux
 - **Заменяет после принятия:** фиксированную схему `3 q2ded + 2 q2` из
@@ -62,9 +62,8 @@ working set. На Linux четыре idle gateway вместе с coordinator и
 линейный рост наиболее дорогой части. На Windows это означало бы десятки
 WebView2-деревьев. Такой предел нельзя считать долговременным решением.
 
-В текущем WebRTC-NET `eacd804` уже поддержаны virtual allocation и
-`sendto`/`recvfrom`; новые read-only resolver и registration getter ещё только
-предлагаются:
+В текущем WebRTC-NET `62fe52c` поддержаны virtual allocation,
+`sendto`/`recvfrom`, read-only resolver и registration getter:
 
 - `humblenet_p2p_virtual_peer_for_alias(alias)` даёт отдельный virtual route
   key на alias;
@@ -517,7 +516,7 @@ ownership, один bounded restart и перепубликация только
 2. Общий gateway реализуется за существующими fake lifecycle tests.
 3. Launcher/coordinator переводятся с slots на динамический `roomId -> target`.
 4. После полного Linux/Windows PASS фиксированный runtime и константы `3+2`
-   удаляются до release; два пользовательских режима не поддерживаются.
+   удаляются из release path; два пользовательских режима не поддерживаются.
 5. Откат продукта — предыдущий rc13 archive. Дисковых данных и CFG migration
    нет.
 
@@ -549,7 +548,7 @@ Quake II packets не несут room identity, достаточную для п
 
 ## Критерий принятия
 
-Решение принято, когда двухцелевой spike проходит на обеих платформах и
-подтверждает общий ICE snapshot для `q2 + q2ded`. После этого ADR 0004 меняет
-статус и ссылается на этот документ. До этого rc13 остаётся рабочим откатом, а
-новый release с увеличенными per-room лимитами не выпускается.
+Решение принято для Linux gateway-layer, когда двухцелевой spike подтвердил
+общий ICE snapshot для `q2 + q2ded`, isolated drop и добавление новой цели без
+restart. До полного релиза остаются Windows runtime gate, package gameplay
+acceptance и resource gates. rc13 остаётся рабочим откатом.

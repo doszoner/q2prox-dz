@@ -5,8 +5,8 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Текущий `1.0.0-rc13` получает PASS только из
-[`1.0.0-rc13`](verification/1.0.0-rc13.md), где должны быть зафиксированы
+rollback. Текущий `1.0.0-rc14` получает PASS только из
+[`1.0.0-rc14`](verification/1.0.0-rc14.md), где должны быть зафиксированы
 точные результаты компонентных, live и package gates.
 
 Пользователю следует публиковать только три canonical архива и соседние
@@ -33,7 +33,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc13
+  -OutputDir .\dist\windows-1.0.0-rc14
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -64,7 +64,7 @@ libraries. `Q2DZ_WEBRTC_NET_SOURCE_DIR` supplies only the upstream license and
 notice files copied by `tools/build-package.sh`. The authoritative WebRTC-NET
 source is the public repository
 `https://github.com/doszoner/WebRTC-NET.git` at immutable commit
-`1b8c145b8fb00e8a1599ec311118cd38aad44e7a`; a tag is not required provenance.
+`62fe52cd20bae55baf03339afee60c895f1aee90`; a tag is not required provenance.
 
 Точный toolchain и runtime prerequisites описаны в
 [linux/README.md](../linux/README.md); Windows dependency pins описаны в
@@ -78,8 +78,9 @@ source is the public repository
 - закрытие комнаты и аварийное завершение не должны оставить orphan-процессы;
 - в hub-режиме закрытие одной комнаты не должно завершить Q2PRO-X или другой
   gateway; после этого должен пройти вход во вторую комнату;
-- одновременно должны быть проверены три `q2ded` и две `q2` строки; dedicated
-  использует точный alias и не более двух recovery start;
+- одновременно должны быть проверены обычные `q2` и dedicated `q2ded` строки;
+  полный список не должен молча усекаться, а превышение `256` targets должно
+  завершаться явной ошибкой;
 - archive/args/env/logs не должны содержать room credentials;
 - должны быть опубликованы SHA-256 и все third-party licenses/notices.
 
@@ -87,5 +88,5 @@ Unsigned Windows candidates допустимы для корректностно
 закрытой alpha-группе с явным предупреждением. До широкого публичного выпуска
 необходимо выполнить Authenticode gate и заново проверить exact release archives.
 
-Пока эти условия не выполнены для конкретного rc13-архива, он остаётся
+Пока эти условия не выполнены для конкретного rc14-архива, он остаётся
 кандидатом для проверки и не считается готовой пользовательской поставкой.
