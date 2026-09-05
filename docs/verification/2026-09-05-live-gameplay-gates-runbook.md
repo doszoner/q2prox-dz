@@ -32,8 +32,9 @@ primary display.
 ```bash
 cd /tmp
 sha256sum -c /path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz.sha256
-tar -xf /path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz
-./q2prox-dz-1.0.0-rc15-linux-x86_64/install-user.sh
+tar -xzf /path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz
+cd q2prox-dz-1.0.0-rc15
+./install.sh
 q2prox-dz
 ```
 
