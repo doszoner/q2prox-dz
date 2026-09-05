@@ -83,6 +83,8 @@ checkout или свежей копией перед следующим прог
 snapshot: q2prox-build-env-ready-20260905
 uuid: 4baf70e7-c6f0-47ee-ac02-9d14130de3a3
 purpose: GuestControl + Windows build toolchain + locked local dependencies
+current: yes
+vm state after preparation: poweroff
 ```
 
 Использование:
@@ -132,15 +134,34 @@ poweroff`; итоговое состояние — `poweroff`.
 
 ## Старые snapshot
 
-Найденные старые точки этой VM:
+После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
+понятное назначение:
 
 ```text
-clean-installed-20260822
-clean-windows-25h2-pre-product-20260822
 q2prox-dz-clean-runtime-20260830
 guest-additions-ready-20260905
+q2prox-build-env-ready-20260905
 ```
 
-Они оставлены как цепочка отката основной VM. Удалять их только отдельным
-шагом после проверки, что `q2prox-build-env-ready-20260905` стартует и больше
-не нужен откат к чистому runtime/доинструментальному состоянию.
+`q2prox-build-env-ready-20260905` — штатная точка для быстрых headless-сборок.
+`q2prox-dz-clean-runtime-20260830` и `guest-additions-ready-20260905` оставлены
+как минимальный откат к runtime/GuestControl-состоянию, если понадобится чистая
+проверка без build tools. Это не отработанные мёртвые образы.
+
+Удалены как отработанные старые rollback-точки:
+
+```text
+clean-windows-25h2-pre-product-20260822
+clean-installed-20260822
+```
+
+Проверка после удаления:
+
+```text
+registered VMs: Windows 11 25H2 + LTSC (x64) 28in1 only
+running VMs: none
+current snapshot: q2prox-build-env-ready-20260905
+remaining snapshots: q2prox-dz-clean-runtime-20260830,
+  guest-additions-ready-20260905,
+  q2prox-build-env-ready-20260905
+```
