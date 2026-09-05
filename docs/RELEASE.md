@@ -16,6 +16,16 @@ rollback. Текущий `1.0.0-rc15` получает PASS только из
 - `q2prox-dz-<version>-windows-x64-setup.zip`;
 - `q2prox-dz-<version>-linux-x86_64.tar.gz`.
 
+Для ревьюера или ручной проверки можно дополнительно собрать общий bundle:
+
+```bash
+python3 tools/build-test-bundle.py
+```
+
+Он кладёт рядом с тремя поставками документы проверки и
+`tests/tools/controlled-room-set.py`, нужный для exact Q2PRO-X 40-source gate.
+Этот bundle не является отдельной пользовательской поставкой.
+
 ## Публичная граница
 
 Package allowlists исключают `input/`, reviewer prompts, work plans, caches,
