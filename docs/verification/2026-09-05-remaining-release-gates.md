@@ -19,6 +19,7 @@ Artifact integrity:
 dist/q2prox-dz-1.0.0-rc15-windows-x64-portable.zip: SHA-256 OK
 dist/q2prox-dz-1.0.0-rc15-windows-x64-setup.zip: SHA-256 OK
 linux/dist/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz: SHA-256 OK
+dist/q2prox-dz-1.0.0-rc15-test-bundle.zip: SHA-256 OK
 ```
 
 Prepared Windows VM:
@@ -27,8 +28,11 @@ Prepared Windows VM:
 vm: Windows 11 25H2 + LTSC (x64) 28in1
 uuid: 9a57e185-2b98-458b-b58f-c9e23e666ce9
 running VMs: none
-current snapshot: q2prox-rc14-live-ready-20260905
-current snapshot UUID: 8110ebf4-1666-427c-82a9-458ee95d297b
+current snapshot: q2prox-rc15-staged-20260905
+current snapshot UUID: 51bc7a39-c654-404b-a9a4-41b34ab9d7e1
+prepared portable: C:\Users\user\q2dz-release\rc15\portable
+prepared Q2PRO-X: C:\Users\user\q2-runtime-20260905\Quake2-PlayGround-2026\Q2PRO-X.exe
+portable internal SHA256SUMS: PASS
 ```
 
 Local Linux GUI isolation:
@@ -42,7 +46,8 @@ xvfb-run: not installed
 
 | Gate | Status | Why not closed | Smallest next action |
 | --- | --- | --- | --- |
-| Exact Q2PRO-X 40-endpoint Custom source/menu gate | `PENDING` | Needs real Q2PRO-X to load the 40-endpoint source, refresh `Custom`, send `status` to all endpoints and prove `status -> connect` source tuple. | Run the retained `controlled-room-set.py source --count 40` with Q2PRO-X in an isolated GUI or in the prepared Windows VM. |
+| 40-endpoint Custom source fixture | `PASS` | `controlled-room-set.py source --count 40 --duration 10` served 40 loopback endpoints and completed cleanup. This proves the retained source/status fixture still works, not Q2PRO-X menu behavior. | None for the fixture. |
+| Exact Q2PRO-X 40-endpoint Custom source/menu gate | `PENDING` | Needs real Q2PRO-X to load the 40-endpoint source, refresh `Custom`, send `status` to all endpoints and prove `status -> connect` source tuple. | Use snapshot `q2prox-rc15-staged-20260905` and run Q2PRO-X against the retained fixture in the prepared Windows VM. |
 | Linux fresh-package gameplay gate | `PENDING` | rc15 controlled gateway admission passes, but map entry, movement/fire, room switch, active/inactive close and cleanup have not been proven from the fresh package. | Install/use isolated X server, or run with explicit operator-owned GUI session. Do not run unattended on primary `DISPLAY=:1`. |
 | Windows fresh portable/setup gameplay gate | `PENDING` | rc15 portable/setup package chain passes, but no fresh interactive Q2PRO-X/WebView2/Dos.Zone gameplay PASS is recorded for these rc15 archives. | Stage rc15 in the prepared Windows VM or on a tester machine, then collect gameplay/process cleanup evidence. |
 | Windows WebView2 two-target transport/runtime gate | `PENDING` | Node protocol tests pass, but a real WebView2/Q2PRO-X runtime with one gateway and two live targets has not been measured. | Use the prepared VM; prove one gateway/WebView2 tree, no 1 Hz pump gaps, isolated close and switch. |
