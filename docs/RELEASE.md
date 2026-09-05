@@ -82,6 +82,12 @@ source is the public repository
 
 ## Перед публикацией
 
+Оставшиеся rc15 gates ведутся в
+[remaining release gates](verification/2026-09-05-remaining-release-gates.md).
+Интерактивные проверки выполняются по
+[exact Q2PRO-X 40-source runbook](verification/2026-09-05-exact-q2pro-x-40-source-runbook.md)
+и [live gameplay gates runbook](verification/2026-09-05-live-gameplay-gates-runbook.md).
+
 - тесты и package smoke должны пройти из чисто распакованного архива;
 - Q2PRO-X должен войти в реальную комнату; движение/стрельба должны быть видны
   владельцу;
