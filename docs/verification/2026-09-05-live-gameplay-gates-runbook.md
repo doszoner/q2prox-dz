@@ -30,9 +30,12 @@ Run in an operator-owned GUI session. Do not run unattended on the user's
 primary display.
 
 ```bash
-cd /tmp
-sha256sum -c /path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz.sha256
-tar -xzf /path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz
+ARTIFACT=/path/to/q2prox-dz-1.0.0-rc15-linux-x86_64.tar.gz
+cd "$(dirname "$ARTIFACT")"
+sha256sum -c "$(basename "$ARTIFACT").sha256"
+WORKDIR=$(mktemp -d /tmp/q2dz-live.XXXXXX)
+cd "$WORKDIR"
+tar -xzf "$ARTIFACT"
 cd q2prox-dz-1.0.0-rc15
 ./install.sh
 q2prox-dz
