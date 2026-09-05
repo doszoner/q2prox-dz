@@ -259,6 +259,31 @@ Run Q2PROX-DZ rc14 portable.cmd
 Граница доказанного: поставка разложена и проверена по SHA-256, но gameplay
 live gate ещё не выполнен.
 
+## RC14 setup VM gate 2026-09-05
+
+Проверено через GuestControl, без запуска `Install.cmd`, потому что
+`Install.cmd` после установки открывает пользовательский ярлык. Для headless
+проверки выполнялись только `install.ps1`, повторный `install.ps1` и
+`uninstall.ps1`.
+
+```text
+source setup: C:\Users\user\q2dz-release\rc14\setup
+first install: PASS
+second install/update: PASS
+uninstall: PASS
+version1: 1.0.0-rc14
+version2: 1.0.0-rc14
+version directory:
+  1.0.0-rc14-296a1fb65fdd9ccf23f02875831c3ce128cd894be4e3e9a51912936f51fa61b4
+q2-path preserved:
+  C:\Users\user\q2-runtime-20260905\Quake2-PlayGround-2026\Q2PRO-X.exe
+product processes after gate: 0
+```
+
+После gate VM была выключена и восстановлена к snapshot
+`q2prox-rc14-live-ready-20260905`, чтобы оставить чистую стартовую точку для
+ручного gameplay live gate.
+
 ## Старые snapshot
 
 После cleanup 2026-09-05 у этой VM остались только точки, которые имеют
