@@ -48,7 +48,7 @@ xvfb-run: not installed
 | Linux fresh-package gameplay gate | `PENDING` | rc14 is installed locally and non-GUI checks passed, but map entry, movement/fire, room switch, active/inactive close and cleanup have not been proven from the fresh package. | Install/use isolated X server, or run with explicit operator-owned GUI session. Do not run unattended on primary `DISPLAY=:1`. |
 | Windows fresh portable/setup gameplay gate | `PENDING` | VM has rc14 staged and Q2PRO-X path set, but no fresh interactive Q2PRO-X/WebView2/Dos.Zone gameplay PASS is recorded for this rebuild. | Restore/start `q2prox-rc14-live-ready-20260905`, log in, run the desktop portable command, collect gameplay and process cleanup evidence. |
 | Windows WebView2 two-target transport/runtime gate | `PENDING` | Node protocol tests pass, but a real WebView2/Q2PRO-X runtime with one gateway and two live targets has not been measured. | Use the prepared VM; prove one gateway/WebView2 tree, no 1 Hz pump gaps, isolated close and switch. |
-| 30-minute shared-gateway resource/churn gate | `PENDING` | A 60-second controlled peer process-fanout smoke passed, but it measures 40 controlled peer processes, not one shared q2prox-dz gateway under churn. | Run the planned 30-minute shared-gateway resource test and record RSS/CPU/fd/handles once per minute. |
+| 30-minute shared-gateway resource/churn gate | `BLOCKED_BY_SHARED_GATEWAY_ADMISSION_STALL` | A real Linux shared gateway did not make all controlled targets `READY` and did not emit terminal events for missing targets. Resource measurement cannot start from this state. | Add a focused regression for bounded terminal events under many resolving targets, then fix the gateway before rerunning the resource gate. |
 | Final release acceptance | `PENDING` | Depends on the live/resource gates above. | After gates pass, rebuild release artifacts if any code/docs changed, update `CHANGELOG.md` and verification, then run final smoke/review. |
 
 ## Boundary
@@ -56,3 +56,6 @@ xvfb-run: not installed
 Do not mark the active goal complete from current evidence. rc14 is suitable as
 a test-group bundle, but final product acceptance still requires the live gates
 above.
+
+Related failure evidence:
+[2026-09-05-shared-gateway-capacity-stall.md](2026-09-05-shared-gateway-capacity-stall.md).
