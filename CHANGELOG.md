@@ -11,6 +11,29 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc14] - 2026-09-05
+
+### Added
+
+- Общий многокомнатный gateway теперь рассчитан на все совместимые комнаты
+  Dos.Zone вместо фиксированных `3 q2ded + 2 q2` слотов.
+- Linux live gateway-layer проверка подтвердила одновременные `q2` и `q2ded`,
+  обычный Quake II `status`, удаление одной цели без поломки второй и
+  добавление новой dedicated цели после обновления ICE без перезапуска gateway.
+
+### Changed
+
+- Shared gateway больше не зависит от production `AliasQuery`: транспортная
+  маршрутизация использует virtual PeerId, а resolved concrete PeerId нужен
+  только для `READY` и защиты от duplicate peer.
+- Обновлён закреплённый WebRTC-NET commit и SHA-256 runtime artifacts.
+
+### Fixed
+
+- Исправлено сохранение pending datagram state в WebRTC-NET, когда flush не
+  смог передать пакет сразу; такие пакеты теперь остаются pending до следующей
+  возможности отправки.
+
 ## [1.0.0-rc13] - 2026-09-03
 
 ### Added
@@ -159,7 +182,8 @@
 - Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
   PAK-файлы пользователя.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc14...HEAD
+[1.0.0-rc14]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...v1.0.0-rc14
 [1.0.0-rc13]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...v1.0.0-rc13
 [1.0.0-rc12]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...v1.0.0-rc12
 [1.0.0-rc11]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...v1.0.0-rc11
