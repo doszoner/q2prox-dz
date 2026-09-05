@@ -253,7 +253,7 @@ def _run_queue_overflow_regression() -> None:
     class NoopEvidence:
         pass
 
-    alias = "room.q2test.server01"
+    alias = "room.q2ded.testserver01"
     event = json.dumps({"event": "ready", "alias": alias, "peer": 1}, separators=(",", ":"))
     output = ((event + "\n") * (module.MAX_CHILD_EVENTS + 1)).encode("ascii")
     harness = module.PeerHarness(1, "/bin/true", module.DEFAULT_SIGNAL, NoopEvidence())
@@ -288,8 +288,8 @@ def _run_two_alias_diagnostic_regression() -> None:
         def emit(self, _event: dict[str, object]) -> None:
             return
 
-    first = "room.q2test.server01"
-    second = "room.q2test.server02"
+    first = "room.q2ded.testserver01"
+    second = "room.q2ded.testserver02"
     assert module._safe_child_event(
         [first, second],
         json.dumps(
@@ -365,9 +365,9 @@ def _run_two_alias_diagnostic_process_regression(directory: Path) -> None:
     expected_command = [
         "--diagnostic-two-alias",
         "--alias",
-        "room.q2test.server01",
+        "room.q2ded.testserver01",
         "--alias",
-        "room.q2test.server02",
+        "room.q2ded.testserver02",
         "--signal",
         "wss://net.js-dos.com:444",
     ]
@@ -378,10 +378,10 @@ def _run_two_alias_diagnostic_process_regression(directory: Path) -> None:
         "import time\n"
         f"if sys.argv[1:] != {expected_command!r}: raise SystemExit(3)\n"
         "sys.stdin.buffer.readline()\n"
-        "for alias in (\"room.q2test.server01\", \"room.q2test.server02\"):\n"
+        "for alias in (\"room.q2ded.testserver01\", \"room.q2ded.testserver02\"):\n"
         "    print(json.dumps({\"event\": \"ready\", \"alias\": alias, \"peer\": 7}, separators=(\",\", \":\")), flush=True)\n"
         "for kind, size in [(\"ping\", 8), (\"status\", 9)]:\n"
-        "    print(json.dumps({\"event\": \"request\", \"aliases\": [\"room.q2test.server01\", \"room.q2test.server02\"], \"kind\": kind, \"peer\": 9, \"bytes\": size}, separators=(\",\", \":\")), flush=True)\n"
+        "    print(json.dumps({\"event\": \"request\", \"aliases\": [\"room.q2ded.testserver01\", \"room.q2ded.testserver02\"], \"kind\": kind, \"peer\": 9, \"bytes\": size}, separators=(\",\", \":\")), flush=True)\n"
         "time.sleep(60)\n",
     )
     process = _run_webrtc_process(fake_peer, mode="webrtc-two-alias", duration=0.2)
@@ -394,13 +394,13 @@ def _run_two_alias_diagnostic_process_regression(directory: Path) -> None:
         assert process.returncode == 0
         assert not error
         assert {event.get("alias") for event in events if event.get("event") == "peer_ready"} == {
-            "room.q2test.server01",
-            "room.q2test.server02",
+            "room.q2ded.testserver01",
+            "room.q2ded.testserver02",
         }
         stats = [event for event in events if event.get("event") == "peer_stats"]
         assert stats and "targets" not in stats[-1]
         assert stats and stats[-1]["groups"] == [{
-            "aliases": ["room.q2test.server01", "room.q2test.server02"],
+            "aliases": ["room.q2ded.testserver01", "room.q2ded.testserver02"],
             "bytes": 17,
             "ping": 1,
             "requests": 2,
@@ -411,7 +411,7 @@ def _run_two_alias_diagnostic_process_regression(directory: Path) -> None:
             if event.get("event") == "ready" and event.get("mode") == "webrtc-two-alias"
         ] == [
             {
-                "aliases": ["room.q2test.server01", "room.q2test.server02"],
+                "aliases": ["room.q2ded.testserver01", "room.q2ded.testserver02"],
                 "event": "ready",
                 "mode": "webrtc-two-alias",
                 "peer_count": 1,

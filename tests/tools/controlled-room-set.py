@@ -37,7 +37,7 @@ DEFAULT_SIGNAL = "wss://net.js-dos.com:444"
 FIXED_CHALLENGE = "424242"
 
 
-def aliases(count: int, prefix: str = "room.q2test.server") -> list[str]:
+def aliases(count: int, prefix: str = "room.q2ded.testserver") -> list[str]:
     return [f"{prefix}{index:02d}" for index in range(1, count + 1)]
 
 
@@ -327,7 +327,7 @@ class PeerHarness:
         binary: str,
         signal_url: str,
         evidence: Evidence,
-        alias_prefix: str = "room.q2test.server",
+        alias_prefix: str = "room.q2ded.testserver",
         alias_groups: list[list[str]] | None = None,
     ) -> None:
         self.count = count
@@ -631,7 +631,7 @@ def webrtc_main(
             args.peer_binary,
             args.signal,
             evidence,
-            getattr(args, "alias_prefix", "room.q2test.server"),
+            getattr(args, "alias_prefix", "room.q2ded.testserver"),
         )
     else:
         harness = PeerHarness(count, args.peer_binary, args.signal, evidence, alias_groups=alias_groups)
@@ -682,7 +682,7 @@ def _parser() -> argparse.ArgumentParser:
 
     webrtc = subparsers.add_parser("webrtc", help="run controlled WebRTC-NET peers")
     webrtc.add_argument("--count", type=_safe_count, default=MAX_TARGETS)
-    webrtc.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2test.server")
+    webrtc.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2ded.testserver")
     webrtc.add_argument("--peer-binary", required=True)
     webrtc.add_argument("--signal", default=DEFAULT_SIGNAL)
     webrtc.add_argument("--ready-timeout", type=float, default=30.0)
@@ -694,7 +694,7 @@ def _parser() -> argparse.ArgumentParser:
         help="run one diagnostic WebRTC-NET peer for two aliases",
     )
     diagnostic.add_argument("--peer-binary", required=True)
-    diagnostic.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2test.server")
+    diagnostic.add_argument("--alias-prefix", type=_safe_alias_prefix, default="room.q2ded.testserver")
     diagnostic.add_argument("--signal", default=DEFAULT_SIGNAL)
     diagnostic.add_argument("--ready-timeout", type=float, default=30.0)
     diagnostic.add_argument("--duration", type=_safe_duration)

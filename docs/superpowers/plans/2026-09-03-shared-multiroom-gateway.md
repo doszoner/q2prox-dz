@@ -619,7 +619,7 @@ Harness имеет два режима с общей конфигурацией 
 
 - `source`: 40 локальных UDP responders для exact Q2PRO-X browser/status;
 - `webrtc`: на отдельном Linux test host запускает 40 лёгких peer processes с
-  уникальными нейтральными alias `room.q2test.server01..40`, каждый отвечает
+  уникальными нейтральными alias `room.q2ded.testserver01..40`, каждый отвечает
   только на OOB ping/status.
 
 Все процессы принадлежат одной process group и завершаются в `finally`; test
@@ -764,7 +764,7 @@ replacement. Native host, bridge и HUB/2 contract не меняются.
 
 Controlled peer использует `humblenet_p2p_is_alias_registered(alias)`, не HTTP
 `/lookup` и не `AliasQuery`. По умолчанию harness создаёт нейтральные
-`room.q2test.serverNN`; для live product-schema проверок используется
+`room.q2ded.testserverNN`; для live product-schema проверок используется
 `--alias-prefix q2.<safe-prefix>`. Пройти последовательно: один peer
 READY/status; один peer с двумя aliases — ровно один target READY, второй
 FAILED duplicate, survivor продолжает status; `DROP -> PUT` того же alias; две
