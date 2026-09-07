@@ -419,9 +419,20 @@ q2dz::Result<Pipes> make_pipe(bool nonblocking_read = false) {
     return q2dz::Result<Pipes>::ok(Pipes{UniqueFd(fds[0]), UniqueFd(fds[1])});
 }
 
+struct SourceTarget {
+    std::string room_id;
+    std::uint64_t target_id = 0;
+    q2dz::Endpoint endpoint;
+};
+
+struct SourceSnapshot {
+    std::string servers;
+    std::string rooms;
+};
+
 class CustomSource {
 public:
-    q2dz::Result<void> start() {
+    q2dz::Result<void> start(std::string session) {
         if (worker_.joinable()) return q2dz::Result<void>::fail("custom source already started");
         UniqueFd listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
         if (!listener) return q2dz::Result<void>::fail(q2dz::errno_message("custom source socket"));
@@ -446,7 +457,9 @@ public:
         listener_ = std::move(listener);
         stop_read_.reset(stop_fds[0]);
         stop_write_.reset(stop_fds[1]);
-        url_ = "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/servers";
+        listener_port_ = ntohs(address.sin_port);
+        session_ = std::move(session);
+        url_ = "http://127.0.0.1:" + std::to_string(listener_port_) + "/servers";
         try {
             worker_ = std::thread([this] { serve(); });
         } catch (const std::exception& error) {
@@ -454,6 +467,8 @@ public:
             stop_read_.reset();
             stop_write_.reset();
             url_.clear();
+            session_.clear();
+            listener_port_ = 0;
             return q2dz::Result<void>::fail(std::string("custom source thread: ") + error.what());
         }
         return q2dz::Result<void>::ok();
@@ -461,13 +476,36 @@ public:
 
     [[nodiscard]] std::string url() const { return url_; }
 
-    void publish(const std::vector<q2dz::Endpoint>& endpoints) {
-        std::string body;
-        for (const auto& endpoint : endpoints) {
-            body += "127.0.0.1:" + std::to_string(endpoint.port) + "\n";
+    void publish(const std::vector<SourceTarget>& targets) {
+        if (targets.size() > 256U) {
+            failed_.store(true);
+            return;
+        }
+        SourceSnapshot snapshot;
+        q2dz::json::Array rooms;
+        rooms.reserve(targets.size());
+        for (const auto& target : targets) {
+            snapshot.servers += target.endpoint.to_string();
+            snapshot.servers.push_back('\n');
+            q2dz::json::Object room;
+            room.emplace("endpoint", q2dz::json::Value{target.endpoint.to_string()});
+            room.emplace("kind", q2dz::json::Value{
+                target.room_id.starts_with("room.q2ded.") ? "q2ded" : "q2"});
+            room.emplace("room", q2dz::json::Value{target.room_id});
+            room.emplace("target", q2dz::json::Value{std::to_string(target.target_id)});
+            rooms.emplace_back(q2dz::json::Value{std::move(room)});
+        }
+        q2dz::json::Object root;
+        root.emplace("session", q2dz::json::Value{session_});
+        root.emplace("targets", q2dz::json::Value{std::move(rooms)});
+        root.emplace("version", q2dz::json::Value{1.0});
+        snapshot.rooms = q2dz::json::stringify(q2dz::json::Value{std::move(root)});
+        if (snapshot.rooms.size() > 256U * 1024U) {
+            failed_.store(true);
+            return;
         }
         std::lock_guard lock(mutex_);
-        body_ = std::move(body);
+        snapshot_ = std::move(snapshot);
     }
 
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
@@ -477,6 +515,8 @@ public:
             listener_.reset();
             stop_read_.reset();
             stop_write_.reset();
+            session_.clear();
+            listener_port_ = 0;
             return;
         }
         const unsigned char byte = 1;
@@ -485,6 +525,8 @@ public:
         listener_.reset();
         stop_read_.reset();
         stop_write_.reset();
+        session_.clear();
+        listener_port_ = 0;
     }
 
     ~CustomSource() { stop(); }
@@ -553,14 +595,71 @@ private:
         const auto first_line_end = request.find('\n');
         std::string_view first_line(request.data(), first_line_end == std::string::npos ? request.size() : first_line_end);
         if (!first_line.empty() && first_line.back() == '\r') first_line.remove_suffix(1);
+        bool has_host = false;
+        bool exact_host = false;
+        bool has_origin = false;
+        bool headers_valid = true;
+        const auto request_end = header_end(request);
+        if (first_line_end != std::string::npos && request_end != std::string_view::npos) {
+            const std::string expected_host = "127.0.0.1:" + std::to_string(listener_port_);
+            const auto trim_ows = [](std::string_view value) {
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1U);
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1U);
+                return value;
+            };
+            std::size_t cursor = first_line_end + 1U;
+            while (cursor < request_end) {
+                const auto line_end = request.find('\n', cursor);
+                if (line_end == std::string::npos || line_end >= request_end) break;
+                std::string_view line(request.data() + cursor, line_end - cursor);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                cursor = line_end + 1U;
+                if (line.empty()) break;
+                if (line.front() == ' ' || line.front() == '\t') {
+                    headers_valid = false;
+                    continue;
+                }
+                const auto colon = line.find(':');
+                if (colon == std::string_view::npos || colon == 0U) {
+                    headers_valid = false;
+                    continue;
+                }
+                std::string name(line.substr(0, colon));
+                if (!std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '-';
+                    })) {
+                    headers_valid = false;
+                    continue;
+                }
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                const auto value = line.substr(colon + 1U);
+                if (!std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                        return c == '\t' || (c >= 0x20U && c != 0x7fU);
+                    })) {
+                    headers_valid = false;
+                    continue;
+                }
+                if (name == "origin") has_origin = true;
+                if (name == "host") {
+                    exact_host = !has_host && trim_ows(value) == expected_host;
+                    has_host = true;
+                }
+            }
+        }
         std::string response;
-        if (first_line == "GET /servers HTTP/1.1") {
-            std::string body;
+        const bool rooms_route = first_line == "GET /q2dz/rooms HTTP/1.1";
+        const bool servers_route = first_line == "GET /servers HTTP/1.1";
+        if (servers_route || (rooms_route && headers_valid && has_host && exact_host && !has_origin)) {
+            SourceSnapshot snapshot;
             {
                 std::lock_guard lock(mutex_);
-                body = body_;
+                snapshot = snapshot_;
             }
-            response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            const auto& body = rooms_route ? snapshot.rooms : snapshot.servers;
+            const char* content_type = rooms_route ? "application/json; charset=utf-8" : "text/plain; charset=utf-8";
+            response = "HTTP/1.1 200 OK\r\nContent-Type: " + std::string(content_type) + "\r\n"
                        "Cache-Control: no-store\r\nContent-Length: " + std::to_string(body.size()) +
                        "\r\nConnection: close\r\n\r\n" + body;
         } else {
@@ -600,8 +699,10 @@ private:
     UniqueFd stop_write_;
     std::thread worker_;
     mutable std::mutex mutex_;
-    std::string body_;
+    SourceSnapshot snapshot_;
     std::string url_;
+    std::string session_;
+    std::uint16_t listener_port_ = 0;
     std::atomic<bool> failed_{false};
 };
 
@@ -898,19 +999,16 @@ void stop_live_gateway(LiveGateway& gateway,
     std::cerr << "HUB_GATEWAY_STOP reason=" << reason << "\n";
 }
 
-std::vector<q2dz::Endpoint> live_endpoints(const LiveTargets& targets) {
-    std::vector<std::pair<std::string, q2dz::Endpoint>> ordered;
+std::vector<SourceTarget> live_endpoints(const LiveTargets& targets) {
+    std::vector<SourceTarget> ordered;
     ordered.reserve(targets.size());
     for (const auto& [room_id, target] : targets) {
-        if (target.ready && target.endpoint) ordered.emplace_back(room_id, *target.endpoint);
+        if (target.ready && target.endpoint) ordered.push_back(SourceTarget{room_id, target.target_id, *target.endpoint});
     }
     std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-        return left.first < right.first;
+        return left.room_id < right.room_id;
     });
-    std::vector<q2dz::Endpoint> endpoints;
-    endpoints.reserve(ordered.size());
-    for (auto& [unused, endpoint] : ordered) endpoints.push_back(std::move(endpoint));
-    return endpoints;
+    return ordered;
 }
 
 void publish_live_source(CustomSource& source, const LiveTargets& targets) {
@@ -1221,7 +1319,7 @@ int run_live_hub(const Options& options,
     std::optional<LiveGateway> gateway;
     unsigned restart_count = 0;
     bool transport_disabled = false;
-    if (auto started = source.start(); !started) {
+    if (auto started = source.start(session_id); !started) {
         pid_t no_q2 = -1;
         return finish_live_hub(options, targets, gateway, no_q2, guardian, source,
                                "source-start-failed", kInternal);

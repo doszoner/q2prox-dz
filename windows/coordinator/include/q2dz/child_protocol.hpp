@@ -118,8 +118,8 @@ public:
     enum class Error { none, line_too_long, queue_overflow };
 
     static constexpr std::size_t max_line_bytes = 4096;
-    // Bound a small event burst using the existing per-line protocol ceiling.
-    static constexpr std::size_t max_queued_lines = 32;
+    // Keep one slot for a fatal event while covering 256 READY events and a heartbeat.
+    static constexpr std::size_t max_queued_lines = 258;
     static constexpr std::size_t max_queued_bytes = 64 * 1024;
 
     [[nodiscard]] bool feed(std::string_view bytes);

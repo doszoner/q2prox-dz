@@ -297,6 +297,25 @@ void framer_tests() {
     CHECK(hub_ready_events.size() == 1);
     CHECK(q2dz::parse_child_event(hub_ready_events.front()).event.has_value());
 
+    q2dz::ChildEventFramer ready_burst;
+    std::string ready_lines;
+    for (std::size_t i = 1; i <= 256; ++i) {
+        ready_lines += "Q2DZ/HUB/2 READY id=" + std::to_string(i) +
+                       " udp=127.0.0.1:" + std::to_string(27910U + i) +
+                       " peer=" + std::to_string(100U + i) + "\n";
+    }
+    const std::string heartbeat = "Q2DZ/HUB/2 HEARTBEAT state=ok targets=256 ready=256\n";
+    ready_lines += heartbeat;
+    CHECK(ready_burst.feed(ready_lines));
+    CHECK(ready_burst.queued_line_count() == 257);
+    CHECK(ready_burst.queued_byte_count() < q2dz::ChildEventFramer::max_queued_bytes);
+    const auto ready_burst_events = ready_burst.drain();
+    CHECK(ready_burst_events.size() == 257);
+    std::string drained_ready_lines;
+    for (const auto& line : ready_burst_events) drained_ready_lines += line;
+    CHECK(drained_ready_lines == ready_lines);
+    CHECK(ready_burst_events.back() == heartbeat);
+
     q2dz::ChildEventFramer by_count;
     for (std::size_t i=0; i<q2dz::ChildEventFramer::max_queued_lines; ++i) {
         if (!by_count.feed("Q2DZ/1 HEARTBEAT\n")) break;

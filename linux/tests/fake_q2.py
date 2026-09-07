@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import http.client, os, signal, socket, sys, time
+import http.client, json, os, signal, socket, sys, time
 if os.environ.get('Q2DZ_SYNTHETIC_CREDENTIAL'):
     raise SystemExit('credential-shaped parent environment reached fake Q2')
 marker=os.environ.get('Q2DZ_TEST_MARKER')
@@ -37,19 +37,62 @@ if host != '127.0.0.1' or not 1024 <= source_port <= 65535:
 if marker:
     open(marker + '.q2-source-url', 'w').write(source)
 mode=os.environ.get('Q2DZ_FAKE_Q2_MODE','normal')
+
+def read_raw(path, host_header):
+    connection = socket.create_connection((host, source_port), timeout=2)
+    request = f'GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n'.encode()
+    connection.sendall(request)
+    chunks = []
+    while True:
+        data = connection.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+    connection.close()
+    return b''.join(chunks)
+
 def read_source():
+    raw = read_raw('/servers', host)
+    separator = raw.find(b'\r\n\r\n')
+    if separator < 0 or not raw.startswith(b'HTTP/1.1 200 OK\r\n'):
+        sys.exit(7)
+    body = raw[separator + 4:]
+    expected = (b'HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n'
+                b'Cache-Control: no-store\r\nContent-Length: ' + str(len(body)).encode() +
+                b'\r\nConnection: close\r\n\r\n' + body)
+    if raw != expected:
+        sys.exit(7)
+    endpoints = [line.decode('ascii') for line in body.splitlines() if line]
+    if len(endpoints) > 256 or any(not endpoint.startswith('127.0.0.1:') for endpoint in endpoints):
+        sys.exit(8)
+    return endpoints
+
+def read_rooms():
     connection = http.client.HTTPConnection(host, source_port, timeout=2)
-    connection.request('GET', '/servers', headers={'Host': f'{host}:{source_port}', 'Connection': 'close'})
+    connection.request('GET', '/q2dz/rooms', headers={'Host': f'{host}:{source_port}', 'Connection': 'close'})
     response = connection.getresponse()
     body = response.read()
     connection.close()
     if response.status != 200:
-        sys.exit(7)
-    endpoints = [line.decode('ascii') for line in body.splitlines() if line]
-    if len(endpoints) > 2 or any(not endpoint.startswith('127.0.0.1:') for endpoint in endpoints):
-        sys.exit(8)
-    return endpoints
+        if marker:
+            open(marker + '.q2-rooms-failed', 'w').write(str(response.status))
+        sys.exit(11)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        if marker:
+            open(marker + '.q2-rooms-failed', 'w').write('invalid-json')
+        sys.exit(12)
+    if payload.get('version') != 1 or not isinstance(payload.get('session'), str) or payload.get('targets') != []:
+        if marker:
+            open(marker + '.q2-rooms-failed', 'w').write('invalid-empty-snapshot')
+        sys.exit(13)
+    if marker:
+        open(marker + '.q2-rooms-empty', 'w').write(json.dumps(payload, sort_keys=True))
+    return payload
 endpoints = [] if mode == 'no-source-request' else read_source()
+if mode != 'no-source-request':
+    read_rooms()
 if marker:
     open(marker + '.q2-source-empty', 'w').write('1' if not endpoints else '0')
 ports = []

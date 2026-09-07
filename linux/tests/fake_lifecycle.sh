@@ -65,7 +65,8 @@ def event(line):
     sys.stdout.flush()
 
 sel = selectors.DefaultSelector()
-sel.register(sys.stdin.buffer, selectors.EVENT_READ, 'control')
+control = os.fdopen(os.dup(sys.stdin.fileno()), 'rb', buffering=0)
+sel.register(control, selectors.EVENT_READ, 'control')
 targets = {}
 dropped_stale = {}
 pending_ready = []
@@ -197,6 +198,86 @@ sys.stdout.buffer.write(body)
 PY
 }
 
+read_rooms() {
+  python3 - "$SOURCE_URL" <<'PY'
+import http.client, sys
+url = sys.argv[1]
+host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
+connection = http.client.HTTPConnection(host, int(port), timeout=1)
+connection.request('GET', '/q2dz/rooms', headers={'Host': host + ':' + port, 'Connection': 'close'})
+response = connection.getresponse()
+body = response.read()
+connection.close()
+if response.status != 200:
+    raise SystemExit(1)
+sys.stdout.buffer.write(body)
+PY
+}
+
+wait_rooms_count() {
+  local expected=$1
+  for _ in $(seq 1 240); do
+    if body=$(read_rooms 2>/dev/null); then
+      if python3 - "$expected" "$body" <<'PY'
+import json, sys
+expected = int(sys.argv[1])
+payload = json.loads(sys.argv[2])
+raise SystemExit(0 if payload.get('version') == 1 and len(payload.get('targets', [])) == expected else 1)
+PY
+      then return 0; fi
+    fi
+    sleep 0.025
+  done
+  echo "unexpected mapping count; expected $expected" >&2
+  read_rooms >&2 || true
+  return 1
+}
+
+assert_rooms_rejected() {
+  python3 - "$SOURCE_URL" <<'PY'
+import socket, sys
+url = sys.argv[1]
+host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
+port = int(port)
+
+def request(raw):
+    sock = socket.create_connection((host, port), timeout=1)
+    sock.settimeout(1)
+    sock.sendall(raw)
+    chunks = []
+    try:
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    except socket.timeout:
+        pass
+    finally:
+        sock.close()
+    return b''.join(chunks)
+
+valid = f'GET /q2dz/rooms HTTP/1.1\r\nHost:{host}:{port}\r\nConnection: close\r\n\r\n'.encode()
+response = request(valid)
+assert response.startswith(b'HTTP/1.1 200 OK'), response[:80]
+assert b'Access-Control-Allow-Origin' not in response
+ows_valid = f'GET /q2dz/rooms HTTP/1.1\r\nHost:\t{host}:{port}\t\r\nConnection: close\r\n\r\n'.encode()
+assert request(ows_valid).startswith(b'HTTP/1.1 200 OK')
+for raw in (
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://example.invalid\r\nConnection: close\r\n\r\n'.encode(),
+    f'POST /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms?x=1 HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nX-Malformed\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: \x00\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: abc\rdef\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: \x7f\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: '.encode() + b'x' * (8 * 1024),
+):
+    assert not request(raw).startswith(b'HTTP/1.1 200 OK'), raw[:40]
+PY
+}
+
 wait_source_count() {
   local expected=$1
   for _ in $(seq 1 240); do
@@ -241,7 +322,16 @@ start_case() {
   exec {WRITER}>"$CASE/control"
   wait_file "$CASE/mark.q2-source-url"
   SOURCE_URL=$(<"$CASE/mark.q2-source-url")
-  wait_file "$CASE/mark.q2-source-empty"
+  for _ in $(seq 1 240); do
+    [ -f "$CASE/mark.q2-source-empty" ] && break
+    if [ -f "$CASE/mark.q2-rooms-failed" ]; then
+      echo "fake Q2 room mapping failed: $(<"$CASE/mark.q2-rooms-failed")" >&2
+      cat "$CASE/output" >&2 || true
+      return 1
+    fi
+    sleep 0.025
+  done
+  [ -f "$CASE/mark.q2-source-empty" ]
   [ "$(<"$CASE/mark.q2-source-empty")" = 1 ]
 }
 
@@ -293,18 +383,116 @@ expect_protocol_failure() {
 
 # 0 targets: Q2 starts with an empty source; the first heartbeat is dynamic.
 start_case empty-start
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload['version'] == 1 and isinstance(payload['session'], str) and payload['session']
+assert payload['targets'] == []
+PY
+assert_rooms_rejected
 send_ice
 send_room room-a
 wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+target = payload['targets'][0]
+assert target['room'] == 'room-a' and target['kind'] == 'q2'
+assert target['target'].isdigit() and target['endpoint'].startswith('127.0.0.1:')
+PY
 shared_pid=$(<"$CASE/mark.shared-pid")
 send_room room-a
 sleep 0.1
 [ "$(<"$CASE/mark.shared-pid")" = "$shared_pid" ]
 send_room room-b
 wait_source_count 2
+wait_rooms_count 2
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+targets = {item['room']: item for item in payload['targets']}
+assert set(targets) == {'room-a', 'room-b'}
+assert {item['kind'] for item in targets.values()} == {'q2'}
+PY
 [ "$(<"$CASE/mark.shared-attempts")" = 1 ]
 send_drop room-a
 wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+assert [item['room'] for item in payload['targets']] == ['room-b']
+PY
+first_session=$(python3 - "$(read_rooms)" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['session'])
+PY
+)
+stop_case
+
+# Dedicated and ordinary targets keep distinct kinds, while a new coordinator
+# instance gets a new opaque session marker.
+start_case session-change
+second_session=$(python3 - "$(read_rooms)" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['session'])
+PY
+)
+[ "$first_session" != "$second_session" ]
+send_ice
+send_room room.q2ded.server
+wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+target = json.loads(sys.argv[1])['targets'][0]
+assert target['room'] == 'room.q2ded.server' and target['kind'] == 'q2ded'
+PY
+stop_case
+
+# The bounded snapshot carries all 256 ready targets, with no truncation and
+# the same endpoint set as the legacy source.
+start_case max-targets
+send_ice
+for index in $(seq -w 1 256); do send_room "max-$index"; done
+wait_source_count 256
+wait_rooms_count 256
+rooms_body=$(read_rooms)
+servers_body=$(read_source "$SOURCE_URL")
+python3 - "$rooms_body" "$servers_body" <<'PY'
+import json, re, sys
+rooms_body, servers_body = sys.argv[1:]
+payload = json.loads(rooms_body)
+targets = payload['targets']
+assert set(payload) == {'version', 'session', 'targets'}
+assert payload['version'] == 1 and isinstance(payload['session'], str) and payload['session']
+assert len(targets) == 256
+assert len(rooms_body.encode()) <= 256 * 1024
+assert not re.search(r'credential|ice|sdp|peer|secret', rooms_body, re.I)
+assert len({item['room'] for item in targets}) == 256
+assert len({item['target'] for item in targets}) == 256
+assert all(set(item) == {'target', 'endpoint', 'room', 'kind'} for item in targets)
+assert all(item['kind'] == 'q2' and isinstance(item['target'], str) for item in targets)
+mapping_endpoints = sorted(item['endpoint'] for item in targets)
+source_endpoints = sorted(line for line in servers_body.splitlines() if line)
+assert source_endpoints == mapping_endpoints
+assert len(set(mapping_endpoints)) == 256
+PY
+stop_case
+
+# Room IDs remain case-sensitive and therefore do not overwrite one another.
+start_case case-sensitive
+send_ice
+send_room room-a
+send_room Room-A
+wait_source_count 2
+wait_rooms_count 2
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+rooms = {item['room'] for item in json.loads(sys.argv[1])['targets']}
+assert rooms == {'room-a', 'Room-A'}
+PY
 stop_case
 
 # A late event from a removed target is retained until the same room is
@@ -313,14 +501,27 @@ start_case stale stale-event
 send_ice
 send_room room-a
 wait_source_count 1
+stale_initial=$(read_rooms)
 send_drop room-a
 wait_source_count 0
+wait_rooms_count 0
 send_room room-b
 wait_source_count 1
 [ "$(tr '\n' ' ' <"$CASE/mark.shared-ready")" = "1 2 " ]
 [ "$(<"$CASE/mark.shared-attempts")" = 1 ]
 send_room room-a
 wait_source_count 2
+wait_rooms_count 2
+stale_recreated=$(read_rooms)
+python3 - "$stale_initial" "$stale_recreated" <<'PY'
+import json, sys
+before, after = (json.loads(item) for item in sys.argv[1:])
+old_target = next(item['target'] for item in before['targets'] if item['room'] == 'room-a')
+new_targets = [item['target'] for item in after['targets'] if item['room'] == 'room-a']
+assert after['session'] == before['session']
+assert len(new_targets) == 1 and new_targets[0] != old_target
+assert old_target not in {item['target'] for item in after['targets']}
+PY
 wait_file "$CASE/mark.shared-replacement-endpoint"
 replacement_endpoint=$(<"$CASE/mark.shared-replacement-endpoint")
 grep -Fqx "$replacement_endpoint" <<<"$(read_source "$SOURCE_URL")"
@@ -335,8 +536,15 @@ send_ice
 send_room room-a
 send_room room-b
 wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+targets = json.loads(sys.argv[1])['targets']
+assert [item['room'] for item in targets] == ['room-b']
+PY
 wait_file "$CASE/mark.shared-drops"
 wait_source_count 1
+wait_rooms_count 1
 stop_case
 
 # A timeout may produce a late READY for the tombstoned target; it must not

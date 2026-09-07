@@ -333,9 +333,46 @@ private:
     SOCKET value_ = INVALID_SOCKET;
 };
 
+struct SourceTarget {
+    std::string room_id;
+    std::uint64_t target_id = 0;
+    q2dz::LoopbackEndpoint endpoint;
+};
+
+struct SourceSnapshot {
+    std::string servers;
+    std::string rooms;
+};
+
+std::string json_escape(std::string_view value) {
+    std::string out;
+    out.reserve(value.size() + 2U);
+    for (const unsigned char c : value) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20U) {
+                    constexpr char hex[] = "0123456789abcdef";
+                    out += "\\u00";
+                    out.push_back(hex[c >> 4U]);
+                    out.push_back(hex[c & 0x0fU]);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    return out;
+}
+
 class CustomSource {
 public:
-    bool start() {
+    bool start(std::string session) {
         if (worker_.joinable()) return false;
         WSADATA data{};
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return false;
@@ -363,7 +400,9 @@ public:
         listener_ = std::move(listener);
         stop_event_ = std::move(stop_event);
         failure_event_ = std::move(failure_event);
-        url_ = L"http://127.0.0.1:" + std::to_wstring(ntohs(address.sin_port)) + L"/servers";
+        listener_port_ = ntohs(address.sin_port);
+        session_ = std::move(session);
+        url_ = L"http://127.0.0.1:" + std::to_wstring(listener_port_) + L"/servers";
         try {
             worker_ = std::jthread([this](std::stop_token) { serve(); });
         } catch (...) {
@@ -371,6 +410,8 @@ public:
             stop_event_.reset();
             failure_event_.reset();
             url_.clear();
+            session_.clear();
+            listener_port_ = 0;
             WSACleanup();
             winsock_started_ = false;
             return false;
@@ -382,14 +423,32 @@ public:
     [[nodiscard]] HANDLE failure_event() const noexcept { return failure_event_.get(); }
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
 
-    void publish(const std::vector<q2dz::LoopbackEndpoint>& endpoints) {
-        std::string body;
-        for (const auto& endpoint : endpoints) {
-            body += endpoint.text();
-            body.push_back('\n');
+    void publish(const std::vector<SourceTarget>& targets) {
+        if (targets.size() > 256U) {
+            failed_.store(true);
+            return;
+        }
+        SourceSnapshot snapshot;
+        snapshot.rooms = "{\"session\":\"" + json_escape(session_) + "\",\"targets\":[";
+        bool first = true;
+        for (const auto& target : targets) {
+            snapshot.servers += target.endpoint.text();
+            snapshot.servers.push_back('\n');
+            if (!first) snapshot.rooms.push_back(',');
+            first = false;
+            snapshot.rooms += "{\"endpoint\":\"" + json_escape(target.endpoint.text()) +
+                               "\",\"kind\":\"" +
+                               (target.room_id.starts_with("room.q2ded.") ? "q2ded" : "q2") +
+                               "\",\"room\":\"" + json_escape(target.room_id) +
+                               "\",\"target\":\"" + std::to_string(target.target_id) + "\"}";
+        }
+        snapshot.rooms += "],\"version\":1}";
+        if (snapshot.rooms.size() > 256U * 1024U) {
+            failed_.store(true);
+            return;
         }
         std::lock_guard lock(mutex_);
-        body_ = std::move(body);
+        snapshot_ = std::move(snapshot);
     }
 
     void stop() noexcept {
@@ -403,6 +462,8 @@ public:
         listener_.reset();
         stop_event_.reset();
         failure_event_.reset();
+        session_.clear();
+        listener_port_ = 0;
         if (winsock_started_) WSACleanup();
         winsock_started_ = false;
     }
@@ -418,6 +479,8 @@ private:
         stop_event_.reset();
         failure_event_.reset();
         url_.clear();
+        session_.clear();
+        listener_port_ = 0;
         if (winsock_started_) WSACleanup();
         winsock_started_ = false;
         return false;
@@ -497,14 +560,71 @@ private:
         const auto newline = request.find('\n');
         std::string_view first_line(request.data(), newline == std::string::npos ? request.size() : newline);
         if (!first_line.empty() && first_line.back() == '\r') first_line.remove_suffix(1);
-        std::string body;
-        {
-            std::lock_guard lock(mutex_);
-            body = body_;
+        bool has_host = false;
+        bool exact_host = false;
+        bool has_origin = false;
+        bool headers_valid = true;
+        const auto request_end = header_end(request);
+        if (newline != std::string::npos && request_end != std::string_view::npos) {
+            const std::string expected_host = "127.0.0.1:" + std::to_string(listener_port_);
+            const auto trim_ows = [](std::string_view value) {
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1U);
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1U);
+                return value;
+            };
+            std::size_t cursor = newline + 1U;
+            while (cursor < request_end) {
+                const auto line_end = request.find('\n', cursor);
+                if (line_end == std::string::npos || line_end >= request_end) break;
+                std::string_view line(request.data() + cursor, line_end - cursor);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                cursor = line_end + 1U;
+                if (line.empty()) break;
+                if (line.front() == ' ' || line.front() == '\t') {
+                    headers_valid = false;
+                    continue;
+                }
+                const auto colon = line.find(':');
+                if (colon == std::string_view::npos || colon == 0U) {
+                    headers_valid = false;
+                    continue;
+                }
+                std::string name(line.substr(0, colon));
+                if (!std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '-';
+                    })) {
+                    headers_valid = false;
+                    continue;
+                }
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                const auto value = line.substr(colon + 1U);
+                if (!std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                        return c == '\t' || (c >= 0x20U && c != 0x7fU);
+                    })) {
+                    headers_valid = false;
+                    continue;
+                }
+                if (name == "origin") has_origin = true;
+                if (name == "host") {
+                    exact_host = !has_host && trim_ows(value) == expected_host;
+                    has_host = true;
+                }
+            }
         }
         std::string response;
-        if (first_line == "GET /servers HTTP/1.1") {
-            response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        const bool rooms_route = first_line == "GET /q2dz/rooms HTTP/1.1";
+        const bool servers_route = first_line == "GET /servers HTTP/1.1";
+        if (servers_route || (rooms_route && headers_valid && has_host && exact_host && !has_origin)) {
+            SourceSnapshot snapshot;
+            {
+                std::lock_guard lock(mutex_);
+                snapshot = snapshot_;
+            }
+            const auto& body = rooms_route ? snapshot.rooms : snapshot.servers;
+            const char* content_type = rooms_route ? "application/json; charset=utf-8" : "text/plain; charset=utf-8";
+            response = "HTTP/1.1 200 OK\r\nContent-Type: " + std::string(content_type) + "\r\n"
                        "Cache-Control: no-store\r\nContent-Length: " + std::to_string(body.size()) +
                        "\r\nConnection: close\r\n\r\n" + body;
         } else {
@@ -556,8 +676,10 @@ private:
     Handle failure_event_;
     std::jthread worker_;
     std::mutex mutex_;
-    std::string body_;
+    SourceSnapshot snapshot_;
     std::wstring url_;
+    std::string session_;
+    unsigned short listener_port_ = 0;
     std::atomic<bool> failed_{false};
     std::mutex active_mutex_;
     SOCKET active_client_ = INVALID_SOCKET;
@@ -781,23 +903,17 @@ std::uint64_t allocate_target_id(TargetRoutes& routes, std::uint64_t& next_id) {
 }
 
 void publish_source(CustomSource& source, const LiveTargets& targets) {
-    std::vector<std::pair<std::string, q2dz::LoopbackEndpoint>> ordered;
+    std::vector<SourceTarget> ordered;
     ordered.reserve(targets.size());
     for (const auto& [room_id, target] : targets) {
         if (target.state == TargetState::ready && target.endpoint) {
-            ordered.emplace_back(room_id, *target.endpoint);
+            ordered.push_back(SourceTarget{room_id, target.target_id, *target.endpoint});
         }
     }
     std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-        return left.first < right.first;
+        return left.room_id < right.room_id;
     });
-    std::vector<q2dz::LoopbackEndpoint> endpoints;
-    endpoints.reserve(ordered.size());
-    for (const auto& [room_id, endpoint] : ordered) {
-        (void)room_id;
-        endpoints.push_back(endpoint);
-    }
-    source.publish(endpoints);
+    source.publish(ordered);
 }
 
 std::unique_ptr<HubGateway> start_shared_gateway(HANDLE root_job,
@@ -1112,7 +1228,7 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
         session_created = true;
         spawn_cleanup_guardian(self, root, session);
 
-        if (!source.start()) throw std::runtime_error("custom source failed to start");
+        if (!source.start(session.filename().string())) throw std::runtime_error("custom source failed to start");
         source.publish({});
         try {
             gateway = start_shared_gateway(job.get(), options.gateway, session, options.graceful_ms);

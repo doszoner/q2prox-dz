@@ -58,6 +58,19 @@ function Wait-SourceUrl([string]$dir, [int]$timeoutMs = 10000) {
   return Get-Content -LiteralPath $path
 }
 
+function Wait-Q2Initial([string]$dir, [int]$timeoutMs = 10000) {
+  $deadline = [Environment]::TickCount + $timeoutMs
+  do {
+    $failed = Marker $dir 'q2-rooms-failed'
+    if (Test-Path -LiteralPath $failed) {
+      throw "Q2 room mapping failed: $((Get-Content -LiteralPath $failed -Raw).Trim())"
+    }
+    if (Test-Path -LiteralPath (Marker $dir 'q2-source-empty')) { return $true }
+    Start-Sleep -Milliseconds 50
+  } while ([Environment]::TickCount -lt $deadline)
+  return $false
+}
+
 function Wait-GatewayPidChange([string]$dir, [int]$oldPid, [int]$timeoutMs = 10000) {
   $path = Gateway-PidPath $dir
   $deadline = [Environment]::TickCount + $timeoutMs
@@ -154,6 +167,29 @@ function Send-Drop([Diagnostics.Process]$process, [string]$roomId) {
 function Read-Source([string]$url) {
   $client = New-Object System.Net.WebClient
   try { return $client.DownloadString($url) } finally { $client.Dispose() }
+}
+
+function Read-RoomsRaw([string]$url) {
+  $uri = [Uri]$url
+  $roomsUrl = 'http://' + $uri.Authority + '/q2dz/rooms'
+  $client = New-Object System.Net.WebClient
+  try { return $client.DownloadString($roomsUrl) } finally { $client.Dispose() }
+}
+
+function Read-Rooms([string]$url) {
+  return (Read-RoomsRaw $url) | ConvertFrom-Json
+}
+
+function Wait-RoomCount([string]$url, [int]$expected, [int]$timeoutMs = 10000) {
+  $deadline = [Environment]::TickCount + $timeoutMs
+  do {
+    try {
+      $mapping = Read-Rooms $url
+      if ($mapping.version -eq 1 -and @($mapping.targets).Count -eq $expected) { return $mapping }
+    } catch { }
+    Start-Sleep -Milliseconds 50
+  } while ([Environment]::TickCount -lt $deadline)
+  throw "unexpected mapping target count; expected $expected"
 }
 
 function Wait-SourceCount([string]$url, [int]$expected, [int]$timeoutMs = 10000) {
@@ -288,15 +324,30 @@ try {
 
   # One process serves a dynamic 0 -> 1 -> 2 -> 1 -> 0 target set.
   $case = Start-Case 'dynamic'
-  if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw 'Q2 did not read the empty source' }
+  if (-not (Wait-Q2Initial $case.Dir)) { throw 'Q2 did not read the empty source' }
   $source = Wait-SourceUrl $case.Dir
+  $emptyMapping = Read-Rooms $source
+  if ($emptyMapping.version -ne 1 -or [string]::IsNullOrEmpty($emptyMapping.session) -or @($emptyMapping.targets).Count -ne 0) {
+    throw 'empty room mapping is invalid'
+  }
+  $firstSession = $emptyMapping.session
   $q2Pid = [int](Get-Content (Marker $case.Dir 'q2.pid'))
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   $gatewayPid = Wait-GatewayPid $case.Dir
   if (-not (Wait-SourceCount $source 1)) { throw ('source did not publish room A; ' + (Case-Diagnostics $case)) }
+  $mapping = Wait-RoomCount $source 1
+  if ($mapping.targets[0].room -ne 'room-a' -or $mapping.targets[0].kind -ne 'q2' -or
+      $mapping.targets[0].target -notmatch '^[0-9]+$' -or $mapping.targets[0].endpoint -notmatch '^127\.0\.0\.1:[0-9]+$') {
+    throw 'room A mapping is invalid'
+  }
   Send-Put $case.Process 'room-b'
   if (-not (Wait-SourceCount $source 2)) { throw ('source did not publish room B; ' + (Case-Diagnostics $case)) }
+  $mapping = Wait-RoomCount $source 2
+  if (@($mapping.targets | Where-Object { $_.kind -ne 'q2' }).Count -ne 0 -or
+      @($mapping.targets | Where-Object { $_.room -notin @('room-a', 'room-b') }).Count -ne 0) {
+    throw 'room A/B mapping mixed kinds or rooms'
+  }
   Assert-ProcessAlive $gatewayPid 'shared gateway'
   Assert-ProcessAlive $q2Pid 'Q2'
   Send-Put $case.Process 'room-a'
@@ -305,14 +356,108 @@ try {
   if ((Wait-GatewayPid $case.Dir) -ne $gatewayPid) { throw 'heartbeat restarted shared gateway' }
   Send-Drop $case.Process 'room-a'
   if (-not (Wait-SourceCount $source 1)) { throw 'DROP room A removed room B' }
+  $mapping = Wait-RoomCount $source 1
+  if ($mapping.targets[0].room -ne 'room-b') { throw 'DROP room A left the wrong mapping' }
   Assert-ProcessAlive $q2Pid 'Q2 after room A drop'
   Send-Drop $case.Process 'room-b'
   if (-not (Wait-SourceCount $source 0)) { throw 'DROP room B did not empty source' }
   Stop-Case $case
 
+  $case = Start-Case 'session-change'
+  Wait-Q2Initial $case.Dir | Out-Null
+  $source = Wait-SourceUrl $case.Dir
+  $secondSession = (Read-Rooms $source).session
+  if ($firstSession -eq $secondSession) { throw 'coordinator restart reused room mapping session' }
+  Send-Ice $case.Process
+  Send-Put $case.Process 'room.q2ded.server'
+  if (-not (Wait-SourceCount $source 1)) { throw 'q2ded source did not become ready' }
+  $mapping = Wait-RoomCount $source 1
+  if ($mapping.targets[0].room -ne 'room.q2ded.server' -or $mapping.targets[0].kind -ne 'q2ded') {
+    throw 'q2ded mapping kind is invalid'
+  }
+  Stop-Case $case
+
+  # The bounded snapshot carries all 256 ready targets, with no truncation and
+  # the same endpoint set as the legacy source.
+  $case = Start-Case 'max-targets'
+  Wait-Q2Initial $case.Dir | Out-Null
+  $source = Wait-SourceUrl $case.Dir
+  Send-Ice $case.Process
+  for ($index = 1; $index -le 256; $index++) {
+    Send-Put $case.Process ('max-' + $index.ToString('000'))
+  }
+  if (-not (Wait-SourceCount $source 256)) {
+    $diagnosticSourceCount = 'unreadable'
+    $diagnosticRoomsCount = 'unreadable'
+    $diagnosticError = ''
+    try {
+      $diagnosticSource = Read-Source $source
+      $diagnosticSourceCount = @($diagnosticSource -split "`r?`n" |
+        Where-Object { $_ -match '^127\.0\.0\.1:[0-9]+$' }).Count
+    } catch {
+      $diagnosticError = 'source=' + $_.Exception.GetType().Name
+    }
+    try {
+      $diagnosticRoomsCount = @((Read-Rooms $source).targets).Count
+    } catch {
+      if ($diagnosticError) { $diagnosticError += ';' }
+      $diagnosticError += 'rooms=' + $_.Exception.GetType().Name
+    }
+    $caseDiagnostic = ''
+    try {
+      $caseDiagnostic = Case-Diagnostics $case
+    } catch {
+      $caseDiagnostic = 'case-diagnostics-error=' + $_.Exception.GetType().Name
+    }
+    throw ("source truncated the 256-target snapshot; observed source-count={0} rooms-count={1} diagnostics=[{2}] {3}" -f
+      $diagnosticSourceCount, $diagnosticRoomsCount, $diagnosticError, $caseDiagnostic)
+  }
+  $roomsRaw = Read-RoomsRaw $source
+  if ([Text.Encoding]::UTF8.GetByteCount($roomsRaw) -gt 256KB) { throw 'room mapping exceeded 256 KiB' }
+  if ($roomsRaw -match '(?i)credential|ice|sdp|peer|secret') { throw 'room mapping exposed a forbidden field' }
+  $mapping = $roomsRaw | ConvertFrom-Json
+  $rootNames = @($mapping.PSObject.Properties.Name)
+  $missingRoot = @(@('version', 'session', 'targets') | Where-Object { $rootNames -cnotcontains $_ })
+  if ($rootNames.Count -ne 3 -or $missingRoot.Count -ne 0) {
+    throw 'room mapping root field allowlist changed'
+  }
+  $targets = @($mapping.targets)
+  if ($mapping.version -ne 1 -or [string]::IsNullOrEmpty($mapping.session) -or $targets.Count -ne 256) {
+    throw 'room mapping did not retain all 256 targets'
+  }
+  foreach ($target in $targets) {
+    $targetNames = @($target.PSObject.Properties.Name)
+    $missingTarget = @(@('target', 'endpoint', 'room', 'kind') | Where-Object { $targetNames -cnotcontains $_ })
+    if ($targetNames.Count -ne 4 -or $missingTarget.Count -ne 0) {
+      throw 'room mapping target field allowlist changed'
+    }
+    if ($target.kind -ne 'q2' -or $target.target -notmatch '^[0-9]+$') { throw 'room mapping target shape is invalid' }
+  }
+  $mappingEndpoints = @($targets | ForEach-Object { $_.endpoint } | Sort-Object)
+  $sourceEndpoints = @((Read-Source $source) -split "`r?`n" | Where-Object { $_ -match '^127\.0\.0\.1:[0-9]+$' } | Sort-Object)
+  if ($mappingEndpoints.Count -ne 256 -or @($mappingEndpoints | Select-Object -Unique).Count -ne 256 -or
+      $sourceEndpoints.Count -ne 256 -or @(Compare-Object $sourceEndpoints $mappingEndpoints).Count -ne 0) {
+    throw 'room mapping endpoint set differs from /servers'
+  }
+  Stop-Case $case
+
+  $case = Start-Case 'case-sensitive'
+  Wait-Q2Initial $case.Dir | Out-Null
+  $source = Wait-SourceUrl $case.Dir
+  Send-Ice $case.Process
+  Send-Put $case.Process 'room-a'
+  Send-Put $case.Process 'Room-A'
+  if (-not (Wait-SourceCount $source 2)) { throw 'case-sensitive targets did not both become ready' }
+  $mapping = Wait-RoomCount $source 2
+  $rooms = @($mapping.targets | ForEach-Object { $_.room })
+  if ($rooms.Count -ne 2 -or $rooms -cnotcontains 'room-a' -or $rooms -cnotcontains 'Room-A') {
+    throw 'room IDs were not case-sensitive'
+  }
+  Stop-Case $case
+
   # An oversized fragment poisons the queue; later valid commands are ignored.
   $case = Start-Case 'protocol-fail-closed'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $oversized = [string]::new('x', 256KB + 1) + "`n"
   $tail = "Q2DZ/ROOMS/2 ICE generation=1 json=[]`n" +
     "Q2DZ/ROOMS/2 PUT room=room-after-error json=" + (Room-Json 'room-after-error') + "`n"
@@ -326,7 +471,7 @@ try {
 
   # A malformed command after more than one drain-sized batch invalidates the whole batch.
   $case = Start-Case 'protocol-malformed-batch'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $batch = New-Object System.Text.StringBuilder
   [void]$batch.AppendLine('Q2DZ/ROOMS/2 ICE generation=1 json=[]')
   for ($index = 1; $index -le 33; $index++) {
@@ -347,7 +492,7 @@ try {
 
   # READY may arrive in a different order from PUT; both routes remain isolated.
   $case = Start-Case 'shuffled-ready' 'shuffled-ready' 'shuffled-ready' 'long-running' 'shuffled-ready'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -361,7 +506,7 @@ try {
   # A target FAILED/CLOSED event is isolated from a healthy sibling.
   foreach ($failureMode in @('fatal-immediate', 'room-close-immediate')) {
     $case = Start-Case ("isolated-" + $failureMode) $failureMode 'normal'
-    if (-not (Wait-Path (Marker $case.Dir 'q2-source-empty'))) { throw "$failureMode case did not start Q2" }
+    if (-not (Wait-Q2Initial $case.Dir)) { throw "$failureMode case did not start Q2" }
     $source = Wait-SourceUrl $case.Dir
     Send-Ice $case.Process
     Send-Put $case.Process 'room-a'
@@ -375,16 +520,26 @@ try {
 
   # Old events after DROP+PUT cannot affect the replacement target.
   $case = Start-Case 'stale-target' 'stale-after-drop' 'normal'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   if (-not (Wait-SourceCount $source 1)) { throw 'stale case initial target was not ready' }
+  $staleInitial = Read-Rooms $source
+  $staleSession = $staleInitial.session
+  $staleTarget = @($staleInitial.targets | Where-Object { $_.room -ceq 'room-a' })[0].target
   $gatewayPid = Wait-GatewayPid $case.Dir
   Send-Drop $case.Process 'room-a'
   if (-not (Wait-SourceCount $source 0)) { throw 'stale case DROP did not clear source' }
+  if ((Wait-RoomCount $source 0).targets.Count -ne 0) { throw 'stale case DROP left a room mapping' }
   Send-Put $case.Process 'room-a'
   if (-not (Wait-SourceCount $source 1)) { throw 'replacement target was not ready' }
+  $staleRecreated = Wait-RoomCount $source 1
+  $newStaleTarget = @($staleRecreated.targets | Where-Object { $_.room -ceq 'room-a' })[0].target
+  if ($staleRecreated.session -cne $staleSession -or $newStaleTarget -eq $staleTarget -or
+      @($staleRecreated.targets | Where-Object { $_.target -eq $staleTarget }).Count -ne 0) {
+    throw 'DROP/recreate did not replace the target generation in the same session'
+  }
   Start-Sleep -Milliseconds 250
   if (-not (Wait-SourceCount $source 1)) { throw 'stale event changed replacement source count' }
   $replacementSource = Read-Source $source
@@ -399,12 +554,14 @@ try {
 
   # A pending target timeout removes only that target.
   $case = Start-Case 'target-timeout' 'never-ready' 'normal' 'long-running' 'normal' 300
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   Send-Put $case.Process 'room-b'
   if (-not (Wait-SourceCount $source 1)) { throw 'target timeout did not leave room B' }
+  $mapping = Wait-RoomCount $source 1
+  if ($mapping.targets[0].room -ne 'room-b') { throw 'pending room leaked into mapping' }
   Start-Sleep -Milliseconds 500
   if (-not (Wait-MarkerValue $case.Dir 'gateway-drop-count' '1')) {
     throw 'target timeout did not drop room A after its deadline'
@@ -415,7 +572,7 @@ try {
 
   # Preserve the former bounded q2/q2ded recovery policy across new target ids.
   $case = Start-Case 'bounded-recovery' 'failed-after-ready' 'normal' 'long-running' 'fatal-immediate'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -436,7 +593,7 @@ try {
 
   # q2 CLOSED is terminal; q2ded CLOSED gets the same two bounded retries as FAILED.
   $case = Start-Case 'bounded-recovery-closed' 'room-close-immediate' 'normal' 'long-running' 'room-close-immediate'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '1')) { throw 'q2 CLOSED initial PUT missing' }
@@ -454,7 +611,7 @@ try {
 
   # A partial command from before global recovery is discarded through its newline.
   $case = Start-Case 'partial-recovery'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -475,7 +632,7 @@ try {
 
   # The discarded remainder remains bounded even when it never supplies a newline.
   $case = Start-Case 'partial-recovery-oversized'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -493,7 +650,7 @@ try {
 
   # EOF while discarding a recovered partial command is a protocol failure.
   $case = Start-Case 'partial-recovery-eof'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -511,7 +668,7 @@ try {
 
   # Exactly one global recovery; no payload replay; second crash disables input.
   $case = Start-Case 'global-restart' 'exit-after-ready' 'normal' 'long-running' 'exit-after-ready'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'
@@ -542,7 +699,7 @@ try {
   Stop-Case $case
 
   $case = Start-Case 'owner-hard-kill'
-  Wait-Path (Marker $case.Dir 'q2-source-empty') | Out-Null
+  Wait-Q2Initial $case.Dir | Out-Null
   $source = Wait-SourceUrl $case.Dir
   Send-Ice $case.Process
   Send-Put $case.Process 'room-a'

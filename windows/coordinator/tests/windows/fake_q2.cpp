@@ -63,7 +63,8 @@ bool endpoint_line(std::string_view value) {
     return errno == 0 && end != nullptr && *end == '\0' && port >= 1024 && port <= 65535;
 }
 
-bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
+bool read_http(unsigned short port, std::string_view path, std::string_view host,
+               std::string_view origin, std::string& response) {
     SOCKET socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (socket_handle == INVALID_SOCKET) return false;
     sockaddr_in address{};
@@ -74,12 +75,15 @@ bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
         closesocket(socket_handle);
         return false;
     }
-    constexpr char request[] = "GET /servers HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    if (send(socket_handle, request, static_cast<int>(sizeof(request) - 1), 0) == SOCKET_ERROR) {
+    std::string request = "GET " + std::string(path) + " HTTP/1.1\r\nHost: " + std::string(host) +
+                          "\r\n";
+    if (!origin.empty()) request += "Origin: " + std::string(origin) + "\r\n";
+    request += "Connection: close\r\n\r\n";
+    if (send(socket_handle, request.data(), static_cast<int>(request.size()), 0) == SOCKET_ERROR) {
         closesocket(socket_handle);
         return false;
     }
-    std::string response;
+    response.clear();
     char buffer[4096];
     for (;;) {
         const int count = recv(socket_handle, buffer, sizeof(buffer), 0);
@@ -96,6 +100,12 @@ bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
     }
     closesocket(socket_handle);
 
+    return true;
+}
+
+bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
+    std::string response;
+    if (!read_http(port, "/servers", "127.0.0.1", {}, response)) return false;
     const auto separator = response.find("\r\n\r\n");
     if (separator == std::string::npos || response.rfind("HTTP/1.1 200 OK", 0) != 0) return false;
     const auto header_end = separator + 4;
@@ -110,6 +120,10 @@ bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
     const auto length = std::strtoul(length_text.c_str(), &length_end, 10);
     if (errno != 0 || length_end == nullptr || *length_end != '\0' || response.size() - header_end != length) return false;
     const auto body = std::string_view(response).substr(header_end);
+    const std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                                 "Cache-Control: no-store\r\nContent-Length: " + std::to_string(body.size()) +
+                                 "\r\nConnection: close\r\n\r\n" + std::string(body);
+    if (response != expected) return false;
     endpoints.clear();
     std::size_t start = 0;
     while (start < body.size()) {
@@ -124,6 +138,74 @@ bool read_source(unsigned short port, std::vector<std::string>& endpoints) {
         if (end_line == std::string_view::npos) break;
         start = end_line + 1;
     }
+    return true;
+}
+
+bool read_rooms(unsigned short port, const std::filesystem::path& marker_directory) {
+    std::string response;
+    const std::string host = "127.0.0.1:" + std::to_string(port);
+    if (!read_http(port, "/q2dz/rooms", host, {}, response)) return false;
+    const auto separator = response.find("\r\n\r\n");
+    if (separator == std::string::npos || response.rfind("HTTP/1.1 200 OK", 0) != 0 ||
+        response.find("\r\nContent-Type: application/json; charset=utf-8\r\n", 0) == std::string::npos) {
+        write_marker(marker_directory, L"q2-rooms-failed", "status");
+        return false;
+    }
+    const auto body = std::string_view(response).substr(separator + 4U);
+    if (body.find("\"version\":1") == std::string_view::npos ||
+        body.find("\"session\":\"") == std::string_view::npos ||
+        body.find("\"targets\":[]") == std::string_view::npos) {
+        write_marker(marker_directory, L"q2-rooms-failed", "invalid-empty-snapshot");
+        return false;
+    }
+    std::string accepted;
+    const std::string ows_host = "\t" + host + "\t";
+    if (!read_http(port, "/q2dz/rooms", ows_host, {}, accepted) ||
+        accepted.rfind("HTTP/1.1 200 OK", 0) != 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "ows-host");
+        return false;
+    }
+    std::string rejected;
+    if (!read_http(port, "/q2dz/rooms", "127.0.0.1", {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "wrong-host");
+        return false;
+    }
+    if (!read_http(port, "/q2dz/rooms", host, "http://example.invalid", rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "origin");
+        return false;
+    }
+    if (!read_http(port, "/q2dz/rooms", host + "\r\nX-Malformed", {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "malformed-header");
+        return false;
+    }
+    const std::string nul_value = host + "\r\nX: " + std::string(1U, '\0');
+    if (!read_http(port, "/q2dz/rooms", nul_value, {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "nul-header-value");
+        return false;
+    }
+    const std::string interior_cr = host + "\r\nX: abc\rdef";
+    if (!read_http(port, "/q2dz/rooms", interior_cr, {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "cr-header-value");
+        return false;
+    }
+    const std::string del_value = host + "\r\nX: \x7f";
+    if (!read_http(port, "/q2dz/rooms", del_value, {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "del-header-value");
+        return false;
+    }
+    const std::string oversized_host = host + "\r\nX: " + std::string(8U * 1024U, 'x');
+    if (!read_http(port, "/q2dz/rooms", oversized_host, {}, rejected) ||
+        rejected.rfind("HTTP/1.1 200 OK", 0) == 0) {
+        write_marker(marker_directory, L"q2-rooms-failed", "oversized-header");
+        return false;
+    }
+    write_marker(marker_directory, L"q2-rooms-empty", std::string(body));
     return true;
 }
 
@@ -182,12 +264,16 @@ int wmain(int argc, wchar_t** argv) {
         return 31;
     }
     std::size_t observed_count = endpoints.size();
-    write_marker(marker_directory, L"q2-source-empty", observed_count == 0 ? "1" : "0");
-    write_marker(marker_directory, L"q2-source-" + std::to_wstring(observed_count));
     std::string source_url;
     source_url.reserve(arguments[8].size());
     for (const wchar_t character : arguments[8]) source_url.push_back(static_cast<char>(character));
     write_marker(marker_directory, L"q2-source-url", source_url);
+    if (!read_rooms(source_port, marker_directory)) {
+        WSACleanup();
+        return 32;
+    }
+    write_marker(marker_directory, L"q2-source-empty", observed_count == 0 ? "1" : "0");
+    write_marker(marker_directory, L"q2-source-" + std::to_wstring(observed_count));
 
     if (mode == L"hub-room-close" || mode == L"hub-room-crash") {
         for (int attempt = 0; attempt < 200 && observed_count < 1; ++attempt) {
