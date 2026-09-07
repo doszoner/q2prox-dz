@@ -2,34 +2,183 @@
 set -euo pipefail
 
 SESSION=$1
-MANAGED=$2
 HERE=$(cd -- "$(dirname -- "$0")" && pwd -P)
 TMP=$(mktemp -d -t q2dz-live-hub.XXXXXX)
 trap 'rm -rf -- "$TMP"' EXIT
 ADAPTER="$TMP/adapter.json"
-cat >"$ADAPTER" <<JSON
-{
-  "argv": ["--bind", "{internal_endpoint}", "--signal", "wss://net.js-dos.com:444", "--ice-file", "{ice_memfd}", "--alias", "{alias}", "--max-datagram", "1400"],
-  "probeTimeoutMs": 2500,
-  "probeIntervalMs": 100,
-  "roomCloseProbeIdleMs": 5000,
-  "roomCloseFailures": 2,
-  "maxDatagram": 1400
-}
+cat >"$ADAPTER" <<'JSON'
+{"argv":["--bind","{internal_endpoint}","--signal","wss://net.js-dos.com:444","--ice-file","{ice_memfd}","--alias","{alias}","--max-datagram","1400"],"probeTimeoutMs":2500,"probeIntervalMs":100,"roomCloseProbeIdleMs":5000,"roomCloseFailures":2,"maxDatagram":1400}
 JSON
 
+cat >"$TMP/fake_shared.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, selectors, socket, sys, time
+
+marker = os.environ.get('Q2DZ_TEST_MARKER')
+mode_spec = os.environ.get('Q2DZ_FAKE_LEGACY_MODE', 'normal')
+attempts = 0
+if marker:
+    try:
+        with open(marker + '.shared-attempts', encoding='ascii') as stream:
+            attempts = int(stream.read() or '0')
+    except FileNotFoundError:
+        pass
+    attempts += 1
+    with open(marker + '.shared-attempts', 'w', encoding='ascii') as stream:
+        stream.write(str(attempts))
+    with open(marker + '.shared-pid', 'w', encoding='ascii') as stream:
+        stream.write(str(os.getpid()))
+
+def mode_for(room_id):
+    for item in mode_spec.split(';'):
+        key, sep, value = item.partition('=')
+        if sep and key == room_id:
+            return value
+    return mode_spec
+
+def append_marker(suffix, value):
+    if not marker:
+        return
+    with open(marker + suffix, 'a', encoding='ascii') as stream:
+        stream.write(value + '\n')
+
+def increment_marker(suffix):
+    if not marker:
+        return
+    path = marker + suffix
+    try:
+        with open(path, encoding='ascii') as stream:
+            value = int(stream.read() or '0')
+    except FileNotFoundError:
+        value = 0
+    with open(path, 'w', encoding='ascii') as stream:
+        stream.write(str(value + 1))
+
+def event(line):
+    if ' READY id=' in line:
+        append_marker('.shared-ready', line.split(' id=', 1)[1].split(' ', 1)[0])
+    elif ' FAILED id=' in line:
+        append_marker('.shared-failed', line.split(' id=', 1)[1].split(' ', 1)[0])
+    elif ' CLOSED id=' in line:
+        append_marker('.shared-closed', line.split(' id=', 1)[1].split(' ', 1)[0])
+    sys.stdout.write(line + '\n')
+    sys.stdout.flush()
+
+sel = selectors.DefaultSelector()
+control = os.fdopen(os.dup(sys.stdin.fileno()), 'rb', buffering=0)
+sel.register(control, selectors.EVENT_READ, 'control')
+targets = {}
+dropped_stale = {}
+pending_ready = []
+pending_exit = None
+while True:
+    for key, _ in sel.select(0.05):
+        if key.data != 'control':
+            continue
+        raw = key.fileobj.readline()
+        if not raw:
+            raise SystemExit(0)
+        line = raw.decode('utf-8').rstrip('\r\n')
+        if not line.startswith('Q2DZ/HUB/2 '):
+            raise SystemExit(30)
+        command = line[len('Q2DZ/HUB/2 '):]
+        if command == 'STOP':
+            raise SystemExit(0)
+        if command.startswith('ICE '):
+            continue
+        if command.startswith('DROP id='):
+            target_id = int(command[8:])
+            old = targets.pop(target_id, None)
+            if old is not None:
+                append_marker('.shared-drops', str(target_id))
+                sel.unregister(old[0])
+                old[0].close()
+                if old[1] == 'stale-event':
+                    # Keep the old generation until the same room is PUT
+                    # again.  The late event must not be emitted for DROP or
+                    # for an unrelated room.
+                    dropped_stale[old[2]] = target_id
+                elif old[1] == 'timeout-late-ready':
+                    event('Q2DZ/HUB/2 READY id=%d udp=127.0.0.1:27910 peer=999' % target_id)
+            continue
+        if not command.startswith('PUT id='):
+            raise SystemExit(31)
+        head, payload = command.split(' json=', 1)
+        target_id = int(head[7:])
+        config = json.loads(payload)
+        room_id = config['roomId']
+        increment_marker('.shared-puts')
+        mode = mode_for(room_id)
+        if mode == 'global-crash-after-ready' and attempts > 1:
+            mode = 'normal'
+        if mode == 'event-flood' and attempts > 1:
+            mode = 'normal'
+        if target_id in targets:
+            continue
+        stale_target_id = dropped_stale.pop(room_id, None) if mode == 'stale-event' else None
+        if mode == 'global-crash':
+            os._exit(21)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('127.0.0.1', 0))
+        sock.setblocking(False)
+        targets[target_id] = (sock, mode, room_id)
+        sel.register(sock, selectors.EVENT_READ, target_id)
+        if mode in ('never-ready', 'timeout-late-ready'):
+            continue
+        if mode == 'malformed-ready':
+            event('Q2DZ/HUB/2 READY id=%d udp=0.0.0.0:27910 peer=1' % target_id)
+            continue
+        port = sock.getsockname()[1]
+        if mode == 'shuffled':
+            pending_ready.append((target_id, port))
+            if len(pending_ready) >= 2:
+                for ready_id, ready_port in reversed(pending_ready):
+                    event('Q2DZ/HUB/2 READY id=%d udp=127.0.0.1:%d peer=%d' % (ready_id, ready_port, ready_id))
+                pending_ready.clear()
+            continue
+        if stale_target_id is not None:
+            append_marker('.shared-replacement-endpoint', '127.0.0.1:%d' % port)
+            event('Q2DZ/HUB/2 READY id=%d udp=127.0.0.1:27910 peer=999' % stale_target_id)
+        event('Q2DZ/HUB/2 READY id=%d udp=127.0.0.1:%d peer=%d' % (target_id, port, target_id))
+        if mode == 'target-failed':
+            event('Q2DZ/HUB/2 FAILED id=%d stage=transport code=test_failure' % target_id)
+            sel.unregister(sock)
+            sock.close()
+            del targets[target_id]
+        elif mode == 'target-closed':
+            event('Q2DZ/HUB/2 CLOSED id=%d reason=test_closed' % target_id)
+            sel.unregister(sock)
+            sock.close()
+            del targets[target_id]
+        elif mode == 'global-crash-after-ready':
+            pending_exit = time.monotonic() + 0.25
+        elif mode == 'event-flood':
+            for _ in range(96):
+                sys.stdout.write('Q2DZ/HUB/2 HEARTBEAT state=ok targets=1 ready=1\n')
+            sys.stdout.flush()
+            append_marker('.shared-flood', 'done')
+    if pending_exit is not None and time.monotonic() >= pending_exit:
+        os._exit(22)
+    for key, _ in sel.select(0):
+        if isinstance(key.data, int):
+            data, address = key.fileobj.recvfrom(65535)
+            key.fileobj.sendto(data, address)
+PY
+chmod +x "$TMP/fake_shared.py"
+
 room_json() {
-  local alias=$1
-  printf '{"alias":"%s","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"","game":"baseq2","credential":"q2dz-secret-canary"}' "$alias"
+  local room=$1
+  printf '{"roomId":"%s","alias":"q2.%s","iceServers":[{"urls":["stun:example.invalid"]}],"ordered":false,"map":"","game":"baseq2","credential":"q2dz-secret-canary"}' "$room" "$room"
 }
 
 wait_file() {
   local path=$1
-  for _ in $(seq 1 200); do
+  for _ in $(seq 1 240); do
     [ -f "$path" ] && return 0
     sleep 0.025
   done
   echo "timed out waiting for $path" >&2
+  cat "$(dirname "$path")/output" >&2 2>/dev/null || true
   return 1
 }
 
@@ -37,10 +186,9 @@ read_source() {
   python3 - "$1" <<'PY'
 import http.client, sys
 url = sys.argv[1]
-host_port = url[len('http://'):].split('/', 1)[0]
-host, port = host_port.rsplit(':', 1)
+host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
 connection = http.client.HTTPConnection(host, int(port), timeout=1)
-connection.request('GET', '/servers', headers={'Host': host_port, 'Connection': 'close'})
+connection.request('GET', '/servers', headers={'Host': host + ':' + port, 'Connection': 'close'})
 response = connection.getresponse()
 body = response.read()
 connection.close()
@@ -50,13 +198,93 @@ sys.stdout.buffer.write(body)
 PY
 }
 
+read_rooms() {
+  python3 - "$SOURCE_URL" <<'PY'
+import http.client, sys
+url = sys.argv[1]
+host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
+connection = http.client.HTTPConnection(host, int(port), timeout=1)
+connection.request('GET', '/q2dz/rooms', headers={'Host': host + ':' + port, 'Connection': 'close'})
+response = connection.getresponse()
+body = response.read()
+connection.close()
+if response.status != 200:
+    raise SystemExit(1)
+sys.stdout.buffer.write(body)
+PY
+}
+
+wait_rooms_count() {
+  local expected=$1
+  for _ in $(seq 1 240); do
+    if body=$(read_rooms 2>/dev/null); then
+      if python3 - "$expected" "$body" <<'PY'
+import json, sys
+expected = int(sys.argv[1])
+payload = json.loads(sys.argv[2])
+raise SystemExit(0 if payload.get('version') == 1 and len(payload.get('targets', [])) == expected else 1)
+PY
+      then return 0; fi
+    fi
+    sleep 0.025
+  done
+  echo "unexpected mapping count; expected $expected" >&2
+  read_rooms >&2 || true
+  return 1
+}
+
+assert_rooms_rejected() {
+  python3 - "$SOURCE_URL" <<'PY'
+import socket, sys
+url = sys.argv[1]
+host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
+port = int(port)
+
+def request(raw):
+    sock = socket.create_connection((host, port), timeout=1)
+    sock.settimeout(1)
+    sock.sendall(raw)
+    chunks = []
+    try:
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    except socket.timeout:
+        pass
+    finally:
+        sock.close()
+    return b''.join(chunks)
+
+valid = f'GET /q2dz/rooms HTTP/1.1\r\nHost:{host}:{port}\r\nConnection: close\r\n\r\n'.encode()
+response = request(valid)
+assert response.startswith(b'HTTP/1.1 200 OK'), response[:80]
+assert b'Access-Control-Allow-Origin' not in response
+ows_valid = f'GET /q2dz/rooms HTTP/1.1\r\nHost:\t{host}:{port}\t\r\nConnection: close\r\n\r\n'.encode()
+assert request(ows_valid).startswith(b'HTTP/1.1 200 OK')
+for raw in (
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://example.invalid\r\nConnection: close\r\n\r\n'.encode(),
+    f'POST /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms?x=1 HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nX-Malformed\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: \x00\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: abc\rdef\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: \x7f\r\nConnection: close\r\n\r\n'.encode(),
+    f'GET /q2dz/rooms HTTP/1.1\r\nHost: {host}:{port}\r\nX: '.encode() + b'x' * (8 * 1024),
+):
+    assert not request(raw).startswith(b'HTTP/1.1 200 OK'), raw[:40]
+PY
+}
+
 wait_source_count() {
   local expected=$1
-  for _ in $(seq 1 200); do
+  for _ in $(seq 1 240); do
     if body=$(read_source "$SOURCE_URL" 2>/dev/null); then
       local count
-      count=$(grep -Ec '^127.0.0.1:[0-9]+$' <<<"$body" || true)
-      if [ "$count" -eq "$expected" ]; then return 0; fi
+      count=$(grep -Ec '^127\.0\.0\.1:[0-9]+$' <<<"$body" || true)
+      [ "$count" -eq "$expected" ] && return 0
     fi
     sleep 0.025
   done
@@ -66,25 +294,49 @@ wait_source_count() {
   return 1
 }
 
+assert_source_lacks() {
+  local endpoint=$1
+  for _ in $(seq 1 240); do
+    if body=$(read_source "$SOURCE_URL" 2>/dev/null); then
+      ! grep -Fqx "$endpoint" <<<"$body" && return 0
+    fi
+    sleep 0.025
+  done
+  echo "unexpected endpoint in source: $endpoint" >&2
+  read_source "$SOURCE_URL" >&2 || true
+  return 1
+}
+
 start_case() {
-  local name=$1
-  local legacy_mode=${2:-normal}
-  local q2_mode=${3:-sleep}
-  local grace_ms=${4:-300}
+  local name=$1 mode=${2:-normal} q2_mode=${3:-sleep}
   CASE="$TMP/$name"
   mkdir -p "$CASE"
   mkfifo "$CASE/control"
-  Q2DZ_TEST_MARKER="$CASE/mark"   Q2DZ_FAKE_LEGACY_MODE="$legacy_mode"   Q2DZ_FAKE_Q2_MODE="$q2_mode"   Q2DZ_SYNTHETIC_CREDENTIAL='q2dz-secret-canary'     "$SESSION" --gateway "$MANAGED" --legacy-gateway "$HERE/fake_legacy.py"       --adapter "$ADAPTER" --q2 "$HERE/fake_q2.py" --wine "$HERE/fake_wine.sh"       --game 3zb2 --runtime-base "$CASE/runtime" --ready-timeout-ms 1200       --shutdown-grace-ms "$grace_ms" <"$CASE/control" >"$CASE/output" 2>&1 &
+  Q2DZ_TEST_MARKER="$CASE/mark" Q2DZ_FAKE_LEGACY_MODE="$mode" \
+    Q2DZ_FAKE_Q2_MODE="$q2_mode" Q2DZ_SYNTHETIC_CREDENTIAL='q2dz-secret-canary' \
+    "$SESSION" --gateway "$TMP/fake_shared.py" --legacy-gateway "$HERE/fake_legacy.py" \
+      --adapter "$ADAPTER" --q2 "$HERE/fake_q2.py" --wine "$HERE/fake_wine.sh" \
+      --game 3zb2 --runtime-base "$CASE/runtime" --ready-timeout-ms 1200 \
+      --shutdown-grace-ms 300 <"$CASE/control" >"$CASE/output" 2>&1 &
   OWNER=$!
   exec {WRITER}>"$CASE/control"
   wait_file "$CASE/mark.q2-source-url"
-  wait_file "$CASE/mark.q2-source-empty"
-  [ "$(<"$CASE/mark.q2-source-empty")" = 1 ]
   SOURCE_URL=$(<"$CASE/mark.q2-source-url")
+  for _ in $(seq 1 240); do
+    [ -f "$CASE/mark.q2-source-empty" ] && break
+    if [ -f "$CASE/mark.q2-rooms-failed" ]; then
+      echo "fake Q2 room mapping failed: $(<"$CASE/mark.q2-rooms-failed")" >&2
+      cat "$CASE/output" >&2 || true
+      return 1
+    fi
+    sleep 0.025
+  done
+  [ -f "$CASE/mark.q2-source-empty" ]
+  [ "$(<"$CASE/mark.q2-source-empty")" = 1 ]
 }
 
 stop_case() {
-  local expected=${1:-0}
+  local expected=${1:-143}
   kill -TERM "$OWNER"
   set +e
   wait "$OWNER"
@@ -93,300 +345,514 @@ stop_case() {
   exec {WRITER}>&-
   [ "$rc" -eq "$expected" ]
   ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
+  ! find "$CASE" -type f -exec grep -q -F 'q2dz-secret-canary' {} +
+}
+
+send_ice() {
+  printf '%s\n' 'Q2DZ/ROOMS/2 ICE generation=1 json=[{"urls":["stun:example.invalid"]}]' >&$WRITER
 }
 
 send_room() {
-  local slot=$1 room=$2 alias=$3
-  printf '%s %s %s\n' "$slot" "$room" "$(room_json "$alias")" >&$WRITER
+  local room=$1
+  printf 'Q2DZ/ROOMS/2 PUT room=%s json=%s\n' "$room" "$(room_json "$room")" >&$WRITER
 }
 
-export Q2DZ_SYNTHETIC_CREDENTIAL='q2dz-secret-canary'
+send_drop() {
+  printf 'Q2DZ/ROOMS/2 DROP room=%s\n' "$1" >&$WRITER
+}
 
-# Q2 starts exactly once with an empty source; a later room is published on
-# the same HTTP URL and the Q2 process is never restarted.
+send_room_fragment() {
+  local room=$1
+  printf 'Q2DZ/ROOMS/2 PUT room=%s json=%s' "$room" "$(room_json "$room")" >&$WRITER
+}
+
+expect_protocol_failure() {
+  local expected_message=${1:-}
+  exec {WRITER}>&-
+  set +e
+  wait "$OWNER"
+  local rc=$?
+  set -e
+  [ "$rc" -eq 65 ]
+  if [ -n "$expected_message" ]; then
+    grep -Fq "$expected_message" "$CASE/output"
+  fi
+  ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
+  ! find "$CASE" -type f -exec grep -q -F 'q2dz-secret-canary' {} +
+}
+
+# 0 targets: Q2 starts with an empty source; the first heartbeat is dynamic.
 start_case empty-start
-send_room 0 room.q2.a q2.room-a
-wait_file "$CASE/mark.legacy-Q2_ROOM_A.pid"
-wait_source_count 1
-gateway_a_pid=$(<"$CASE/mark.legacy-Q2_ROOM_A.pid")
-starts=$(<"$CASE/mark.q2-starts")
-send_room 0 room.q2.a q2.room-a
-sleep 0.1
-[ "$(<"$CASE/mark.q2-starts")" = "$starts" ]
-[ "$(<"$CASE/mark.legacy-Q2_ROOM_A.pid")" = "$gateway_a_pid" ]
-send_room 1 room.q2.b q2.room-b
-wait_file "$CASE/mark.legacy-Q2_ROOM_B.pid"
-send_room 2 room.q2.c q2.room-c
-send_room 3 room.q2.d q2.room-d
-send_room 4 room.q2.e q2.room-e
-for alias in C D E; do wait_file "$CASE/mark.legacy-Q2_ROOM_${alias}.pid"; done
-wait_source_count 5
-printf '0 -\n' >&$WRITER
-wait_source_count 4
-stop_case 143
-
-# Two valid roughly-140 KiB commands in one stream must be parsed independently;
-# the aggregate input is larger than the per-line limit.
-start_case large-lines
-python3 - "$CASE/control" <<'PY'
+python3 - "$(read_rooms)" <<'PY'
 import json, sys
-rooms = []
-for alias in ('q2.large-a', 'q2.large-b'):
-    room = {
-        'alias': alias,
-        'iceServers': [{'urls': ['stun:example.invalid']}],
-        'ordered': False,
-        'map': '',
-        'game': 'baseq2',
-        'credential': 'q2dz-secret-canary',
-        'padding': 'x' * 139000,
-    }
-    rooms.append(json.dumps(room, separators=(',', ':')))
-assert all(130000 < len(line.encode()) < 150000 for line in rooms)
-with open(sys.argv[1], 'w', encoding='utf-8') as pipe:
-    pipe.write('0 room.q2.large-a ' + rooms[0] + '\n')
-    pipe.write('1 room.q2.large-b ' + rooms[1] + '\n')
+payload = json.loads(sys.argv[1])
+assert payload['version'] == 1 and isinstance(payload['session'], str) and payload['session']
+assert payload['targets'] == []
 PY
-wait_file "$CASE/mark.legacy-Q2_LARGE_A.pid"
-wait_file "$CASE/mark.legacy-Q2_LARGE_B.pid"
-wait_source_count 2
-[ "$(<"$CASE/mark.q2-starts")" = 1 ]
-stop_case 143
-
-# A room replacement removes the old endpoint before publishing the new one;
-# the Q2 process remains the same and the source URL stays stable.
-start_case replace 'q2.room-b=no-ack' sleep-no-probe
-send_room 0 room.q2.a q2.room-a
-wait_file "$CASE/mark.legacy-Q2_ROOM_A.pid"
+assert_rooms_rejected
+send_ice
+send_room room-a
 wait_source_count 1
-q2_pid_before=$(<"$CASE/mark.q2-pid")
-send_room 0 room.q2.b q2.room-b
-wait_source_count 0
-[ "$(<"$CASE/mark.q2-pid")" = "$q2_pid_before" ]
-printf '0 -\n' >&$WRITER
-wait_source_count 0
-stop_case 143
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+target = payload['targets'][0]
+assert target['room'] == 'room-a' and target['kind'] == 'q2'
+assert target['target'].isdigit() and target['endpoint'].startswith('127.0.0.1:')
+PY
+shared_pid=$(<"$CASE/mark.shared-pid")
+send_room room-a
+sleep 0.1
+[ "$(<"$CASE/mark.shared-pid")" = "$shared_pid" ]
+send_room room-b
+wait_source_count 2
+wait_rooms_count 2
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+targets = {item['room']: item for item in payload['targets']}
+assert set(targets) == {'room-a', 'room-b'}
+assert {item['kind'] for item in targets.values()} == {'q2'}
+PY
+[ "$(<"$CASE/mark.shared-attempts")" = 1 ]
+send_drop room-a
+wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+assert [item['room'] for item in payload['targets']] == ['room-b']
+PY
+first_session=$(python3 - "$(read_rooms)" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['session'])
+PY
+)
+stop_case
 
-# Q2 normal exit closes the whole hub and leaves no session directory.
-start_case normal-exit normal normal-delay
+# Dedicated and ordinary targets keep distinct kinds, while a new coordinator
+# instance gets a new opaque session marker.
+start_case session-change
+second_session=$(python3 - "$(read_rooms)" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['session'])
+PY
+)
+[ "$first_session" != "$second_session" ]
+send_ice
+send_room room.q2ded.server
+wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+target = json.loads(sys.argv[1])['targets'][0]
+assert target['room'] == 'room.q2ded.server' and target['kind'] == 'q2ded'
+PY
+stop_case
+
+# The bounded snapshot carries all 256 ready targets, with no truncation and
+# the same endpoint set as the legacy source.
+start_case max-targets
+send_ice
+for index in $(seq -w 1 256); do send_room "max-$index"; done
+wait_source_count 256
+wait_rooms_count 256
+rooms_body=$(read_rooms)
+servers_body=$(read_source "$SOURCE_URL")
+python3 - "$rooms_body" "$servers_body" <<'PY'
+import json, re, sys
+rooms_body, servers_body = sys.argv[1:]
+payload = json.loads(rooms_body)
+targets = payload['targets']
+assert set(payload) == {'version', 'session', 'targets'}
+assert payload['version'] == 1 and isinstance(payload['session'], str) and payload['session']
+assert len(targets) == 256
+assert len(rooms_body.encode()) <= 256 * 1024
+assert not re.search(r'credential|ice|sdp|peer|secret', rooms_body, re.I)
+assert len({item['room'] for item in targets}) == 256
+assert len({item['target'] for item in targets}) == 256
+assert all(set(item) == {'target', 'endpoint', 'room', 'kind'} for item in targets)
+assert all(item['kind'] == 'q2' and isinstance(item['target'], str) for item in targets)
+mapping_endpoints = sorted(item['endpoint'] for item in targets)
+source_endpoints = sorted(line for line in servers_body.splitlines() if line)
+assert source_endpoints == mapping_endpoints
+assert len(set(mapping_endpoints)) == 256
+PY
+stop_case
+
+# Room IDs remain case-sensitive and therefore do not overwrite one another.
+start_case case-sensitive
+send_ice
+send_room room-a
+send_room Room-A
+wait_source_count 2
+wait_rooms_count 2
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+rooms = {item['room'] for item in json.loads(sys.argv[1])['targets']}
+assert rooms == {'room-a', 'Room-A'}
+PY
+stop_case
+
+# A late event from a removed target is retained until the same room is
+# replaced; it cannot repopulate the source or affect an unrelated room.
+start_case stale stale-event
+send_ice
+send_room room-a
+wait_source_count 1
+stale_initial=$(read_rooms)
+send_drop room-a
+wait_source_count 0
+wait_rooms_count 0
+send_room room-b
+wait_source_count 1
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-ready")" = "1 2 " ]
+[ "$(<"$CASE/mark.shared-attempts")" = 1 ]
+send_room room-a
+wait_source_count 2
+wait_rooms_count 2
+stale_recreated=$(read_rooms)
+python3 - "$stale_initial" "$stale_recreated" <<'PY'
+import json, sys
+before, after = (json.loads(item) for item in sys.argv[1:])
+old_target = next(item['target'] for item in before['targets'] if item['room'] == 'room-a')
+new_targets = [item['target'] for item in after['targets'] if item['room'] == 'room-a']
+assert after['session'] == before['session']
+assert len(new_targets) == 1 and new_targets[0] != old_target
+assert old_target not in {item['target'] for item in after['targets']}
+PY
+wait_file "$CASE/mark.shared-replacement-endpoint"
+replacement_endpoint=$(<"$CASE/mark.shared-replacement-endpoint")
+grep -Fqx "$replacement_endpoint" <<<"$(read_source "$SOURCE_URL")"
+! grep -Fqx 127.0.0.1:27910 <<<"$(read_source "$SOURCE_URL")"
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-ready")" = "1 2 1 3 " ]
+[ "$(<"$CASE/mark.shared-attempts")" = 1 ]
+stop_case
+
+# One target timeout/failure is isolated from a healthy target and Q2.
+start_case isolated 'room-a=never-ready;room-b=normal'
+send_ice
+send_room room-a
+send_room room-b
+wait_source_count 1
+wait_rooms_count 1
+python3 - "$(read_rooms)" <<'PY'
+import json, sys
+targets = json.loads(sys.argv[1])['targets']
+assert [item['room'] for item in targets] == ['room-b']
+PY
+wait_file "$CASE/mark.shared-drops"
+wait_source_count 1
+wait_rooms_count 1
+stop_case
+
+# A timeout may produce a late READY for the tombstoned target; it must not
+# restart the shared gateway or disturb the healthy sibling.
+start_case timeout-stale 'room-a=timeout-late-ready;room-b=normal'
+send_ice
+send_room room-a
+send_room room-b
+wait_source_count 1
+wait_file "$CASE/mark.shared-drops"
+wait_source_count 1
+[ "$(<"$CASE/mark.shared-attempts")" = 1 ]
+assert_source_lacks 127.0.0.1:27910
+[ "$(<"$CASE/mark.shared-attempts")" = 1 ]
+send_room room-a
+sleep 0.2
+[ "$(<"$CASE/mark.shared-puts")" = 2 ]
+wait_source_count 1
+stop_case
+
+# Target CLOSED/FAILED are local events, not a global shutdown.
+for terminal in target-closed target-failed; do
+  start_case "$terminal" "room-a=$terminal;room-b=normal"
+  send_ice
+  send_room room-a
+  send_room room-b
+  wait_source_count 1
+  kill -0 "$OWNER"
+  stop_case
+done
+
+# Preserve bounded target recovery across target IDs: q2 gets one retry after
+# a ready failure, while q2ded keeps the existing two-recovery-start policy.
+start_case bounded-q2 'room-a=target-failed'
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-failed"
+[ "$(<"$CASE/mark.shared-puts")" = 1 ]
+sleep 0.2
+send_room room-a
+for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ] && break; sleep 0.025; done
+[ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ]
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-failed")" = "1 2 " ]
+send_room room-a
+sleep 0.2
+[ "$(<"$CASE/mark.shared-puts")" = 2 ]
+stop_case
+
+start_case bounded-q2ded 'room.q2ded.server=target-failed'
+send_ice
+send_room room.q2ded.server
+wait_file "$CASE/mark.shared-failed"
+sleep 0.2
+send_room room.q2ded.server
+for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ] && break; sleep 0.025; done
+[ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ]
+sleep 0.2
+send_room room.q2ded.server
+for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-failed")" -ge 3 ] && break; sleep 0.025; done
+[ "$(wc -l <"$CASE/mark.shared-failed")" -ge 3 ]
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-failed")" = "1 2 3 " ]
+send_room room.q2ded.server
+sleep 0.2
+[ "$(<"$CASE/mark.shared-puts")" = 3 ]
+stop_case
+
+start_case bounded-q2ded-closed 'room.q2ded.server=target-closed'
+send_ice
+send_room room.q2ded.server
+wait_file "$CASE/mark.shared-closed"
+sleep 0.2
+send_room room.q2ded.server
+for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-closed")" -ge 2 ] && break; sleep 0.025; done
+[ "$(wc -l <"$CASE/mark.shared-closed")" -ge 2 ]
+sleep 0.2
+send_room room.q2ded.server
+for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-closed")" -ge 3 ] && break; sleep 0.025; done
+[ "$(wc -l <"$CASE/mark.shared-closed")" -ge 3 ]
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-closed")" = "1 2 3 " ]
+send_room room.q2ded.server
+sleep 0.2
+[ "$(<"$CASE/mark.shared-puts")" = 3 ]
+stop_case
+
+# READY may arrive in a different order than PUT; source publication remains
+# deterministic and both targets survive.
+start_case shuffled 'room-a=shuffled;room-b=shuffled'
+send_ice
+send_room room-a
+sleep 0.1
+send_room room-b
+wait_source_count 2
+[ "$(tr '\n' ' ' <"$CASE/mark.shared-ready")" = "2 1 " ]
+stop_case
+
+# A shared gateway crash is restarted once without replay; the next heartbeat repopulates it.
+start_case global-restart global-crash-after-ready
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-ready"
+wait_source_count 1
+[ "$(<"$CASE/mark.shared-puts")" = 1 ]
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+wait_source_count 0
+[ "$(<"$CASE/mark.shared-puts")" = 1 ]
+send_ice
+send_room room-a
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-puts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-puts")" = 2 ]
+wait_source_count 1
+stop_case
+
+# A pre-crash partial command is discarded through its newline.  Its suffix
+# cannot be replayed to the replacement gateway, while a later ICE heartbeat
+# can repopulate the source normally.
+start_case recovery-discard global-crash-after-ready
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-ready"
+wait_source_count 1
+send_room_fragment room-old
+sleep 0.1
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+wait_source_count 0
+printf '\n' >&$WRITER
+sleep 0.2
+[ "$(<"$CASE/mark.shared-puts")" = 1 ]
+wait_source_count 0
+send_ice
+send_room room-b
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-puts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-puts")" = 2 ]
+wait_source_count 1
+stop_case
+
+# The recovery discard has the same 256 KiB bound as a normal command line.
+start_case recovery-discard-oversized global-crash-after-ready
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-ready"
+wait_source_count 1
+send_room_fragment room-old
+sleep 0.1
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+wait_source_count 0
+set +e
+python3 - "$WRITER" <<'PY'
+import os
+import sys
+
+fd = int(sys.argv[1])
+payload = b'x' * (256 * 1024 + 1)
+while payload:
+    try:
+        count = os.write(fd, payload)
+    except BrokenPipeError:
+        break
+    payload = payload[count:]
+PY
+set -e
+expect_protocol_failure 'hub recovery remainder exceeds 256 KiB'
+
+# EOF while resynchronising is a protocol failure, not an implicit command
+# terminator.
+start_case recovery-discard-eof global-crash-after-ready
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-ready"
+wait_source_count 1
+send_room_fragment room-old
+sleep 0.1
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+wait_source_count 0
+exec {WRITER}>&-
+expect_protocol_failure 'hub input ended while discarding recovery remainder'
+
+# Recovery resets the command parser's ICE gate.  A PUT received before a
+# fresh ICE is rejected without reaching the replacement gateway.
+start_case recovery-requires-ice global-crash-after-ready
+send_ice
+send_room room-a
+wait_file "$CASE/mark.shared-ready"
+wait_source_count 1
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+wait_source_count 0
+send_room room-a
+sleep 0.2
+expect_protocol_failure 'PUT requires a preceding ICE command'
+[ "$(<"$CASE/mark.shared-puts")" = 1 ]
+
+# Validate an entire bounded input batch before executing any of it.  A bad
+# command after 32 valid commands must not allow the first 32 to reach the
+# gateway.
+start_case fail-closed-batch normal
+send_ice
+sleep 0.1
+python3 - "$WRITER" <<'PY'
+import os
+import sys
+
+fd = int(sys.argv[1])
+lines = []
+for index in range(1, 33):
+    room = f'batch-room-{index}'
+    lines.append(
+        f'Q2DZ/ROOMS/2 PUT room={room} '
+        f'json={{"roomId":"{room}","alias":"q2.{room}","iceServers":[{{}}]}}\n'.encode()
+    )
+lines.append(b'Q2DZ/ROOMS/2 NOT_A_COMMAND\n')
+payload = b''.join(lines)
+assert len(payload) < 4096
+written = os.write(fd, payload)
+assert written == len(payload)
+PY
+expect_protocol_failure 'unknown hub command'
+if [ -f "$CASE/mark.shared-puts" ]; then
+  if [ "$(<"$CASE/mark.shared-puts")" != 0 ]; then
+    echo "fail-closed batch forwarded unexpected PUTs: $(<"$CASE/mark.shared-puts")" >&2
+    cat "$CASE/output" >&2 || true
+    false
+  fi
+fi
+
+# A child that floods valid events cannot starve Q2 or make the coordinator
+# retain an unbounded event vector.  The bounded reader keeps the session
+# usable until the normal owner stop.
+start_case event-flood 'room-a=event-flood'
+send_ice
+send_room room-a
+wait_source_count 1
+wait_file "$CASE/mark.shared-flood"
+kill -0 "$(<"$CASE/mark.q2-pid")"
+stop_case
+
+# A continuously-fed command pipe cannot starve the shared gateway.  The
+# source must become ready before the producer finishes its bounded run.
+start_case bounded-input-backlog normal
+send_ice
+backlog_line="Q2DZ/ROOMS/2 PUT room=backlog-room json=$(room_json backlog-room)"
+(
+  end=$((SECONDS + 3))
+  while [ "$SECONDS" -lt "$end" ]; do
+    printf '%s\n' "$backlog_line" >&$WRITER || break
+  done
+  : >"$CASE/backlog-done"
+) &
+backlog_writer=$!
+wait_source_count 1
+[ ! -f "$CASE/backlog-done" ]
+wait "$backlog_writer"
+stop_case
+
+# A second shared crash leaves Q2 alive and rejects transport commands.
+start_case global-no-retry global-crash
+send_ice
+send_room room-a
+for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+send_ice
+send_room room-b
+sleep 0.2
+[ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+kill -0 "$(<"$CASE/mark.q2-pid")"
+stop_case
+
+# A normal Q2 exit still owns the complete process tree.
+start_case q2-exit normal normal-delay
+q2_exit_shared_pid=$(<"$CASE/mark.shared-pid")
 set +e
 wait "$OWNER"
-normal_exit_rc=$?
+rc=$?
 set -e
 exec {WRITER}>&-
-[ "$normal_exit_rc" -eq 0 ]
-[ -f "$CASE/mark.finished" ]
-[ "$(<"$CASE/mark.q2-starts")" = 1 ]
+[ "$rc" -eq 0 ]
 ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
+! kill -0 "$q2_exit_shared_pid" 2>/dev/null
 
-# Closing room A does not remove Q2 or the still-ready room B.
-start_case room-close-isolation 'q2.room-a=room-close-after-ack;q2.room-b=normal' sleep-no-probe
-send_room 0 room.q2.a q2.room-a
-send_room 1 room.q2.b q2.room-b
-wait_file "$CASE/mark.legacy-Q2_ROOM_A.pid"
-wait_file "$CASE/mark.legacy-Q2_ROOM_B.pid"
+# Owner hard-kill is recovered by the guardian and leaves no child process.
+start_case hard-kill normal
+send_ice
+send_room room-a
+send_room room-b
 wait_source_count 2
-isolation_q2_pid=$(<"$CASE/mark.q2-pid")
-isolation_b_pid=$(<"$CASE/mark.legacy-Q2_ROOM_B.pid")
-for _ in $(seq 1 160); do grep -Fq 'reason=room-closed' "$CASE/output" && break; sleep 0.025; done
-grep -Fq 'reason=room-closed' "$CASE/output"
-wait_source_count 1
-kill -0 "$isolation_q2_pid"
-kill -0 "$isolation_b_pid"
-stop_case 143
-
-# A hard owner kill is recovered by the guardian, including Q2 and five rooms.
-start_case hard-kill normal sleep
-hard_rooms=(a b c d e)
-for index in "${!hard_rooms[@]}"; do
-  room=${hard_rooms[$index]}
-  send_room "$index" "room.q2.$room" "q2.room-$room"
-  wait_file "$CASE/mark.legacy-Q2_ROOM_${room^^}.pid"
-done
-wait_source_count 5
-hard_q2_pid=$(<"$CASE/mark.q2-pid")
-hard_wine_pid=$(<"$CASE/mark.wine-pid")
-hard_gateway_pids=()
-for letter in A B C D E; do hard_gateway_pids+=("$(<"$CASE/mark.legacy-Q2_ROOM_${letter}.pid")"); done
+q2_pid=$(<"$CASE/mark.q2-pid")
+shared_pid=$(<"$CASE/mark.shared-pid")
 kill -KILL "$OWNER"
 set +e
 wait "$OWNER"
-hard_rc=$?
+rc=$?
 set -e
 exec {WRITER}>&-
-[ "$hard_rc" -eq 137 ]
-for _ in $(seq 1 200); do
-  if ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .; then break; fi
+[ "$rc" -eq 137 ]
+for _ in $(seq 1 240); do
+  if ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q . && ! kill -0 "$q2_pid" 2>/dev/null && ! kill -0 "$shared_pid" 2>/dev/null; then break; fi
   sleep 0.025
 done
 ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-for pid in "$hard_q2_pid" "$hard_wine_pid" "${hard_gateway_pids[@]}"; do
-  ! kill -0 "$pid" 2>/dev/null
-done
+! kill -0 "$q2_pid" 2>/dev/null
+! kill -0 "$shared_pid" 2>/dev/null
 
-# A no-ACK readiness failure reaps its legacy child and never starts Q2.
-noack_marker="$TMP/noack"
-set +e
-env -u Q2DZ_SYNTHETIC_CREDENTIAL Q2DZ_TEST_MARKER="$noack_marker" Q2DZ_FAKE_LEGACY_MODE=no-ack \
-  timeout --signal=KILL 4s bash -c 'printf "%s" "$1" | "$2" --managed --legacy "$3" --adapter "$4" --bind 127.0.0.1:0' \
-  _ "$(room_json q2.test)" "$MANAGED" "$HERE/fake_legacy.py" "$ADAPTER" \
-  >"$TMP/noack.output" 2>&1
-noack_rc=$?
-set -e
-[ "$noack_rc" -eq 72 ]
-[ "$(<"$noack_marker.legacy-attempts")" = 1 ]
-[ "$(wc -l < "$noack_marker.legacy-endpoints")" -eq 1 ]
-! kill -0 "$(<"$noack_marker.legacy-Q2_TEST.pid")" 2>/dev/null
-
-# The managed UDP boundary accepts 1400 bytes and drops 1401 in both directions.
-boundary_marker="$TMP/datagram-boundary"
-env -u Q2DZ_SYNTHETIC_CREDENTIAL Q2DZ_TEST_MARKER="$boundary_marker" Q2DZ_FAKE_LEGACY_MODE=datagram-boundary \
-  "$MANAGED" --managed --legacy "$HERE/fake_legacy.py" --adapter "$ADAPTER" --bind 127.0.0.1:0 \
-  < <(room_json q2.test) >"$TMP/datagram-boundary.output" 2>&1 &
-boundary_gateway=$!
-for _ in $(seq 1 100); do
-  grep -q 'TRANSPORT_READY .*udp=' "$TMP/datagram-boundary.output" 2>/dev/null && break
-  sleep 0.025
-done
-boundary_endpoint=$(sed -n 's/.*TRANSPORT_READY .*udp=\([^ ]*\).*/\1/p' "$TMP/datagram-boundary.output")
-[ -n "$boundary_endpoint" ]
-python3 - "$boundary_endpoint" <<'PY'
-import socket, sys
-host, port = sys.argv[1].rsplit(':', 1)
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(.5)
-endpoint = (host, int(port))
-sock.sendto(b'A' * 1400, endpoint)
-assert sock.recvfrom(65535)[0] == b'A' * 1400
-sock.sendto(b'B' * 1401, endpoint)
-try:
-    sock.recvfrom(65535)
-    raise AssertionError('1401-byte UDP datagram was forwarded')
-except socket.timeout:
-    pass
-sock.sendto(b'remote-oversize', endpoint)
-try:
-    sock.recvfrom(65535)
-    raise AssertionError('1401-byte transport datagram was forwarded')
-except socket.timeout:
-    pass
-sock.sendto(b'C' * 1399, endpoint)
-assert sock.recvfrom(65535)[0] == b'C' * 1399
-PY
-kill -TERM "$boundary_gateway"
-wait "$boundary_gateway"
-grep -Fq 'GATEWAY_STOP max_udp_to_transport_datagram=1400 max_transport_to_udp_datagram=1400 oversized_udp_drops=1 oversized_transport_drops=1' "$TMP/datagram-boundary.output"
-! grep -Eq 'A{16}|B{16}|C{16}|R{16}' "$TMP/datagram-boundary.output"
-
-# A zero-request source still shuts down promptly.
-start_case zero-request normal no-source-request
-stop_case 143
-
-# A post-ready failure gets one later replacement, then the room is tombstoned.
-start_case retry 'q2.room-a=exit-after-ack' sleep-no-probe
-send_room 0 room.q2.a q2.room-a
-wait_file "$CASE/mark.legacy-attempts"
-for _ in $(seq 1 120); do [ "$(<"$CASE/mark.legacy-attempts")" -ge 1 ] && break; sleep 0.025; done
-for _ in $(seq 1 160); do grep -Eq 'reason=(gateway-fatal|gateway-exited|gateway-control-eof)' "$CASE/output" && break; sleep 0.025; done
-if ! grep -Eq 'reason=(gateway-fatal|gateway-exited|gateway-control-eof)' "$CASE/output"; then
-  cat "$CASE/output" >&2 || true
-  cat "$CASE/mark.legacy-attempts" >&2 || true
-  exit 1
-fi
-wait_source_count 0
-send_room 0 room.q2.a q2.room-a
-for _ in $(seq 1 120); do [ "$(<"$CASE/mark.legacy-attempts")" -ge 2 ] && break; sleep 0.025; done
-[ "$(<"$CASE/mark.legacy-attempts")" = 2 ]
-sleep 1
-send_room 0 room.q2.a q2.room-a
-sleep 0.1
-[ "$(<"$CASE/mark.legacy-attempts")" = 2 ]
-stop_case 143
-
-# Pre-ready failure and semantic rejection are tombstoned without retries.
-start_case pre-ready q2.room-a=early-exit-always sleep-no-probe
-send_room 0 room.q2.a q2.room-a
-wait_file "$CASE/mark.legacy-attempts"
-for _ in $(seq 1 120); do grep -Fq 'HUB_GATEWAY_STOP' "$CASE/output" && break; sleep 0.025; done
-[ "$(<"$CASE/mark.legacy-attempts")" = 3 ]
-for _ in $(seq 1 5); do send_room 0 room.q2.a q2.room-a; done
-sleep 0.1
-[ "$(<"$CASE/mark.legacy-attempts")" = 3 ]
-stop_case 143
-
-start_case semantic
-printf '%s %s\n' 0 'room.q2.bad {"alias":"q2.bad","credential":"q2dz-secret-canary"}' >&$WRITER
-sleep 0.1
-[ ! -e "$CASE/mark.legacy-attempts" ]
-for _ in $(seq 1 5); do printf '%s %s %s\n' 0 room.q2.bad "$(room_json q2.bad)" >&$WRITER; done
-sleep 0.1
-[ ! -e "$CASE/mark.legacy-attempts" ]
-stop_case 143
-
-# ROOM_CLOSED tombstones the ID; clear resets it and permits a replacement.
-start_case room-close 'q2.room-a=room-close-after-ack' sleep-no-probe
-send_room 0 room.q2.a q2.room-a
-wait_file "$CASE/mark.legacy-attempts"
-for _ in $(seq 1 160); do grep -Fq 'reason=room-closed' "$CASE/output" && break; sleep 0.025; done
-grep -Fq 'reason=room-closed' "$CASE/output"
-attempts=$(<"$CASE/mark.legacy-attempts")
-for _ in $(seq 1 5); do send_room 0 room.q2.a q2.room-a; done
-sleep 0.1
-[ "$(<"$CASE/mark.legacy-attempts")" = "$attempts" ]
-send_room 0 room.q2.b q2.room-b
-wait_file "$CASE/mark.legacy-Q2_ROOM_B.pid"
-wait_source_count 1
-b_attempts=$(<"$CASE/mark.legacy-attempts")
-printf '0 -\n' >&$WRITER
-send_room 0 room.q2.a q2.room-a
-for _ in $(seq 1 160); do [ "$(<"$CASE/mark.legacy-attempts")" -gt "$b_attempts" ] && break; sleep 0.025; done
-[ "$(<"$CASE/mark.legacy-attempts")" -gt "$b_attempts" ]
-wait_source_count 1
-stop_case 143
-
-# A dedicated binding gets exactly two recovery starts for every terminal
-# stage: pre-ready failure, post-ready failure and ROOM_CLOSED.
-for mode in early-exit-always exit-after-ack room-close-after-ack; do
-  start_case "dedicated-$mode" "room.q2ded.server=$mode" sleep-no-probe
-  send_room 0 room.q2ded.server room.q2ded.server
-  wait_file "$CASE/mark.legacy-attempts"
-  multiplier=1
-  [ "$mode" != early-exit-always ] || multiplier=3
-  for start in 1 2 3; do
-    expected=$((start * multiplier))
-    for _ in $(seq 1 240); do
-      attempts=$(<"$CASE/mark.legacy-attempts")
-      stops=$(grep -Fc 'HUB_GATEWAY_STOP reason=' "$CASE/output" || true)
-      [ "$attempts" -ge "$expected" ] && [ "$stops" -ge "$start" ] && break
-      sleep 0.025
-    done
-    [ "$(<"$CASE/mark.legacy-attempts")" = "$expected" ]
-    [ "$start" -eq 3 ] || send_room 0 room.q2ded.server room.q2ded.server
-  done
-  send_room 0 room.q2ded.server room.q2ded.server
-  sleep 0.1
-  [ "$(<"$CASE/mark.legacy-attempts")" = "$((3 * multiplier))" ]
-  stop_case 143
-done
-
-# Malformed framing, oversized input, and EOF after partial input are fatal.
+# Control framing remains fail-closed.
 start_case malformed
-printf '5 -
-' >&$WRITER
-exec {WRITER}>&-
-set +e
-wait "$OWNER"
-rc=$?
-set -e
-[ "$rc" -eq 65 ]
-! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-
-start_case oversized
-python3 - "$CASE/control" <<'PY'
-import sys
-with open(sys.argv[1], 'w', encoding='utf-8') as pipe:
-    pipe.write('0 room.q2.big {"alias":"q2.big","iceServers":[{"urls":["stun:example.invalid"]}],"x":"' + ('x' * 263000) + '"}\n')
-PY
+printf 'Q2DZ/ROOMS/2 PUT room=bad json={}\n' >&$WRITER
 exec {WRITER}>&-
 set +e
 wait "$OWNER"
@@ -394,37 +860,4 @@ rc=$?
 set -e
 [ "$rc" -eq 65 ]
 
-start_case partial
-printf '0 room.q2.partial ' >&$WRITER
-exec {WRITER}>&-
-set +e
-wait "$OWNER"
-rc=$?
-set -e
-[ "$rc" -eq 65 ]
-
-# A half-sent HTTP header cannot keep shutdown blocked.
-start_case half-header
-python3 - "$SOURCE_URL" <<'PY' &
-import socket, sys, time
-url = sys.argv[1]
-host, port = url[len('http://'):].split('/', 1)[0].rsplit(':', 1)
-sock = socket.create_connection((host, int(port)), timeout=1)
-sock.sendall(b'GET /servers HTTP/1.1\r\n')
-time.sleep(5)
-PY
-CLIENT=$!
-sleep 0.1
-kill -TERM "$OWNER"
-exec {WRITER}>&-
-set +e
-wait "$OWNER"
-rc=$?
-set -e
-[ "$rc" -eq 143 ]
-kill "$CLIENT" 2>/dev/null || true
-wait "$CLIENT" 2>/dev/null || true
-! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
-
-! find "$TMP" -type f -exec grep -H --binary-files=without-match -F 'q2dz-secret-canary' {} + >/dev/null 2>&1
-printf 'fake lifecycle matrix: PASS\n'
+printf 'fake shared lifecycle matrix: PASS\n'

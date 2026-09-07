@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Fail-closed check that the configured legacy gateway accepts required options.
 
-This never passes room secrets. It checks only static option names against --help
-and, optionally, source text. Unknown or ambiguous contracts fail.
+This never passes room secrets. It checks the adapter statically and executes the
+gateway with a bounded sealed inherited ICE memfd, proving that legacy arguments
+reach transport initialization without requiring a live peer.
 """
 from __future__ import annotations
 import argparse
+import fcntl
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -41,31 +44,63 @@ def main() -> int:
     option_names = sorted(set(re.findall(r"--[a-zA-Z0-9][a-zA-Z0-9-]*", joined)))
     if set(option_names) != REQUIRED_OPTIONS or "wss://net.js-dos.com:444" not in argv:
         raise SystemExit(f"adapter does not match the proven gateway contract: {option_names}")
-    try:
-        cp = subprocess.run(
-            [str(gateway), "--help"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=5, check=False,
-            env={"PATH": "/usr/bin:/bin"},
-        )
-        evidence = cp.stdout
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"unable to obtain gateway --help: {exc}")
-
     if ns.source:
         source = pathlib.Path(ns.source).resolve()
         if not source.is_file():
             raise SystemExit(f"source not found: {source}")
-        evidence += "\n" + source.read_text(encoding="utf-8", errors="replace")
+        evidence = source.read_text(encoding="utf-8", errors="replace")
+        absent = [name for name in option_names if name not in evidence]
+        if absent:
+            raise SystemExit(f"legacy gateway contract is not proven; missing options: {absent}")
 
-    absent = [name for name in option_names if name not in evidence]
-    if absent:
-        raise SystemExit(f"legacy gateway contract is not proven; missing options: {absent}")
+    try:
+        ice_fd = os.memfd_create(
+            "q2dz-legacy-contract", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        )
+        if os.write(ice_fd, b"[{}]") != 4:
+            raise OSError("short ICE memfd write")
+        os.lseek(ice_fd, 0, os.SEEK_SET)
+        required_seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        fcntl.fcntl(ice_fd, fcntl.F_ADD_SEALS, required_seals)
+        arguments = [
+            str(gateway), "--bind", "127.0.0.1:27999",
+            "--signal", "wss://net.js-dos.com:444",
+            "--ice-file", f"/proc/self/fd/{ice_fd}",
+            "--alias", "q2.contract-test", "--max-datagram", "1400",
+        ]
+        try:
+            cp = subprocess.run(
+                arguments, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=5, check=False,
+                env={"PATH": "/usr/bin:/bin"}, pass_fds=(ice_fd,),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"unable to execute legacy gateway contract: {exc}")
+    except OSError as exc:
+        raise SystemExit(f"unable to create sealed ICE memfd: {exc}")
+    finally:
+        if "ice_fd" in locals():
+            os.close(ice_fd)
+
+    expected_output = "GATEWAY_ERROR legacy transport initialization failed"
+    if cp.returncode != 2 or cp.stdout.strip() != expected_output:
+        raise SystemExit(
+            "legacy gateway execution did not reach the expected bounded validation "
+            f"path: returncode={cp.returncode}, output={cp.stdout!r}"
+        )
+
     print(json.dumps({
         "status": "PASS",
         "gateway": str(gateway),
         "adapter": str(adapter_path),
         "verified_options": option_names,
+        "legacy_execution": {"status": "PASS", "returncode": cp.returncode},
     }, indent=2))
     return 0
 

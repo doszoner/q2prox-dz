@@ -8,36 +8,49 @@ import {
   bytesToMessage,
   classifyIncomingDatagram,
   createCadenceCounter,
-  exactAliasQuery,
+  createFairReceiveScheduler,
   maxDatagram,
+  maxTargets,
+  maxPumpPacketsPerTick,
   messageToBytes,
+  normalizeIceGeneration,
+  normalizeTargetId,
   parseStartMessage,
+  parseTargetMessage,
   reliableSendMode,
 } from "./transport_protocol.mjs";
 
 let started = false;
 let stopped = false;
-let module;
-let remotePeer = 0;
-let send;
-let receive;
-let wait;
-let buffer;
-let fromPeer;
-let probe;
-let probeStarted = false;
 let startupStage = "parse_config";
-const queryMatches = [];
+let webRtcModule;
+let timer;
+let receiveBuffer;
+let fromPeerBuffer;
+let receive;
+let send;
+let wait;
+let setIceServers;
+let connectTo;
+let virtualPeerForAlias;
+let resolvedPeerForVirtual;
+let disconnect;
+let shutdown;
+let runtimeStarting;
+let runtimeConnected = false;
+let commonIce;
+let iceGeneration = 0n;
+let lastCadenceReport = 0;
+const targets = new Map();
+const routePeerToTarget = new Map();
+const concretePeerToTarget = new Map();
+const resolveDeadlineMs = 30000;
+const receiveScheduler = createFairReceiveScheduler();
 const cadence = createCadenceCounter();
+const controlChain = { value: Promise.resolve() };
 
 function post(message) {
   globalThis.chrome.webview.postMessage(message);
-}
-
-function fail(reason) {
-  if (stopped) return;
-  stopped = true;
-  post({ type: "state", value: "failed", reason });
 }
 
 function stableError(error, fallback) {
@@ -45,152 +58,395 @@ function stableError(error, fallback) {
   return /^[a-z0-9_-]{1,64}$/.test(value) ? value : fallback;
 }
 
-async function start(message) {
-  if (started) throw new Error("duplicate_start");
-  started = true;
-  const config = parseStartMessage(message);
-  startupStage = "load_runtime";
-  const query = exactAliasQuery(config.alias);
-  window.netConfig = {
-    debug: false,
-    ordered: config.ordered,
-    iceServers: config.iceServers,
-  };
-
-  let queryFinished = false;
-  module = await WebRTCNet({
-    print: () => {},
-    printErr: () => fail("runtime_error"),
-    aliasQueryAdd: (seenQuery, alias, peer) => {
-      if (seenQuery === query) queryMatches.push({ alias, peer: peer >>> 0 });
-    },
-    onAliasQueryEnd: (seenQuery) => {
-      if (seenQuery === query) queryFinished = true;
-    },
-  });
-
-  startupStage = "bind_runtime";
-  const connectTo = module.cwrap("connectTo", "number", ["string", "string", "string"]);
-  wait = module.cwrap("wait", null, ["number"]);
-  const myId = module.cwrap("myId", "number", []);
-  const queryAliases = module.cwrap("queryAliases", null, ["string"]);
-  send = module.cwrap("sendto", "number", ["number", "number", "number", "number"]);
-  receive = module.cwrap("recvfrom", "number", ["number", "number", "number"]);
-  buffer = module._malloc(maxDatagram);
-  fromPeer = module._malloc(4);
-  probe = new ManagedReadinessProbe({
-    send: (datagram) => {
-      module.HEAPU8.set(datagram, buffer);
-      cadence.probeSend();
-      return send(buffer, datagram.length, remotePeer, reliableSendMode) === datagram.length;
-    },
-    onReady: () => post({ type: "state", value: "transport-ready", peer: remotePeer }),
-    onRoomClosed: (reason) => {
-      if (stopped) return;
-      stopped = true;
-      post({ type: "state", value: "room-closed", reason });
-    },
-  });
-
-  startupStage = "connect_signaling";
-  if (!connectTo("wss://net.js-dos.com:444", "quake2", "quake2-secret")) {
-    throw new Error("connect_failed");
+function fail(reason) {
+  if (stopped) return;
+  stopped = true;
+  if (timer !== undefined) clearInterval(timer);
+  let emitted = false;
+  for (const target of [...targets.values()]) {
+    failTarget(target, reason);
+    emitted = true;
   }
-  startupStage = "complete";
+  if (!emitted) post({ type: "state", value: "failed", reason });
+}
 
-  let queried = false;
-  let pollStage = "wait";
-  const cadenceTimer = setInterval(() => {
-    if (stopped) {
-      clearInterval(cadenceTimer);
-      return;
+function iceServersCopy(value) {
+  if (!Array.isArray(value) || value.length === 0) throw new Error("invalid_ice_servers");
+  const encoded = JSON.stringify(value);
+  if (encoded.length > 65536) throw new Error("ice_configuration_too_large");
+  for (const server of value) {
+    const urls = typeof server?.urls === "string" ? [server.urls] : server?.urls;
+    if (!Array.isArray(urls) || urls.length === 0 ||
+        urls.some((url) => typeof url !== "string" || url.length === 0)) {
+      throw new Error("invalid_ice_server");
     }
-    post(cadence.snapshot());
-  }, 1000);
-  const timer = setInterval(() => {
-    if (stopped) {
-      clearInterval(timer);
-      return;
+  }
+  return JSON.parse(encoded);
+}
+
+function targetConfig(value, targetId) {
+  if (!value || typeof value !== "object") throw new Error("invalid_target_message");
+  const alias = value.alias ?? value.roomAlias ?? value.room?.alias ?? value.net?.alias;
+  const ordered = value.ordered ?? value.netConfig?.ordered ?? value.room?.netConfig?.ordered;
+  const parsed = parseTargetMessage({ targetId, alias, ordered });
+  if (!/^(?:q2\.|room\.q2ded\.)/.test(parsed.alias)) {
+    throw new Error("invalid_target_alias");
+  }
+  return parsed;
+}
+
+function postTargetState(target, value, extra = {}) {
+  post({ type: "state", value, targetId: target.targetId, ...extra });
+}
+
+function removeTarget(target, value, reason, emit = true) {
+  if (!targets.has(target.targetId)) return;
+  if (target.probe) target.probe.stop();
+  if (target.routePeerId !== 0) {
+    routePeerToTarget.delete(target.routePeerId);
+    try { disconnect?.(target.routePeerId); } catch {}
+  }
+  if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
+  receiveScheduler.drop(target.targetId);
+  targets.delete(target.targetId);
+  if (emit) postTargetState(target, value, { reason });
+}
+
+function closeTarget(target, reason) {
+  removeTarget(target, "room-closed", reason);
+}
+
+function failTarget(target, reason) {
+  removeTarget(target, "failed", reason);
+}
+
+function validVirtualPeerId(value) {
+  const peer = value >>> 0;
+  return peer >= 0x80000000 && peer <= 0xffffffff;
+}
+
+function validConcretePeerId(value) {
+  const peer = value >>> 0;
+  return peer > 0 && peer < 0x80000000;
+}
+
+function isProbeAck(datagram) {
+  return datagram && typeof datagram.length === "number" && datagram.length >= 7 &&
+    datagram[0] === 0xff && datagram[1] === 0xff &&
+    datagram[2] === 0xff && datagram[3] === 0xff &&
+    datagram[4] === 0x61 && datagram[5] === 0x63 && datagram[6] === 0x6b &&
+    (datagram.length === 7 || datagram[7] === 0 || datagram[7] === 10 || datagram[7] === 13);
+}
+
+function makeProbe(target) {
+  return new ManagedReadinessProbe({
+    send(datagram) {
+      if (!runtimeConnected || target.routePeerId === 0) return false;
+      webRtcModule.HEAPU8.set(datagram, receiveBuffer);
+      cadence.probeSend();
+      return send(receiveBuffer, datagram.length, target.routePeerId, reliableSendMode) === datagram.length;
+    },
+    onReady() {
+      if (targets.get(target.targetId) === target && target.concretePeerId !== 0) {
+        target.state = "ready";
+        postTargetState(target, "transport-ready", { peer: target.concretePeerId });
+      }
+    },
+    onRoomClosed(reason) {
+      if (targets.get(target.targetId) !== target) return;
+      if (target.concretePeerId === 0) {
+        target.probe = makeProbe(target);
+        if (target.routePeerId !== 0) target.probe.channelOpened();
+        return;
+      }
+      closeTarget(target, reason);
+    },
+  });
+}
+
+function putTarget(value, targetId) {
+  const config = targetConfig(value, targetId);
+  if (targets.has(config.targetId)) return;
+  if (targets.size >= maxTargets) throw new Error("target_capacity_exceeded");
+  const target = {
+    ...config,
+    routePeerId: 0,
+    concretePeerId: 0,
+    state: "resolving",
+    resolveDeadline: 0,
+    pendingProbeAck: undefined,
+    probe: undefined,
+  };
+  target.probe = makeProbe(target);
+  targets.set(target.targetId, target);
+}
+
+async function ensureRuntime(iceServers) {
+  if (runtimeConnected) return;
+  if (runtimeStarting) return runtimeStarting;
+  const configuredIce = iceServersCopy(iceServers);
+  runtimeStarting = (async () => {
+    startupStage = "load_runtime";
+    window.netConfig = { debug: false, ordered: false, iceServers: configuredIce };
+    webRtcModule = await WebRTCNet({
+      print: () => {},
+      printErr: () => fail("runtime_error"),
+    });
+
+    startupStage = "bind_runtime";
+    setIceServers = webRtcModule.cwrap("setIceServers", "number", ["string"]);
+    connectTo = webRtcModule.cwrap("connectTo", "number", ["string", "string", "string"]);
+    wait = webRtcModule.cwrap("wait", null, ["number"]);
+    virtualPeerForAlias = webRtcModule.cwrap("virtualPeerForAlias", "number", ["string"]);
+    resolvedPeerForVirtual = webRtcModule.cwrap("resolvedPeerForVirtual", "number", ["number"]);
+    send = webRtcModule.cwrap("sendto", "number", ["number", "number", "number", "number"]);
+    receive = webRtcModule.cwrap("recvfrom", "number", ["number", "number", "number"]);
+    disconnect = webRtcModule.cwrap("disconnect", null, ["number"]);
+    shutdown = webRtcModule.cwrap("shutdown", null, []);
+    receiveBuffer = webRtcModule._malloc(maxDatagram + 1);
+    fromPeerBuffer = webRtcModule._malloc(4);
+
+    startupStage = "configure_ice";
+    if (!setIceServers(JSON.stringify(configuredIce))) throw new Error("ice_configuration_failed");
+    startupStage = "connect_signaling";
+    if (!connectTo("wss://net.js-dos.com:444", "quake2", "quake2-secret")) {
+      throw new Error("connect_failed");
     }
+    runtimeConnected = true;
+    startupStage = "complete";
+    timer = setInterval(pump, 5);
+  })();
+  try {
+    await runtimeStarting;
+  } catch (error) {
+    runtimeStarting = undefined;
+    throw error;
+  }
+}
+
+async function applyIce(value) {
+  const generation = normalizeIceGeneration(value?.generation);
+  if (generation === null || generation < 1n) throw new Error("invalid_ice_generation");
+  if (generation <= iceGeneration) return;
+  const servers = iceServersCopy(value.iceServers);
+  commonIce = servers;
+  iceGeneration = generation;
+  if (runtimeConnected) {
+    if (!setIceServers(JSON.stringify(servers))) throw new Error("ice_configuration_failed");
+  }
+}
+
+function hasUnresolvedRoute() {
+  return [...targets.values()].some((target) =>
+    target.routePeerId !== 0 && target.concretePeerId === 0);
+}
+
+function allocateTargetRoute() {
+  if (!runtimeConnected || hasUnresolvedRoute()) return false;
+  for (const target of targets.values()) {
+    if (target.routePeerId !== 0) continue;
+    let routePeerId;
     try {
-      cadence.timerTick();
-      pollStage = "wait";
-      cadence.waitCall();
-      wait(0);
-      if (remotePeer === 0) cadence.aliasPoll();
-      if (!queried && myId() !== 0) {
-        pollStage = "query_alias";
-        queried = true;
-        queryAliases(query);
-      }
-      if (queryFinished && remotePeer === 0) {
-        pollStage = "resolve_alias";
-        if (queryMatches.length !== 1 || queryMatches[0].alias !== config.alias ||
-            queryMatches[0].peer === 0) {
-          throw new Error("alias_not_unique");
-        }
-        remotePeer = queryMatches[0].peer;
-      }
-      if (remotePeer !== 0 && !probeStarted) {
-        pollStage = "start_probe";
-        probeStarted = true;
-        probe.channelOpened();
-      }
-      if (remotePeer === 0) return;
+      routePeerId = virtualPeerForAlias(target.alias) >>> 0;
+    } catch {
+      failTarget(target, "peer_bind_failed");
+      continue;
+    }
+    if (!validVirtualPeerId(routePeerId) ||
+        (routePeerToTarget.has(routePeerId) && routePeerToTarget.get(routePeerId) !== target.targetId)) {
+      failTarget(target, "peer_bind_failed");
+      continue;
+    }
+    target.routePeerId = routePeerId;
+    routePeerToTarget.set(routePeerId, target.targetId);
+    target.resolveDeadline = performance.now() + resolveDeadlineMs;
+    target.probe.channelOpened();
+    return true;
+  }
+  return false;
+}
 
-      pollStage = "receive";
-      for (;;) {
-        module.HEAP32[fromPeer >> 2] = 0;
-        const length = receive(buffer, maxDatagram, fromPeer);
-        if (length === 0) break;
-        const disposition = classifyIncomingDatagram(length);
-        if (disposition === "invalid" ||
-            (module.HEAP32[fromPeer >> 2] >>> 0) !== remotePeer) {
-          throw new Error("invalid_incoming_datagram");
+function resolveTargets() {
+  for (const target of [...targets.values()]) {
+    if (target.routePeerId === 0 || target.concretePeerId !== 0) continue;
+    cadence.aliasPoll();
+    let concretePeerId;
+    try {
+      concretePeerId = resolvedPeerForVirtual(target.routePeerId) >>> 0;
+    } catch {
+      continue;
+    }
+    if (!validConcretePeerId(concretePeerId)) continue;
+    const owner = concretePeerToTarget.get(concretePeerId);
+    if (owner !== undefined && owner !== target.targetId) {
+      failTarget(target, "duplicate_remote_peer");
+      continue;
+    }
+    concretePeerToTarget.set(concretePeerId, target.targetId);
+    target.concretePeerId = concretePeerId;
+    target.state = "probing";
+    if (target.pendingProbeAck) {
+      const ack = target.pendingProbeAck;
+      target.pendingProbeAck = undefined;
+      if (target.probe.packetReceived(ack)) cadence.probeAck();
+    }
+  }
+}
+
+function expireUnresolvedTargets() {
+  const now = performance.now();
+  for (const target of [...targets.values()]) {
+    if (target.routePeerId !== 0 && target.concretePeerId === 0 &&
+        now >= target.resolveDeadline) {
+      failTarget(target, "alias_timeout");
+    }
+  }
+}
+
+function pumpTargetRoutes() {
+  if (!runtimeConnected) return;
+  for (;;) {
+    resolveTargets();
+    expireUnresolvedTargets();
+    if (hasUnresolvedRoute() || !allocateTargetRoute()) return;
+  }
+}
+
+function pump() {
+  if (stopped || !runtimeConnected) return;
+  try {
+    cadence.timerTick();
+    cadence.waitCall();
+    wait(0);
+    pumpTargetRoutes();
+    const receivePacket = () => {
+      webRtcModule.HEAP32[fromPeerBuffer >> 2] = 0;
+      const length = receive(receiveBuffer, maxDatagram + 1, fromPeerBuffer);
+      if (length === 0) return null;
+      const routePeerId = webRtcModule.HEAP32[fromPeerBuffer >> 2] >>> 0;
+      if (length < 0) return { peer: routePeerId, length, data: null };
+      if (classifyIncomingDatagram(length) !== "accepted") {
+        return { peer: routePeerId, length, data: null, oversized: true };
+      }
+      return {
+        peer: routePeerId,
+        length,
+        data: webRtcModule.HEAPU8.slice(receiveBuffer, receiveBuffer + length),
+      };
+    };
+    const receiveDrop = (packet, targetId) => {
+      if (!targetId) {
+        post({ type: "drop", reason: "unknown_peer" });
+        return;
+      }
+      const target = targets.get(targetId);
+      if (!target) return;
+      if (packet.length < 0) {
+        if (target.concretePeerId !== 0) closeTarget(target, "transport_closed");
+        return;
+      } else if (packet.oversized) {
+        post({ type: "drop", targetId, reason: "oversized_transport" });
+      } else {
+        post({ type: "drop", targetId, reason: "receive_queue_full" });
+      }
+    };
+    receiveScheduler.pump(
+      receivePacket,
+      (routePeerId) => routePeerToTarget.get(routePeerId),
+      (targetId, datagram) => {
+        const target = targets.get(targetId);
+        if (!target) return;
+        if (target.concretePeerId === 0 && isProbeAck(datagram)) {
+          target.pendingProbeAck = datagram;
+          return;
         }
-        if (disposition === "oversized") {
-          post({ type: "drop", reason: "oversized_transport" });
-          continue;
-        }
-        const datagram = module.HEAPU8.slice(buffer, buffer + length);
-        if (probe.packetReceived(datagram)) {
+        if (target.probe.packetReceived(datagram)) {
           cadence.probeAck();
         } else {
-          cadence.dcToNative(length);
-          post(bytesToMessage(datagram));
+          cadence.dcToNative(datagram.length);
+          post({ ...bytesToMessage(datagram), targetId });
         }
-      }
-    } catch (error) {
-      fail(stableError(error, `transport_${pollStage}_failed`));
+      },
+      receiveDrop,
+      maxPumpPacketsPerTick,
+    );
+    const now = performance.now();
+    if (lastCadenceReport === 0 || now - lastCadenceReport >= 1000) {
+      lastCadenceReport = now;
+      post(cadence.snapshot());
     }
-  }, 5);
+  } catch (error) {
+    fail(stableError(error, `transport_${startupStage}_failed`));
+  }
+}
+
+async function startLegacy(value) {
+  if (started) throw new Error("duplicate_start");
+  started = true;
+  const config = parseStartMessage(value);
+  await applyIce({ generation: "1", iceServers: config.iceServers });
+  await ensureRuntime(commonIce);
+  putTarget({ alias: config.alias, ordered: config.ordered }, "1");
+}
+
+async function dispatch(value) {
+  if (value?.type === "stop") {
+    stopped = true;
+    if (timer !== undefined) clearInterval(timer);
+    for (const target of [...targets.values()]) removeTarget(target, "", "", false);
+    try { shutdown?.(); } catch {}
+    return;
+  }
+  if (value?.type === "ice") {
+    started = true;
+    await applyIce(value);
+    return;
+  }
+  if (!started && value?.version === 1) {
+    await startLegacy(value);
+    return;
+  }
+  if (value?.type === "put") {
+    if (!commonIce) throw new Error("ice_required_before_put");
+    started = true;
+    putTarget(value.config, value.targetId);
+    await ensureRuntime(commonIce);
+    return;
+  }
+  if (value?.type === "drop") {
+    const targetId = normalizeTargetId(value.targetId);
+    if (!targetId) throw new Error("invalid_target_id");
+    const target = targets.get(targetId);
+    if (target) removeTarget(target, "room-closed", "dropped", false);
+    return;
+  }
+  if (value?.type === "udp") {
+    const targetId = normalizeTargetId(value.targetId);
+    if (!runtimeConnected || !targetId) {
+      post({ type: "drop", reason: "transport_not_ready" });
+      return;
+    }
+    const target = targets.get(targetId);
+    if (!target || target.routePeerId === 0) {
+      post({ type: "drop", targetId, reason: "transport_not_ready" });
+      return;
+    }
+    const datagram = messageToBytes(value);
+    webRtcModule.HEAPU8.set(datagram, receiveBuffer);
+    if (send(receiveBuffer, datagram.length, target.routePeerId, reliableSendMode) === datagram.length) {
+      cadence.nativeToDc(datagram.length);
+    } else {
+      post({ type: "drop", targetId, reason: "transport_not_ready" });
+    }
+    return;
+  }
+  throw new Error("invalid_message");
 }
 
 globalThis.chrome.webview.addEventListener("message", (event) => {
-  try {
-    if (event.data?.type === "stop") {
-      stopped = true;
-      probe?.stop();
-      post({ type: "state", value: "stopped", reason: "" });
-      module?.cwrap("shutdown", null, [])();
-      return;
-    }
-    if (!started) {
-      void start(event.data).catch((error) =>
-        fail(stableError(error, `startup_${startupStage}_failed`)));
-      return;
-    }
-    if (!started || stopped || remotePeer === 0) throw new Error("transport_not_ready");
-    const datagram = messageToBytes(event.data);
-    module.HEAPU8.set(datagram, buffer);
-    if (send(buffer, datagram.length, remotePeer, reliableSendMode) === datagram.length) {
-      cadence.nativeToDc(datagram.length);
-    } else {
-      post({ type: "drop", reason: "transport_not_ready" });
-    }
-  } catch (error) {
-    fail(stableError(error, "invalid_message"));
-  }
+  controlChain.value = controlChain.value
+    .then(() => dispatch(event.data))
+    .catch((error) => fail(stableError(error, `startup_${startupStage}_failed`)));
 });
 
 post({ type: "state", value: "page-ready", reason: "" });

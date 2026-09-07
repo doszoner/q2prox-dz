@@ -2,7 +2,7 @@
   "schema": 1,
   "webrtcNet": {
     "source": "https://github.com/doszoner/WebRTC-NET.git",
-    "commit": "1b8c145b8fb00e8a1599ec311118cd38aad44e7a",
+    "commit": "62fe52cd20bae55baf03339afee60c895f1aee90",
     "submodules": {
       "3rdparty/boringssl": "b34976cae99f8d1b864dbab31e20fc00d06acb09",
       "3rdparty/flatbuffers": "fb9afbafc7dfe226b9db54d4923bfb8839635274",
@@ -17,15 +17,15 @@
     ],
     "linux": {
       "humblenet.h": "faf981e10425e4c7f2c85d98d55a8c5104f52016fa4de8f2d6f9deea40495844",
-      "humblenet_p2p.h": "cedd19cc48e7503f6e0f03f16d13686670b6dbdf5c78670c923acde77f224bb2",
-      "libhumblenet.so": "60215739b82c61865717622f291e6d4d77e93e4e23122c008cdd0aae2e053b02",
+      "humblenet_p2p.h": "b9b2750b0b5cb9baa7bd5c390dce1eab232602175ade96ad1be8cc42feb2d086",
+      "libhumblenet.so": "23ff664ab18acb03409626a497f8052525c1eecc77b1ab66c71f3254444de7cf",
       "libwebrtc.so": "ac3548454e189300c29ef9c9d1f5f8ea726438dc2cfa83a2c065a452c3ca8745",
-      "webrtcnet.mjs": "c4c3eccc9753563e2a77d5b8e121568561fa1011164542c6662356db58b1b2a1",
-      "webrtcnet.wasm": "0374c3c43d24e013ae0ef874eccbd17b0463d78ad8dbc385cb9853129c269118"
+      "webrtcnet.mjs": "c2d2d3232ae4f6eb7a25d3087ef0533a395a651a94d62aaeb89b27e7e903f1f9",
+      "webrtcnet.wasm": "023fdb8d4eb0b07f76488f8cd3a6411f03a2b79964f67592bf73d84eb4e98269"
     },
     "windows": {
-      "webrtcnet.mjs": "c4c3eccc9753563e2a77d5b8e121568561fa1011164542c6662356db58b1b2a1",
-      "webrtcnet.wasm": "0374c3c43d24e013ae0ef874eccbd17b0463d78ad8dbc385cb9853129c269118"
+      "webrtcnet.mjs": "c2d2d3232ae4f6eb7a25d3087ef0533a395a651a94d62aaeb89b27e7e903f1f9",
+      "webrtcnet.wasm": "023fdb8d4eb0b07f76488f8cd3a6411f03a2b79964f67592bf73d84eb4e98269"
     }
   },
   "webView2": {

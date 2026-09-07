@@ -5,7 +5,7 @@ if(NOT WIN32)
     message(FATAL_ERROR "The WebView2 gateway builds only on Windows")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -32,10 +32,12 @@ endforeach()
 add_executable(q2-doszone-webview2-gateway
     src/main.cpp
     src/webview_bridge_protocol.cpp
+    ../coordinator/src/child_protocol.cpp
     src/web_message_dispatch.hpp)
 target_include_directories(q2-doszone-webview2-gateway PRIVATE
     "${WEBVIEW2_SDK_DIR}/build/native/include"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../coordinator/include")
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" Q2DZ_GATEWAY_SOURCE_ROOT)
 target_compile_definitions(q2-doszone-webview2-gateway PRIVATE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WINSOCK_DEPRECATED_NO_WARNINGS)

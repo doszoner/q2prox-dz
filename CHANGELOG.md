@@ -11,6 +11,69 @@
 
 ## [Unreleased]
 
+### Added
+
+- Добавлено соответствие локальных адресов комнатам (только чтение) для локального клиента; это ещё не чат.
+
+### Fixed
+
+- Windows: ограниченная очередь готовности теперь обрабатывает 256 комнат без
+  сброса `Custom` при массовой готовности.
+
+## [1.0.0-rc15] - 2026-09-05
+
+Linux-пакет и общий архив перепакованы 2026-09-06 с исправлениями запускателя
+из `c7277cd`. Windows-пакеты не менялись; повторные проверки не выполнялись.
+
+### Fixed
+
+- Linux: запускатель выбирает общий `q2dz-webrtc-gateway`, а не старый
+  однокомнатный адаптер, из-за которого список Custom оставался пустым.
+- Linux: обновление временных ICE/TURN-данных больше не удаляет комнаты
+  и не разрывает действующие соединения при каждом опросе каталога.
+
+- Linux shared gateway больше не оставляет target в промежуточном состоянии,
+  если readiness probe через HumbleNet/WebRTC-NET вернул short или zero send
+  после получения concrete peer. Такой target теперь получает ограниченное
+  число probe attempts и завершает readiness через `READY` либо
+  `CLOSED reason=probe_timeout`.
+
+### Verified
+
+- Повторный Linux controlled gate с 40 одновременно зарегистрированными
+  neutral `q2ded` peers получил `40/40 READY` через один
+  `q2dz-webrtc-gateway`.
+
+## [1.0.0-rc14] - 2026-09-05
+
+### Added
+
+- Общий многокомнатный gateway теперь рассчитан на все совместимые комнаты
+  Dos.Zone вместо фиксированных `3 q2ded + 2 q2` слотов.
+- Linux live gateway-layer проверка подтвердила одновременные `q2` и `q2ded`,
+  обычный Quake II `status`, удаление одной цели без поломки второй и
+  добавление новой dedicated цели после обновления ICE без перезапуска gateway.
+
+### Changed
+
+- Shared gateway больше не зависит от production `AliasQuery`: транспортная
+  маршрутизация использует virtual PeerId, а resolved concrete PeerId нужен
+  только для `READY` и защиты от duplicate peer.
+- Обновлён закреплённый WebRTC-NET commit и SHA-256 runtime artifacts.
+
+### Fixed
+
+- Исправлено сохранение pending datagram state в WebRTC-NET, когда flush не
+  смог передать пакет сразу; такие пакеты теперь остаются pending до следующей
+  возможности отправки.
+- Windows coordinator теперь принимает CRLF-строки управления и terminal events
+  от PowerShell/child pipes без ложного protocol failure.
+- Windows lifecycle matrix больше не использует устаревшее поле
+  `credential` в тестовом `ROOMS/2 PUT` и устойчивее ждёт bounded recovery
+  после terminal events.
+- Windows release smoke проверяет текущий heartbeat-контракт launcher
+  (`ICE`/`DROP`/`PUT`) вместо удалённых старых helper-имён.
+
 ## [1.0.0-rc13] - 2026-09-03
 
 ### Added
@@ -159,7 +222,9 @@
 - Add-on устанавливается отдельно от Quake II и не заменяет EXE, CFG, карты или
   PAK-файлы пользователя.
 
-[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...HEAD
+[Unreleased]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc15...HEAD
+[1.0.0-rc15]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc14...v1.0.0-rc15
+[1.0.0-rc14]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc13...v1.0.0-rc14
 [1.0.0-rc13]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc12...v1.0.0-rc13
 [1.0.0-rc12]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc11...v1.0.0-rc12
 [1.0.0-rc11]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc10...v1.0.0-rc11

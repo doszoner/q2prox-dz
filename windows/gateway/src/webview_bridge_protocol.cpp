@@ -9,17 +9,32 @@
 namespace {
 
 constexpr std::size_t max_datagram = 1400;
-constexpr std::string_view prefix = "{\"type\":\"udp\",\"data\":\"";
+constexpr std::string_view tagged_prefix = "{\"type\":\"udp\",\"targetId\":\"";
+constexpr std::string_view tagged_data_prefix = "\",\"data\":\"";
 constexpr std::string_view suffix = "\"}";
 constexpr std::string_view ready_prefix =
     "{\"type\":\"state\",\"value\":\"transport-ready\",\"peer\":";
 constexpr std::string_view room_closed_prefix =
     "{\"type\":\"state\",\"value\":\"room-closed\",\"reason\":\"";
-constexpr std::string_view failed_prefix =
-    "{\"type\":\"state\",\"value\":\"failed\",\"reason\":\"";
 constexpr std::string_view cadence_prefix = "{\"type\":\"cadence\",";
+constexpr std::string_view tagged_drop_prefix = "{\"type\":\"drop\",\"targetId\":\"";
+constexpr std::string_view tagged_drop_suffix = "\",\"reason\":\"oversized_transport\"}";
+constexpr std::string_view unknown_peer_drop = "{\"type\":\"drop\",\"reason\":\"unknown_peer\"}";
+constexpr std::string_view ice_prefix = "{\"type\":\"ice\",\"generation\":\"";
+constexpr std::string_view ice_servers_separator = "\",\"iceServers\":";
 constexpr char alphabet[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::optional<std::uint64_t> positive_u64(std::string_view value) {
+    if (value.empty() || (value.front() == '0' && value.size() > 1U)) return std::nullopt;
+    std::uint64_t result = 0;
+    const auto [end, error] = std::from_chars(
+        value.data(), value.data() + value.size(), result);
+    if (error != std::errc{} || end != value.data() + value.size() || result == 0) {
+        return std::nullopt;
+    }
+    return result;
+}
 
 int base64_value(char value) {
     if (value >= 'A' && value <= 'Z') return value - 'A';
@@ -87,23 +102,145 @@ std::vector<std::uint8_t> decode_base64(std::string_view input) {
     return output;
 }
 
+bool safe_reason(std::string_view value) {
+    return !value.empty() && value.size() <= 64U && std::all_of(
+        value.begin(), value.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_' || c == '-';
+        });
+}
+
+struct ParsedStateFields {
+    std::string type;
+    std::string value;
+    std::string reason;
+    std::uint64_t target_id = 0;
+    std::uint32_t peer = 0;
+    bool has_type = false;
+    bool has_value = false;
+    bool has_reason = false;
+    bool has_target_id = false;
+    bool has_peer = false;
+};
+
+bool parse_state_fields(std::string_view message, ParsedStateFields& result) {
+    if (message.size() < 2U || message.size() > 1024U || message.front() != '{' ||
+        message.back() != '}') return false;
+    auto body = message.substr(1U, message.size() - 2U);
+    while (!body.empty()) {
+        const auto comma = body.find(',');
+        const auto part = body.substr(0, comma);
+        const auto colon = part.find(':');
+        if (colon == std::string_view::npos || colon < 3U) return false;
+        const auto key = part.substr(0, colon);
+        const auto raw = part.substr(colon + 1U);
+        if (key.size() < 2U || key.front() != '"' || key.back() != '"' || raw.empty()) return false;
+        const auto name = key.substr(1U, key.size() - 2U);
+        if (name == "type") {
+            if (result.has_type || raw.size() < 2U || raw.front() != '"' || raw.back() != '"') return false;
+            result.type = std::string(raw.substr(1U, raw.size() - 2U));
+            result.has_type = true;
+        } else if (name == "value") {
+            if (result.has_value || raw.size() < 2U || raw.front() != '"' || raw.back() != '"') return false;
+            result.value = std::string(raw.substr(1U, raw.size() - 2U));
+            result.has_value = true;
+        } else if (name == "reason") {
+            if (result.has_reason || raw.size() < 2U || raw.front() != '"' || raw.back() != '"') return false;
+            result.reason = std::string(raw.substr(1U, raw.size() - 2U));
+            result.has_reason = true;
+        } else if (name == "targetId") {
+            if (result.has_target_id || raw.size() < 2U || raw.front() != '"' || raw.back() != '"') return false;
+            const auto value = positive_u64(raw.substr(1U, raw.size() - 2U));
+            if (!value) return false;
+            result.target_id = *value;
+            result.has_target_id = true;
+        } else if (name == "peer") {
+            if (result.has_peer) return false;
+            const auto value = positive_u64(raw);
+            if (!value || *value >= 0x80000000U) return false;
+            result.peer = static_cast<std::uint32_t>(*value);
+            result.has_peer = true;
+        } else {
+            return false;
+        }
+        if (comma == std::string_view::npos) break;
+        body.remove_prefix(comma + 1U);
+        if (body.empty()) return false;
+    }
+    return true;
+}
+
+std::optional<TargetStateMessage> parse_state_message(std::string_view message) {
+    ParsedStateFields fields;
+    if (!parse_state_fields(message, fields) || !fields.has_type || fields.type != "state" ||
+        !fields.has_value || !fields.has_target_id) return std::nullopt;
+    if (fields.value == "transport-ready") {
+        if (!fields.has_peer || fields.has_reason) return std::nullopt;
+    } else if (fields.value == "room-closed" || fields.value == "failed") {
+        if (!fields.has_reason || fields.has_peer || !safe_reason(fields.reason)) return std::nullopt;
+    } else {
+        return std::nullopt;
+    }
+    return TargetStateMessage{fields.target_id, fields.value, fields.reason, fields.peer};
+}
+
 }  // namespace
 
 std::string encode_datagram_message(const std::vector<std::uint8_t> &datagram) {
+    return encode_datagram_message(1, datagram);
+}
+
+std::string encode_datagram_message(std::uint64_t target_id,
+                                    const std::vector<std::uint8_t> &datagram) {
+    if (!positive_u64(std::to_string(target_id))) {
+        throw std::invalid_argument("target id must be nonzero");
+    }
     validate_size(datagram.size());
-    return std::string(prefix) + encode_base64(datagram) + std::string(suffix);
+    return std::string(tagged_prefix) + std::to_string(target_id) +
+           std::string(tagged_data_prefix) + encode_base64(datagram) + std::string(suffix);
 }
 
 std::vector<std::uint8_t> decode_datagram_message(std::string_view message) {
-    if (message.size() <= prefix.size() + suffix.size() ||
-        message.substr(0, prefix.size()) != prefix ||
+    return decode_tagged_datagram_message(message).datagram;
+}
+
+TaggedDatagram decode_tagged_datagram_message(std::string_view message) {
+    if (message.size() <= tagged_prefix.size() + tagged_data_prefix.size() + suffix.size() ||
+        message.substr(0, tagged_prefix.size()) != tagged_prefix ||
         message.substr(message.size() - suffix.size()) != suffix) {
-        throw std::invalid_argument("invalid datagram message");
+        throw std::invalid_argument("invalid tagged datagram message");
     }
-    auto datagram = decode_base64(message.substr(
-        prefix.size(), message.size() - prefix.size() - suffix.size()));
+    const auto separator = message.find(tagged_data_prefix, tagged_prefix.size());
+    if (separator == std::string_view::npos) {
+        throw std::invalid_argument("invalid tagged datagram message");
+    }
+    const auto target = positive_u64(message.substr(tagged_prefix.size(),
+                                                   separator - tagged_prefix.size()));
+    if (!target) throw std::invalid_argument("invalid target id");
+    const auto encoded = message.substr(
+        separator + tagged_data_prefix.size(),
+        message.size() - separator - tagged_data_prefix.size() - suffix.size());
+    auto datagram = decode_base64(encoded);
     validate_size(datagram.size());
-    return datagram;
+    return TaggedDatagram{*target, std::move(datagram)};
+}
+
+std::optional<std::uint64_t> parse_ice_generation_message(std::string_view message) {
+    if (message.size() <= ice_prefix.size() + ice_servers_separator.size() + 2U ||
+        message.substr(0, ice_prefix.size()) != ice_prefix || message.back() != '}') {
+        return std::nullopt;
+    }
+    const auto separator = message.find(ice_servers_separator, ice_prefix.size());
+    if (separator == std::string_view::npos) return std::nullopt;
+    const auto generation = positive_u64(message.substr(
+        ice_prefix.size(), separator - ice_prefix.size()));
+    if (!generation) return std::nullopt;
+    const auto servers = message.substr(
+        separator + ice_servers_separator.size(),
+        message.size() - separator - ice_servers_separator.size() - 1U);
+    if (servers.size() < 2U || servers.front() != '[' || servers.back() != ']') {
+        return std::nullopt;
+    }
+    return generation;
 }
 
 bool record_oversized_datagram(std::size_t size,
@@ -119,23 +256,50 @@ void record_accepted_datagram(std::size_t size, std::size_t &maximum) noexcept {
 
 bool record_oversized_transport_drop(std::string_view message,
                                      std::uint64_t &oversized_drops) noexcept {
-    if (message != "{\"type\":\"drop\",\"reason\":\"oversized_transport\"}") {
-        return false;
+    if (message == "{\"type\":\"drop\",\"reason\":\"oversized_transport\"}") {
+        ++oversized_drops;
+        return true;
     }
+    if (message.size() <= tagged_drop_prefix.size() + tagged_drop_suffix.size() ||
+        message.substr(0, tagged_drop_prefix.size()) != tagged_drop_prefix ||
+        message.substr(message.size() - tagged_drop_suffix.size()) != tagged_drop_suffix ||
+        !positive_u64(message.substr(tagged_drop_prefix.size(),
+                                     message.size() - tagged_drop_prefix.size() -
+                                     tagged_drop_suffix.size()))) return false;
     ++oversized_drops;
     return true;
 }
 
+bool record_unknown_peer_drop(std::string_view message,
+                              std::uint64_t &unknown_peer_drops) noexcept {
+    if (message != unknown_peer_drop) return false;
+    ++unknown_peer_drops;
+    return true;
+}
+
 std::optional<std::uint32_t> parse_transport_ready_peer(std::string_view message) {
+    if (const auto parsed = parse_transport_ready_message(message)) return parsed->peer;
     if (message.size()<=ready_prefix.size() || message.substr(0,ready_prefix.size())!=ready_prefix || message.back()!='}') return std::nullopt;
     const auto value=message.substr(ready_prefix.size(),message.size()-ready_prefix.size()-1);
     std::uint32_t peer=0;
     const auto [end,error]=std::from_chars(value.data(),value.data()+value.size(),peer);
-    if(error!=std::errc{}||end!=value.data()+value.size()||peer==0)return std::nullopt;
+    if(error!=std::errc{}||end!=value.data()+value.size()||peer==0||peer>=0x80000000U)return std::nullopt;
     return peer;
 }
 
+std::optional<TransportReadyMessage> parse_transport_ready_message(std::string_view message) {
+    const auto parsed = parse_state_message(message);
+    if (!parsed || parsed->value != "transport-ready") return std::nullopt;
+    return TransportReadyMessage{parsed->target_id, parsed->peer};
+}
+
+std::optional<TargetStateMessage> parse_target_state_message(std::string_view message) {
+    return parse_state_message(message);
+}
+
 std::optional<std::string> parse_room_closed_reason(std::string_view message) {
+    if (const auto parsed = parse_target_state_message(message);
+        parsed && parsed->value == "room-closed") return parsed->reason;
     if (message.size()<=room_closed_prefix.size()+suffix.size() || message.substr(0,room_closed_prefix.size())!=room_closed_prefix || message.substr(message.size()-suffix.size())!=suffix) return std::nullopt;
     const auto value=message.substr(room_closed_prefix.size(),message.size()-room_closed_prefix.size()-suffix.size());
     if(value.empty()||value.size()>64)return std::nullopt;
@@ -144,21 +308,14 @@ std::optional<std::string> parse_room_closed_reason(std::string_view message) {
 }
 
 std::optional<std::string> parse_transport_failed_reason(std::string_view message) {
-    constexpr std::string_view type_field = "\"type\":\"state\"";
-    constexpr std::string_view value_field = "\"value\":\"failed\"";
-    constexpr std::string_view reason_field = "\"reason\":\"";
-    if (message.size() < failed_prefix.size()+suffix.size() || message.front()!='{' || message.back()!='}' ||
-        message.find(type_field)==std::string_view::npos ||
-        message.find(value_field)==std::string_view::npos) return std::nullopt;
-    const auto begin=message.find(reason_field);
-    if(begin==std::string_view::npos)return std::nullopt;
-    const auto start=begin+reason_field.size();
-    const auto end=message.find('"',start);
-    if(end==std::string_view::npos)return std::nullopt;
-    const auto value=message.substr(start,end-start);
-    if(value.empty()||value.size()>64)return std::nullopt;
-    for(const unsigned char c:value)if(!(std::isalnum(c)||c=='_'||c=='-'))return std::nullopt;
-    return std::string(value);
+    if (const auto parsed = parse_target_state_message(message);
+        parsed && parsed->value == "failed") return parsed->reason;
+    ParsedStateFields fields;
+    if (!parse_state_fields(message, fields) || !fields.has_type ||
+        fields.type != "state" || !fields.has_value || fields.value != "failed" ||
+        fields.has_target_id || fields.has_peer || !fields.has_reason ||
+        !safe_reason(fields.reason)) return std::nullopt;
+    return fields.reason;
 }
 
 std::optional<CadenceSnapshot> parse_cadence_message(std::string_view message) {

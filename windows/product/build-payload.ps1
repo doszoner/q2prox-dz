@@ -31,13 +31,22 @@ function Invoke-Checked([string]$File, [object[]]$Arguments) {
 function Get-PythonCommand {
   $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
   if ($launcher) {
-    & $launcher.Source -3 --version *> $null
-    if ($LASTEXITCODE -eq 0) { return @($launcher.Source, '-3') }
+    try {
+      & $launcher.Source -3 --version *> $null
+      if ($LASTEXITCODE -eq 0) { return @($launcher.Source, '-3') }
+    } catch {
+      # Some Windows images ship py.exe but have no registered Python runtime.
+      # Fall back to python.exe instead of making release builds depend on the
+      # launcher registry state.
+    }
   }
   $python = Get-Command python.exe -ErrorAction SilentlyContinue
   if ($python) {
-    & $python.Source --version *> $null
-    if ($LASTEXITCODE -eq 0) { return @($python.Source) }
+    try {
+      & $python.Source --version *> $null
+      if ($LASTEXITCODE -eq 0) { return @($python.Source) }
+    } catch {
+    }
   }
   throw 'Python 3 is required to verify deps.lock.json.'
 }
@@ -112,7 +121,14 @@ try {
 
   $node = Get-Command node.exe -ErrorAction SilentlyContinue
   if (-not $node) { throw 'Node.js is required for the Windows release contract tests.' }
-  Invoke-Checked $node.Source @('--test', (Join-Path $repoRoot 'windows/gateway/tests/transport_protocol.test.mjs'))
+  $previousWebRtcSource = $env:WEBRTC_NET_SOURCE_DIR
+  try {
+    $env:WEBRTC_NET_SOURCE_DIR = $webrtcSource
+    Invoke-Checked $node.Source @('--test', (Join-Path $repoRoot 'windows/gateway/tests/transport_protocol.test.mjs'))
+  } finally {
+    if ($null -eq $previousWebRtcSource) { Remove-Item Env:WEBRTC_NET_SOURCE_DIR -ErrorAction SilentlyContinue }
+    else { $env:WEBRTC_NET_SOURCE_DIR = $previousWebRtcSource }
+  }
 
   $catalogContract = Join-Path $product 'tests/catalog.tests.ps1'
   & $catalogContract

@@ -1,6 +1,209 @@
 const aliasPattern = /^[A-Za-z0-9._-]{1,255}$/;
 export const maxDatagram = 1400;
+export const maxTargets = 256;
+export const maxPumpPacketsPerTick = 64;
+export const maxDeliveriesPerPeerPerTick = 8;
+export const maxQueuedPacketsPerTarget = 64;
 export const reliableSendMode = 0;
+
+const maxUint64 = 18446744073709551615n;
+const canonicalTargetId = /^[1-9][0-9]*$/;
+
+export function normalizeIceGeneration(value) {
+  if (typeof value !== "string" || !canonicalTargetId.test(value)) return null;
+  try {
+    const parsed = BigInt(value);
+    return parsed <= maxUint64 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeTargetId(value) {
+  let text;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 1) return null;
+    text = String(value);
+  } else if (typeof value === "string") {
+    text = value;
+  } else {
+    return null;
+  }
+  if (!canonicalTargetId.test(text)) return null;
+  try {
+    return BigInt(text) <= maxUint64 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+function validTargetId(value) {
+  return normalizeTargetId(value) !== null;
+}
+
+function validVirtualPeerId(value) {
+  const peer = value >>> 0;
+  return peer >= 0x80000000 && peer <= 0xffffffff;
+}
+
+function validConcretePeerId(value) {
+  return Number.isSafeInteger(value) && value > 0 && value < 0x80000000;
+}
+
+export function createTargetRegistry() {
+  const targets = new Map();
+  const routePeerToTarget = new Map();
+  const concretePeerToTarget = new Map();
+  return {
+    targets,
+    routePeerToTarget,
+    concretePeerToTarget,
+    put({ targetId, alias, ...rest } = {}) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      if (!normalizedTargetId || typeof alias !== "string" ||
+          !aliasPattern.test(alias) || targets.size >= maxTargets ||
+          targets.has(normalizedTargetId)) {
+        return false;
+      }
+      targets.set(normalizedTargetId, {
+        ...rest, targetId: normalizedTargetId, alias,
+        routePeerId: 0, concretePeerId: 0, state: "resolving",
+      });
+      return true;
+    },
+    bindRoute(targetId, routePeerId) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      const target = targets.get(normalizedTargetId);
+      const normalizedRoutePeerId = routePeerId >>> 0;
+      if (!target || !validVirtualPeerId(normalizedRoutePeerId)) return "invalid_peer";
+      const owner = routePeerToTarget.get(normalizedRoutePeerId);
+      if (owner !== undefined && owner !== normalizedTargetId) return "duplicate_route_peer";
+      if (target.routePeerId !== 0) routePeerToTarget.delete(target.routePeerId);
+      target.routePeerId = normalizedRoutePeerId;
+      routePeerToTarget.set(normalizedRoutePeerId, normalizedTargetId);
+      return "bound";
+    },
+    reserveConcrete(targetId, concretePeerId) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      const target = targets.get(normalizedTargetId);
+      if (!target || !validConcretePeerId(concretePeerId)) return "invalid_peer";
+      const owner = concretePeerToTarget.get(concretePeerId);
+      if (owner !== undefined && owner !== normalizedTargetId) return "duplicate_remote_peer";
+      if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
+      target.concretePeerId = concretePeerId;
+      target.state = "probing";
+      concretePeerToTarget.set(concretePeerId, normalizedTargetId);
+      return "reserved";
+    },
+    targetForRoute(routePeerId) {
+      return routePeerToTarget.get(routePeerId >>> 0);
+    },
+    targetForConcrete(concretePeerId) {
+      return concretePeerToTarget.get(concretePeerId);
+    },
+    send(targetId, datagram) {
+      const target = targets.get(normalizeTargetId(targetId));
+      if (!target || target.routePeerId === 0) throw new Error("transport_not_ready");
+      return { ...bytesToMessage(datagram), targetId: target.targetId };
+    },
+    receive(routePeerId, datagram) {
+      const targetId = routePeerToTarget.get(routePeerId >>> 0);
+      if (targetId === undefined) return { type: "drop", reason: "unknown_peer" };
+      return { ...bytesToMessage(datagram), targetId };
+    },
+    close(targetId) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      const target = targets.get(normalizedTargetId);
+      if (!target) return false;
+      if (target.routePeerId !== 0) routePeerToTarget.delete(target.routePeerId);
+      if (target.concretePeerId !== 0) concretePeerToTarget.delete(target.concretePeerId);
+      targets.delete(normalizedTargetId);
+      return true;
+    },
+    pump(receive, handle, limit = maxPumpPacketsPerTick) {
+      let processed = 0;
+      for (; processed < Math.min(limit, maxPumpPacketsPerTick); ++processed) {
+        const packet = receive();
+        if (!packet) break;
+        handle(this.receive(packet.peer, packet.data));
+      }
+      return processed;
+    },
+  };
+}
+
+export function createFairReceiveScheduler({
+  scanLimit = maxPumpPacketsPerTick,
+  deliveryLimit = maxPumpPacketsPerTick,
+  perPeerLimit = maxDeliveriesPerPeerPerTick,
+  queueLimit = maxQueuedPacketsPerTarget,
+} = {}) {
+  const queues = new Map();
+  let cursor = 0;
+  const bounded = (value, fallback) => Number.isInteger(value) && value > 0 ? value : fallback;
+
+  return {
+    enqueue(targetId, datagram) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      if (!normalizedTargetId || !(datagram instanceof Uint8Array)) return false;
+      let queue = queues.get(normalizedTargetId);
+      if (!queue) queues.set(normalizedTargetId, queue = []);
+      if (queue.length >= bounded(queueLimit, maxQueuedPacketsPerTarget)) return false;
+      queue.push(datagram);
+      return true;
+    },
+    drop(targetId) {
+      const normalizedTargetId = normalizeTargetId(targetId);
+      if (!normalizedTargetId) return false;
+      return queues.delete(normalizedTargetId);
+    },
+    pending(targetId) {
+      return queues.get(normalizeTargetId(targetId))?.length ?? 0;
+    },
+    pump(receive, resolveTarget, handle, onDrop = () => {}, limit = deliveryLimit) {
+      const scans = bounded(scanLimit, maxPumpPacketsPerTick);
+      let scanned = 0;
+      for (; scanned < scans; ++scanned) {
+        const packet = receive();
+        if (!packet) break;
+        const targetId = resolveTarget(packet.peer);
+        if (!targetId || !this.enqueue(targetId, packet.data)) onDrop(packet, targetId);
+      }
+
+      const ids = [...queues.keys()];
+      const deliveries = bounded(limit, maxPumpPacketsPerTick);
+      const perTarget = new Map();
+      let delivered = 0;
+      if (ids.length !== 0) {
+        const peerQuota = bounded(perPeerLimit, maxDeliveriesPerPeerPerTick);
+        const round = (quota) => {
+          let progress = false;
+          for (let offset = 0; offset < ids.length && delivered < deliveries; ++offset) {
+            const index = (cursor + offset) % ids.length;
+            const targetId = ids[index];
+            const queue = queues.get(targetId);
+            const count = perTarget.get(targetId) ?? 0;
+            if (!queue || queue.length === 0 || (quota !== undefined && count >= quota)) {
+              continue;
+            }
+            handle(targetId, queue.shift());
+            perTarget.set(targetId, count + 1);
+            ++delivered;
+            progress = true;
+          }
+          return progress;
+        };
+        while (delivered < deliveries && round(peerQuota)) {}
+        while (delivered < deliveries && round(undefined)) {}
+        cursor = (cursor + 1) % ids.length;
+      }
+      for (const targetId of ids) {
+        if (queues.get(targetId)?.length === 0) queues.delete(targetId);
+      }
+      return { scanned, delivered };
+    },
+  };
+}
 
 export function createCadenceCounter() {
   const interval = {
@@ -80,6 +283,20 @@ export function parseStartMessage(value) {
     alias: value.alias,
     ordered: value.ordered,
     iceServers: JSON.parse(iceJson),
+  });
+}
+
+export function parseTargetMessage(value) {
+  const targetId = normalizeTargetId(value?.targetId);
+  if (!value || typeof value !== "object" || !targetId ||
+      !aliasPattern.test(value.alias ?? "") ||
+      (value.ordered !== undefined && value.ordered !== false)) {
+    throw new Error("invalid_target_message");
+  }
+  return Object.freeze({
+    targetId,
+    alias: value.alias,
+    ordered: value.ordered === true,
   });
 }
 

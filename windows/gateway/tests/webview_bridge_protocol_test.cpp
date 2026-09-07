@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -116,12 +117,94 @@ int main() {
         transport_drops));
     CHECK(!record_oversized_transport_drop(
         "{\"type\":\"drop\",\"reason\":\"transport_not_ready\"}", transport_drops));
-    CHECK(transport_drops == 1);
+    CHECK(record_oversized_transport_drop(
+        "{\"type\":\"drop\",\"targetId\":\"42\",\"reason\":\"oversized_transport\"}",
+        transport_drops));
+    CHECK(!record_oversized_transport_drop(
+        "{\"type\":\"drop\",\"targetId\":\"42\",\"credential\":\"x\",\"reason\":\"oversized_transport\"}",
+        transport_drops));
+    std::uint64_t unknown_peer_drops = 0;
+    CHECK(record_unknown_peer_drop(
+        "{\"type\":\"drop\",\"reason\":\"unknown_peer\"}", unknown_peer_drops));
+    CHECK(!record_unknown_peer_drop(
+        "{\"type\":\"drop\",\"reason\":\"unknown_peer\",\"credential\":\"x\"}",
+        unknown_peer_drops));
+    CHECK(unknown_peer_drops == 1);
+    CHECK(transport_drops == 2);
+
+    const auto large_ice_generation = parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":\"9007199254740993\",\"iceServers\":[]}");
+    CHECK(large_ice_generation && *large_ice_generation == UINT64_C(9007199254740993));
+    const auto maximum_ice_generation = parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":\"18446744073709551615\",\"iceServers\":[]}");
+    CHECK(maximum_ice_generation && *maximum_ice_generation == UINT64_C(18446744073709551615));
+    CHECK(!parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":9007199254740993,\"iceServers\":[]}"));
+    CHECK(!parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":\"01\",\"iceServers\":[]}"));
+    CHECK(!parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":\"18446744073709551616\",\"iceServers\":[]}"));
+    CHECK(!parse_ice_generation_message(
+        "{\"type\":\"ice\",\"generation\":\"1\",\"iceServers\":[],\"credential\":\"x\"}"));
 
     for (const std::size_t size : {1, 32, 512, 1390, 1400}) {
         const auto input = datagram(size);
         const auto message = encode_datagram_message(input);
         CHECK(decode_datagram_message(message) == input);
+    }
+
+    const auto tagged = encode_datagram_message(42, datagram(32));
+    const auto tagged_decoded = decode_tagged_datagram_message(tagged);
+    CHECK(tagged_decoded.target_id == 42 && tagged_decoded.datagram == datagram(32));
+    CHECK(decode_tagged_datagram_message(encode_datagram_message(42, datagram(1400))).datagram.size() == 1400);
+    CHECK(throws_invalid_argument([] {
+        encode_datagram_message(42, std::vector<std::uint8_t>(1401));
+    }));
+    CHECK(throws_invalid_argument([] {
+        encode_datagram_message(0, std::vector<std::uint8_t>(1));
+    }));
+    CHECK(throws_invalid_argument([] {
+        decode_tagged_datagram_message(
+            "{\"type\":\"udp\",\"targetId\":\"0\",\"data\":\"AQ==\"}");
+    }));
+    CHECK(throws_invalid_argument([] {
+        decode_tagged_datagram_message(
+            "{\"type\":\"udp\",\"targetId\":\"1\",\"data\":\"AQ==\",\"credential\":\"x\"}");
+    }));
+    CHECK(throws_invalid_argument([] {
+        decode_tagged_datagram_message(
+            "{\"type\":\"udp\",\"targetId\":1,\"data\":\"AQ==\"}");
+    }));
+    CHECK(throws_invalid_argument([] {
+        decode_datagram_message("{\"type\":\"udp\",\"data\":\"AQ==\"}");
+    }));
+
+    CHECK(parse_transport_ready_message(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"targetId\":\"42\",\"peer\":77}")
+          .value().target_id == 42);
+    CHECK(!parse_transport_ready_message(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"targetId\":\"42\",\"peer\":77,\"token\":\"x\"}"));
+    CHECK(!parse_transport_ready_message(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"targetId\":\"42\",\"peer\":2147483648}"));
+    CHECK(!parse_transport_ready_message(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"targetId\":42,\"peer\":77}"));
+    CHECK(!parse_transport_ready_message(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"targetId\":\"042\",\"peer\":77}"));
+    CHECK(!parse_target_state_message(
+        "{\"type\":\"state\",\"value\":\"failed\",\"targetId\":\"42\",\"reason\":\"bad reason\"}"));
+    CHECK(parse_target_state_message(
+        "{\"type\":\"state\",\"value\":\"room-closed\",\"targetId\":\"42\",\"reason\":\"probe_timeout\"}")
+          .value().target_id == 42);
+    const auto maximum_target_message = encode_datagram_message(
+        UINT64_C(18446744073709551615), datagram(1));
+    CHECK(maximum_target_message.find("\"targetId\":\"18446744073709551615\"") !=
+          std::string::npos);
+    CHECK(decode_tagged_datagram_message(maximum_target_message).target_id ==
+          UINT64_C(18446744073709551615));
+    for (std::uint64_t target = 1; target <= 40; ++target) {
+        const auto message = encode_datagram_message(target, datagram(1));
+        const auto decoded = decode_tagged_datagram_message(message);
+        CHECK(decoded.target_id == target);
     }
 
     CHECK(throws_invalid_argument([] { encode_datagram_message({}); }));
@@ -142,6 +225,8 @@ int main() {
     CHECK(!parse_transport_ready_peer(
         "{\"type\":\"state\",\"value\":\"transport-ready\",\"peer\":0}"));
     CHECK(!parse_transport_ready_peer(
+        "{\"type\":\"state\",\"value\":\"transport-ready\",\"peer\":2147483648}"));
+    CHECK(!parse_transport_ready_peer(
         "{\"type\":\"state\",\"value\":\"transport-ready\",\"peer\":42,\"token\":\"leak\"}"));
     CHECK(parse_room_closed_reason(
         "{\"type\":\"state\",\"value\":\"room-closed\",\"reason\":\"probe_timeout\"}") == "probe_timeout");
@@ -155,5 +240,40 @@ int main() {
         "invalid_start_message");
     CHECK(!parse_transport_failed_reason(
         "{\"type\":\"state\",\"value\":\"failed\",\"reason\":\"secret leaked\"}"));
+    CHECK(!parse_transport_failed_reason(
+        "{\"type\":\"state\",\"value\":\"failed\",\"reason\":\"safe\",\"credential\":\"x\"}"));
+
+    std::map<std::uint64_t, bool> active_targets;
+    for (std::uint64_t target = 1; target <= 40; ++target) active_targets[target] = true;
+    std::map<std::uint64_t, std::vector<std::uint8_t>> routes;
+    for (std::uint64_t round = 0; round < 3; ++round) {
+        if (round == 1) active_targets.erase(17);
+        for (std::uint64_t offset = 0; offset < 40; ++offset) {
+            const auto target = 1 + ((round * 13 + offset) % 40);
+            if (!active_targets.contains(target)) continue;
+            const auto message = encode_datagram_message(target,
+                {static_cast<std::uint8_t>(round), static_cast<std::uint8_t>(target)});
+            const auto tagged_message = decode_tagged_datagram_message(message);
+            const auto destination = active_targets.find(tagged_message.target_id);
+            CHECK(destination != active_targets.end());
+            if (destination != active_targets.end()) {
+                routes[tagged_message.target_id].insert(routes[tagged_message.target_id].end(),
+                                                        tagged_message.datagram.begin(),
+                                                        tagged_message.datagram.end());
+            }
+        }
+    }
+    CHECK(routes.size() == 40);
+    for (std::uint64_t target = 1; target <= 40; ++target) {
+        if (target == 17) {
+            CHECK(routes[target].size() == 2);
+            continue;
+        }
+        const auto &route = routes[target];
+        CHECK(route.size() == 6);
+        for (std::size_t round = 0; round < 3; ++round) {
+            CHECK(route[round * 2] == round && route[round * 2 + 1] == target);
+        }
+    }
     return failures ? 1 : 0;
 }

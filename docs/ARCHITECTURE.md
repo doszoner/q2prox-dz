@@ -41,8 +41,9 @@ HumbleNet/WebRTC receive API получает caller-sized buffer. Если API 
 
 ## Встроенный браузер комнат
 
-Launcher сразу запускает hub-режим, без отдельного окна выбора. Hub поддерживает
-до трёх dedicated и двух обычных независимых gateway и запускает один Q2PRO-X со стабильным
+Launcher сразу запускает hub-режим, без отдельного окна выбора. Hub публикует
+все совместимые комнаты, которые проходят проверку каталога, content check и
+текущий предел `256` targets, и запускает один Q2PRO-X со стабильным
 локальным HTTP-источником:
 
 ```text
@@ -61,8 +62,8 @@ Q2PRO-X получает через прозрачный gateway настоящ�
 `Custom` и нажимает `Refresh`. Принудительный `serverbrowser_open_modern` не
 используется.
 
-Закрытие или падение одного gateway не завершает Q2PRO-X и остальные gateway.
-Для dedicated одного slot binding разрешены две попытки восстановления;
+Закрытие или падение одного target не завершает Q2PRO-X и остальные targets.
+Для одного target разрешены ограниченные попытки восстановления;
 после их исчерпания пользователь перезапускает add-on.
 После штатного таймаута либо ручного `Disconnect` пользователь выбирает другую
 комнату. Выход Q2PRO-X или hard-kill hub очищает все принадлежащие ему процессы.
@@ -75,11 +76,12 @@ Quake II status. Подробный контракт: [ADR 0004](adr/0004-q2pro-
 
 Граница компонентов:
 
-- Python/PowerShell: опрос каталога, строгая проверка и выбор пяти стабильных
-  слотов (`0..2 q2ded`, `3..4 q2`);
-- C++ coordinator: независимые команды слотов, владение Q2PRO-X и gateway,
+- Python/PowerShell: опрос каталога, строгая проверка и полный heartbeat
+  совместимых комнат без молчаливого усечения;
+- C++ coordinator: независимые команды targets, владение Q2PRO-X и gateway,
   локальный HTTP-источник;
-- gateway: неизменённый UDP↔WebRTC transport для одной комнаты;
+- gateway: общий UDP↔WebRTC transport runtime с отдельным loopback endpoint на
+  target;
 - Q2PRO-X: неизменённые встроенные `Custom` и `Refresh`.
 
 ## Windows
@@ -111,6 +113,6 @@ guardian очищает весь набор по session marker и удаляе�
 
 [ADR 0004](adr/0004-q2pro-x-custom-source-room-hub.md) описывает текущий путь:
 штатная вкладка `Custom`, стабильный loopback HTTP source и room hub. Кандидат
-`1.0.0-rc13` проверяется по указанным в ADR live, lifecycle и package gates;
+`1.0.0-rc15` проверяется по указанным в ADR live, lifecycle и package gates;
 фактически пройденные проверки приведены в
-[rc13 verification](verification/1.0.0-rc13.md).
+[rc15 verification](verification/1.0.0-rc15.md).
