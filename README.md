@@ -70,9 +70,10 @@ Windows использует WebView2, Linux — нативный WebRTC-NET tra
 
 ## Состояние
 
-В исходниках Windows-кандидата `1.0.0-rc16` исправлены причины пустого `Custom`:
-проверка карт, ротация ICE и обмен gateway. Новые Windows ZIP ещё не собраны:
-Windows build/package gates ожидают доступа к VM. Linux-поставка остаётся `1.0.0-rc15`.
+В Windows-кандидате `1.0.0-rc16` исправлены причины пустого `Custom`:
+проверка карт, ротация ICE и обмен gateway. Portable/setup ZIP собраны
+и прошли Windows build/package gates; gameplay у пользователя ещё не проверен.
+Linux-поставка остаётся `1.0.0-rc15`.
 Используется общий многокомнатный gateway. Точный
 контракт Q2PRO-X для локального HTTP-источника и последовательности
 `status`/`connect` зафиксирован в [отчёте проверки](docs/verification/2026-08-29-q2pro-x-live-custom-source.md).

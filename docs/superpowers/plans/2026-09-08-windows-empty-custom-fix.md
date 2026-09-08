@@ -26,19 +26,20 @@
 - [x] Независимые проверки соответствия и качества: SPEC PASS / QUALITY PASS
   для source-commit gate, не для Windows-поставки.
 - [x] VERSION rc16, CHANGELOG, evidence; Linux остаётся rc15.
-- [ ] Windows build-payload.ps1 в существующей
+- [x] Windows build-payload.ps1 в существующей
   VM с закреплёнными зависимостями, lifecycle, Brepro, package smoke.
-- [ ] Проверка новой portable-поставки на Windows: несколько целей, одна
-  недоступная карта, смена ICE; реальный WebView2/Quake II обмен если среда позволяет.
-  Не приравнивать fake-peer/READY к gameplay.
+- [x] Проверка новой portable-поставки на Windows: несколько целей, одна
+  недоступная карта, смена ICE; настоящий packaged content checker.
+- [ ] Реальный WebView2/Quake II gameplay: нужен отдельный интерактивный gate.
+  Не приравнивать проверки каталога и fake-peer/READY к gameplay.
 - [x] Коммит от текущей repo identity; без push.
-- [ ] Portable/setup ZIP + SHA256; источник поставки однозначен.
+- [x] Portable/setup ZIP + SHA256; источник поставки однозначен.
   Старые поставки не перезаписывать.
 - [x] Открытые live-gates перечислены явно в rc16 verification.
 
-Windows build/package и проверка готовых архивов заблокированы авторизацией
-GuestControl. VM возвращена в исходное состояние `saved`; требуется доступ
-от пользователя. Это не PASS поставки.
+Windows build/package PASS: сборка из `bd4cf57`. Прежний доступ к VM восстановлен
+без смены пароля и без rollback. VM штатно выключена, все пять snapshots
+сохранены. Отдельные gameplay/Authenticode gates остаются открытыми.
 
 Основание: `docs/verification/2026-09-08-windows11-empty-custom-review.md`.
 Исполнение по subagent-driven-development: один implementer, затем review;

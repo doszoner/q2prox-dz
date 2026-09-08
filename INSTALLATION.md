@@ -33,8 +33,8 @@ Launcher опрашивает каталог примерно раз в 15 се�
 
 ## Windows setup
 
-Ниже указаны имена планируемых rc16-архивов; пока они не собраны.
-Состояние build/package gates: [rc16 verification](docs/verification/1.0.0-rc16.md).
+Rc16-архивы собраны и проверены в Windows. Хеши и оставшиеся live-gates:
+[rc16 verification](docs/verification/1.0.0-rc16.md).
 
 1. Скачайте `q2prox-dz-1.0.0-rc16-windows-x64-setup.zip` и полностью
    распакуйте его.
