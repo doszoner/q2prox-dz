@@ -126,6 +126,10 @@ void emit_closed(std::uint64_t id, std::string_view reason) {
     emit("Q2DZ/HUB/2 CLOSED id=" + std::to_string(id) + " reason=" + std::string(reason));
 }
 
+void emit_fatal(std::string_view stage, std::string_view code) {
+    emit("Q2DZ/HUB/2 FATAL stage=" + std::string(stage) + " code=" + std::string(code));
+}
+
 } // namespace
 
 int wmain() {
@@ -201,6 +205,11 @@ int wmain() {
             if (mode == L"fatal-immediate") {
                 emit_failed(id, "immediate_test");
                 targets.erase(id);
+                wipe(command.json);
+                continue;
+            }
+            if (mode == L"fatal-global") {
+                emit_fatal("gateway", "invalid_web_message");
                 wipe(command.json);
                 continue;
             }

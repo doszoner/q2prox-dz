@@ -5,11 +5,12 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Текущий `1.0.0-rc15` получает PASS только из
-[`1.0.0-rc15`](verification/1.0.0-rc15.md), где должны быть зафиксированы
+rollback. Windows-кандидат `1.0.0-rc16` получает PASS только из
+[`1.0.0-rc16`](verification/1.0.0-rc16.md), где должны быть зафиксированы
 точные результаты компонентных, live и package gates.
+Linux-поставка остаётся `1.0.0-rc15`; rc16 выпускается только для Windows.
 
-Пользователю следует публиковать только три canonical архива и соседние
+Пользователю следует публиковать только canonical архивы и соседние
 `.sha256`:
 
 - `q2prox-dz-<version>-windows-x64-portable.zip`;
@@ -25,6 +26,7 @@ python3 tools/build-test-bundle.py
 Он кладёт рядом с тремя поставками документы проверки и
 `tests/tools/controlled-room-set.py`, нужный для exact Q2PRO-X 40-source gate.
 Этот bundle не является отдельной пользовательской поставкой.
+Для Windows-only rc16 этот скрипт не применяется: Linux rc16 не собирался.
 
 ## Публичная граница
 
@@ -43,7 +45,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc15
+  -OutputDir .\dist\windows-1.0.0-rc16
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -104,5 +106,5 @@ Unsigned Windows candidates допустимы для корректностно
 закрытой alpha-группе с явным предупреждением. До широкого публичного выпуска
 необходимо выполнить Authenticode gate и заново проверить exact release archives.
 
-Пока эти условия не выполнены для конкретного rc15-архива, он остаётся
+Пока эти условия не выполнены для конкретного архива, он остаётся
 кандидатом для проверки и не считается готовой пользовательской поставкой.

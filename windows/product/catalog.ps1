@@ -358,6 +358,26 @@ function ConvertTo-Q2DzCanonicalJsonValue {
   return $result
 }
 
+function Test-Q2DzRoomConfigChanged {
+  param(
+    [Parameter(Mandatory = $true)][string]$Previous,
+    [Parameter(Mandatory = $true)][string]$Current
+  )
+  $previousValue = $Previous | ConvertFrom-Json -ErrorAction Stop
+  $currentValue = $Current | ConvertFrom-Json -ErrorAction Stop
+  foreach ($value in @($previousValue, $currentValue)) {
+    if ($null -eq $value -or $value -is [array] -or $null -eq $value.PSObject) {
+      throw 'room configuration must be a JSON object'
+    }
+    if ($value.PSObject.Properties.Name -contains 'iceServers') {
+      [void]$value.PSObject.Properties.Remove('iceServers')
+    }
+  }
+  $previousJson = ConvertTo-Json -InputObject (ConvertTo-Q2DzCanonicalJsonValue $previousValue) -Depth 8 -Compress
+  $currentJson = ConvertTo-Json -InputObject (ConvertTo-Q2DzCanonicalJsonValue $currentValue) -Depth 8 -Compress
+  return $previousJson -cne $currentJson
+}
+
 function Get-Q2DzDedicatedIceServers {
   param([Parameter(Mandatory = $true)]$RtcPayload)
   if (-not (Test-Q2DzRtcPayload $RtcPayload)) { throw 'RTC configuration has an invalid schema' }
@@ -483,18 +503,20 @@ function Get-Q2DzTargetPlan {
     $values = @(& $MakeConfig $row)
     if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }
     $config = [string]$values[0]
-    $changed = $config -cne [string]$target.Config
+    $changed = Test-Q2DzRoomConfigChanged -Previous ([string]$target.Config) -Current $config
     $mapChanged = -not [string]::IsNullOrEmpty([string]$target.MapName) -and [string]$target.MapName -cne $map
-    if ($changed -and $mapChanged -and -not (& $MapAvailable $row)) { throw 'map content check failed' }
-    $savedConfig = if ($changed) { $config } else { [string]$target.Config }
-    $updated[$roomId] = New-Q2DzTarget $target.RoomId $savedConfig 0 $map
+    if ($mapChanged -and -not (& $MapAvailable $row)) {
+      [void]$drops.Add([string]$roomId)
+      continue
+    }
+    $updated[$roomId] = New-Q2DzTarget $target.RoomId $config 0 $map
     if ($changed) { [void]$drops.Add([string]$roomId) }
   }
 
   foreach ($row in (Sort-Q2DzRoomRows $desired)) {
     $roomId = [string]$row.room
     if ($updated.ContainsKey($roomId)) { continue }
-    if (-not (& $MapAvailable $row)) { throw 'map content check failed' }
+    if (-not (& $MapAvailable $row)) { continue }
     if ($updated.Count -ge $Q2DZ_MAX_TARGETS) { continue }
     $values = @(& $MakeConfig $row)
     if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }

@@ -990,6 +990,14 @@ bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTarge
             return false;
         }
         const auto& event = *parsed.event;
+        if (event.type == q2dz::ChildEventType::fatal) {
+            const auto stage = event.fields.find("stage");
+            const auto code = event.fields.find("code");
+            if (stage == event.fields.end() || code == event.fields.end()) return false;
+            std::cerr << "q2dz-session: gateway fatal stage=" << stage->second
+                      << " code=" << code->second << '\n';
+            return false;
+        }
         if (event.type == q2dz::ChildEventType::heartbeat) continue;
         const auto id_field = event.fields.find("id");
         if (id_field == event.fields.end()) return false;

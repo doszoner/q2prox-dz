@@ -820,6 +820,9 @@ test("synthetic Node vm HUB/2 page routes 40 targets and keeps a DROP survivor",
     peers.map((peer, index) => [String(index + 1), peer]));
   const routed = posts.filter((value) => value.type === "udp");
   assert.equal(routed.length, 40);
+  assert.equal(JSON.stringify(routed.find(({ targetId }) => targetId === "1")),
+    `{"type":"udp","targetId":"1","data":"${bytesToMessage(Uint8Array.of(1, 255)).data}"}`,
+    "the production sender uses the native decoder field order");
   assert.deepEqual(routed.map(({ targetId, data }) => [targetId, data]).sort(
     ([left], [right]) => Number(left) - Number(right)),
     aliases.map((_, index) => [

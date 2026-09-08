@@ -103,7 +103,7 @@ function Invoke-HeartbeatScenario {
     }
   }
 
-  if ($name -eq 'heartbeat-map-content-failure-preserves-target') {
+  if ($name -eq 'heartbeat-content-check-execution-failure-preserves-target') {
     $old = New-TestRoom 'room.q2.map-scenario.1' '1' ([string]$payload.mapBefore)
     $changed = New-TestRoom $old.room '1' ([string]$payload.mapAfter)
     $oldConfig = New-Q2DzRoomConfig -Room $old -LookupPayload (New-TestLookup @($old)) -RtcPayload @(New-TestRtc)
@@ -114,7 +114,7 @@ function Invoke-HeartbeatScenario {
       Get-Q2DzTargetPlan -Targets $current -Rows @($changed) -MakeConfig {
         param($row)
         return New-Q2DzRoomConfig -Room $row -LookupPayload (New-TestLookup @($row)) -RtcPayload @(New-TestRtc)
-      } -MapAvailable { param($row) return $false } | Out-Null
+      } -MapAvailable { param($row) throw 'content checker execution failed' } | Out-Null
     } catch { $failed = $_.Exception.Message -match 'content' }
     return [pscustomobject]@{
       contentFailure = if ($failed -and $current[$old.room].Config -eq $oldConfig) { 'preserve' } else { 'changed' }
@@ -270,6 +270,16 @@ $mixedPlan = Get-Q2DzTargetPlan -Targets $emptyTargets -Rows $mixedRows -MakeCon
 Assert-Equal 40 $mixedPlan.Targets.Count 'mixed 20 q2 and 20 q2ded retains every target'
 Assert-Equal (($mixedRows.room | Sort-Object) -join ',') ((Sort-Q2DzStrings @($mixedPlan.Targets.Keys)) -join ',') 'target map is stable by room id'
 
+$mixedMissing = New-TestRoom -RoomId 'room.q2.missing.1' -Owner '99' -Map 'missing'
+$mixedValid = New-TestRoom -RoomId 'room.q2.valid.1' -Owner '98'
+$mixedIsolated = Get-Q2DzTargetPlan -Targets (New-Q2DzTargetMap) -Rows @($mixedMissing,$mixedValid) -MakeConfig {
+  param($row)
+  return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+} -MapAvailable { param($row) return ([string]$row.createSettings.map -ne 'missing') }
+Assert-Equal 1 $mixedIsolated.Targets.Count 'missing map skips only the new room'
+Assert-True $mixedIsolated.Targets.ContainsKey($mixedValid.room) 'valid room survives a missing new-room map'
+Assert-Equal 0 $mixedIsolated.Drops.Count 'missing new-room map emits no unrelated drop'
+
 $one = New-TestRoom -RoomId 'room.q2.keep.1'
 $oneConfig = '{"roomId":"room.q2.keep.1","alias":"q2.1","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"q2dm1","game":"3zb2"}'
 $current = New-Q2DzTargetMap
@@ -296,17 +306,36 @@ Assert-True $fullPlan.Targets.ContainsKey($fullExisting.room) 'already-ready ful
 Assert-True (-not $fullPlan.Targets.ContainsKey($fullNew.room)) 'new full room is not added'
 
 $mapChanged = New-TestRoom -RoomId $one.room -Map 'missing'
+$mapSibling = New-TestRoom -RoomId 'room.q2.keep.2' -Owner '2'
 $mapCurrent = New-Q2DzTargetMap
 $mapCurrent[$one.room] = New-Q2DzTarget $one.room $oneConfig 0 'q2dm1'
-$mapFailed = $false
-try {
-  Get-Q2DzTargetPlan -Targets $mapCurrent -Rows @($mapChanged) -MakeConfig {
-    param($row)
-    return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
-  } -MapAvailable { param($row) return $false } | Out-Null
-} catch { $mapFailed = $_.Exception.Message -match 'content' }
-Assert-True $mapFailed 'map content failure preserves prior state'
-Assert-Equal $oneConfig $mapCurrent[$one.room].Config 'map content failure does not mutate old target'
+$mapMakeConfig = {
+  param($row)
+  return ('{"roomId":"' + $row.room + '","alias":"' + (Get-Q2DzRoomAlias $row) + '","ordered":false,"iceServers":[{"urls":["stun:example.invalid"]}],"map":"' + $row.createSettings.map + '","game":"3zb2"}')
+}
+$mapPlan = Get-Q2DzTargetPlan -Targets $mapCurrent -Rows @($mapChanged,$mapSibling) -MakeConfig $mapMakeConfig `
+  -MapAvailable { param($row) return ([string]$row.createSettings.map -ne 'missing') }
+Assert-True (-not $mapPlan.Targets.ContainsKey($one.room)) 'retained target with missing map is removed in isolation'
+Assert-True ($mapPlan.Drops -ccontains $one.room) 'retained target with missing map emits an explicit drop'
+Assert-True $mapPlan.Targets.ContainsKey($mapSibling.room) 'sibling target survives retained map failure'
+$mapRecovered = Get-Q2DzTargetPlan -Targets $mapPlan.Targets -Rows @($mapChanged,$mapSibling) -MakeConfig $mapMakeConfig `
+  -MapAvailable { param($row) return $true }
+Assert-True $mapRecovered.Targets.ContainsKey($mapChanged.room) 'room returns when its map becomes available'
+Assert-Equal 0 $mapRecovered.Drops.Count 'returning room does not drop a sibling'
+
+$iceRoom = New-TestRoom -RoomId 'room.q2.ice-rotation.1' -Owner '77'
+$oldIce = @([pscustomobject]@{ urls = @('stun:old.example.invalid') })
+$newIce = @([pscustomobject]@{ urls = @('stun:new.example.invalid') })
+$oldIceConfig = New-Q2DzRoomConfig -Room $iceRoom -LookupPayload (New-TestLookup @($iceRoom)) -RtcPayload @(New-TestRtc) -IceServers $oldIce
+$iceCurrent = New-Q2DzTargetMap
+$iceCurrent[$iceRoom.room] = New-Q2DzTarget $iceRoom.room $oldIceConfig 0 $iceRoom.createSettings.map
+$icePlan = Get-Q2DzTargetPlan -Targets $iceCurrent -Rows @($iceRoom) -MakeConfig {
+  param($row)
+  return New-Q2DzRoomConfig -Room $row -LookupPayload (New-TestLookup @($row)) -RtcPayload @(New-TestRtc) -IceServers $newIce
+}
+Assert-Equal 0 $icePlan.Drops.Count 'ICE-only rotation does not recreate a room'
+Assert-True ($icePlan.Targets[$iceRoom.room].Config -ne $oldIceConfig) 'ICE-only rotation refreshes the stored config'
+Assert-Equal 'stun:new.example.invalid' ((($icePlan.Targets[$iceRoom.room].Config | ConvertFrom-Json).iceServers[0].urls[0])) 'ICE-only rotation keeps the fresh ICE config'
 
 $duplicateRoom = New-TestRoom -RoomId 'room.q2.duplicate.1' -Owner '1'
 $duplicateRoomAgain = New-TestRoom -RoomId 'room.q2.duplicate.1' -Owner '2'
@@ -340,6 +369,56 @@ $emptyPlan = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\
   -ContentCheckPath 'q2dz-content-check.exe' -FetchJson $emptyFetch -RunContentCheck { param($path,$map,$root) return $true }
 Assert-Equal 0 $emptyPlan.Targets.Count 'empty PSCustomObject catalog is accepted'
 Assert-Equal 1 $emptyPlan.IceServers.Count 'empty catalog still validates global RTC'
+
+function Invoke-Q2DzTestContentChecker {
+  $global:LASTEXITCODE = [int]$global:Q2DzTestContentCheckExitCode
+}
+$checkerRoom = New-TestRoom -RoomId 'room.q2.checker.1'
+$checkerRows = @($checkerRoom)
+$checkerLookup = New-TestLookup $checkerRows
+$checkerFetch = {
+  param($endpoint)
+  switch ($endpoint) {
+    $Q2DZ_ROOM_ENDPOINT { return [pscustomobject]@{ rooms = $checkerRows } }
+    $Q2DZ_LOOKUP_ENDPOINT { return $checkerLookup }
+    $Q2DZ_RTC_ENDPOINT { return (New-TestRtc) }
+    default { throw "unexpected endpoint $endpoint" }
+  }
+}
+$lastExitCodeVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$hadLastExitCode = $null -ne $lastExitCodeVariable
+$previousLastExitCode = if ($hadLastExitCode) { $lastExitCodeVariable.Value } else { $null }
+try {
+  $global:Q2DzTestContentCheckExitCode = 0
+  $checkerReady = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+    -ContentCheckPath 'Invoke-Q2DzTestContentChecker' -FetchJson $checkerFetch
+  Assert-Equal 1 $checkerReady.Targets.Count 'content checker exit 0 keeps the room'
+  $global:Q2DzTestContentCheckExitCode = 3
+  $checkerMissing = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+    -ContentCheckPath 'Invoke-Q2DzTestContentChecker' -FetchJson $checkerFetch
+  Assert-Equal 0 $checkerMissing.Targets.Count 'content checker exit 3 skips the room'
+  $global:Q2DzTestContentCheckExitCode = 17
+  Assert-Throws {
+    Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+      -ContentCheckPath 'Invoke-Q2DzTestContentChecker' -FetchJson $checkerFetch | Out-Null
+  } 'unexpected content checker exit remains an execution error'
+  $missingCheckerMessage = $null
+  try {
+    Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+      -ContentCheckPath 'q2dz-missing-content-check-for-test.exe' -FetchJson $checkerFetch | Out-Null
+  } catch {
+    $missingCheckerMessage = $_.Exception.Message
+  }
+  Assert-Equal 'content checker execution failed' $missingCheckerMessage 'missing content checker is normalized'
+}
+finally {
+  if ($hadLastExitCode) {
+    Set-Variable -Name LASTEXITCODE -Scope Global -Value $previousLastExitCode
+  } else {
+    Remove-Variable -Scope Global -Name LASTEXITCODE -ErrorAction SilentlyContinue
+  }
+  Remove-Variable -Scope Global -Name Q2DzTestContentCheckExitCode -ErrorAction SilentlyContinue
+}
 
 $launcherText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\q2dz-launch.ps1') -Raw
 Assert-True ($launcherText.Contains('Q2DZ/ROOMS/2 ICE')) 'launcher emits ROOMS/2 ICE'

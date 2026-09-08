@@ -209,7 +209,7 @@ class LauncherTests(unittest.TestCase):
                 "missesBeforeDrop": 2 if not second_miss.targets and len(second_miss.drops) == len(plan.targets) else 0,
             }
 
-        if name == "heartbeat-map-content-failure-preserves-target":
+        if name == "heartbeat-content-check-execution-failure-preserves-target":
             old = room("room.q2.map-scenario.1", "1", map_name=payload["mapBefore"])
             changed = room(old["room"], "1", map_name=payload["mapAfter"])
             old_config = launch.make_room_config(old, lookup_for([old]), rtc_rows())
@@ -218,6 +218,9 @@ class LauncherTests(unittest.TestCase):
                     old["room"], launch._config_text(old_config), 0, payload["mapBefore"]
                 )
             }
+            def content_check_execution_failure(_row):
+                raise launch.LaunchError("content checker execution failed")
+
             writer = mock.Mock()
             result = launch.poll_once(
                 current,
@@ -225,7 +228,7 @@ class LauncherTests(unittest.TestCase):
                     current,
                     [changed],
                     lambda row: launch.make_room_config(row, lookup_for([row]), rtc_rows()),
-                    map_available=lambda _row: False,
+                    map_available=content_check_execution_failure,
                 ),
                 writer,
             )
@@ -389,7 +392,7 @@ class LauncherTests(unittest.TestCase):
             {
                 "heartbeat-mixed-20-q2-20-q2ded",
                 "heartbeat-retains-all-40",
-                "heartbeat-map-content-failure-preserves-target",
+                "heartbeat-content-check-execution-failure-preserves-target",
                 "heartbeat-retains-full-existing-room",
                 "heartbeat-invalid-global-rtc",
                 "heartbeat-duplicate-room-id",
