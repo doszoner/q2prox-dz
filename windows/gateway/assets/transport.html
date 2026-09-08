@@ -364,7 +364,7 @@ function pump() {
           cadence.probeAck();
         } else {
           cadence.dcToNative(datagram.length);
-          post({ ...bytesToMessage(datagram), targetId });
+          post({ type: "udp", targetId, data: bytesToMessage(datagram).data });
         }
       },
       receiveDrop,

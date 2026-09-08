@@ -99,7 +99,20 @@ void protocol_tests() {
     CHECK(!q2dz::parse_child_event("Q2DZ/1 FATAL credential=leak").event);
     CHECK(!q2dz::parse_child_event("Q2DZ/1 FATAL stage=gateway").event);
     CHECK(q2dz::parse_child_event("Q2DZ/1 FATAL stage=gateway code=connect_failed").event);
+    CHECK(!q2dz::parse_child_event("Q2DZ/1 FATAL id=42 stage=gateway code=connect_failed").event);
+    CHECK(!q2dz::parse_child_event("Q2DZ/1 FATAL stage=gateway code=credential_leak").event);
     CHECK(!q2dz::parse_child_event("Q2DZ/1 FATAL stage=ice stage=two").event);
+    const auto hub_fatal = q2dz::parse_child_event("Q2DZ/HUB/2 FATAL stage=gateway code=connect_failed");
+    CHECK(hub_fatal.event && hub_fatal.event->type == q2dz::ChildEventType::fatal);
+    CHECK(hub_fatal.event && hub_fatal.event->fields.size() == 2U);
+    CHECK(!q2dz::parse_child_event("Q2DZ/HUB/2 FATAL stage=gateway").event);
+    CHECK(!q2dz::parse_child_event("Q2DZ/HUB/2 FATAL id=42 stage=gateway code=connect_failed").event);
+    CHECK(!q2dz::parse_child_event("Q2DZ/HUB/2 FATAL stage=gateway code=credential_leak").event);
+    CHECK(q2dz::format_child_event(q2dz::ChildEventType::fatal,
+                                   {{"stage", "gateway"}, {"code", "connect_failed"}}) ==
+          "Q2DZ/HUB/2 FATAL stage=gateway code=connect_failed");
+    CHECK(q2dz::format_child_event(q2dz::ChildEventType::fatal,
+                                   {{"stage", "gateway"}, {"code", "connect_failed"}, {"id", "42"}}).empty());
     auto closed=q2dz::parse_child_event("Q2DZ/1 ROOM_CLOSED reason=probe%20timeout");
     CHECK(closed.event && closed.event->fields.at("reason")=="probe timeout");
     const std::map<std::string, std::string, std::less<>> ready_fields = {

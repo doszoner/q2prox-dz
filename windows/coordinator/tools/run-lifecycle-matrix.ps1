@@ -270,7 +270,7 @@ function Assert-NoOrphans([string]$dir) {
   }
 }
 
-function Stop-Case($case, [int]$expected = 0) {
+function Stop-Case($case, [int]$expected = 0, [string]$stderrPattern = '') {
   try { $case.Process.StandardInput.Close() } catch { }
   if (-not $case.Process.WaitForExit(10000)) {
     Stop-Process -Id $case.Process.Id -Force -ErrorAction SilentlyContinue
@@ -280,6 +280,9 @@ function Stop-Case($case, [int]$expected = 0) {
   $stderr = $case.Process.StandardError.ReadToEnd()
   if ($case.Process.ExitCode -ne $expected) {
     throw "$($case.Name) returned $($case.Process.ExitCode), expected $expected`n$stdout`n$stderr"
+  }
+  if ($stderrPattern -and $stderr -notmatch $stderrPattern) {
+    throw "$($case.Name) stderr did not contain expected diagnostic: $stderrPattern`n$stderr"
   }
   Assert-NoOrphans $case.Dir
   $credentialFiles = @(Get-ChildItem -LiteralPath $case.Dir -Recurse -File -ErrorAction SilentlyContinue |
@@ -517,6 +520,20 @@ try {
     Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) "Q2 after $failureMode"
     Stop-Case $case
   }
+
+  # A global FATAL has no target id: preserve its diagnostic and restart the
+  # shared gateway without converting it into a per-target FAILED event.
+  $case = Start-Case 'global-fatal' 'fatal-global' 'normal'
+  Wait-Q2Initial $case.Dir | Out-Null
+  $source = Wait-SourceUrl $case.Dir
+  Send-Ice $case.Process
+  $firstGateway = Wait-GatewayPid $case.Dir
+  Send-Put $case.Process 'room-a'
+  $secondGateway = Wait-GatewayPidChange $case.Dir $firstGateway
+  if (-not (Wait-SourceCount $source 0)) { throw 'global FATAL did not clear the shared source' }
+  Assert-ProcessAlive $secondGateway 'shared gateway after global FATAL'
+  Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'Q2 after global FATAL'
+  Stop-Case $case -stderrPattern 'q2dz-session: gateway fatal stage=gateway code=invalid_web_message'
 
   # Old events after DROP+PUT cannot affect the replacement target.
   $case = Start-Case 'stale-target' 'stale-after-drop' 'normal'

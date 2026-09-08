@@ -155,7 +155,8 @@ bool allowed_hub_event_field(ChildEventType type, std::string_view name) noexcep
     if (type == ChildEventType::transport_ready) return name == "id" || name == "udp" || name == "peer";
     if (type == ChildEventType::room_closed) return name == "id" || name == "reason";
     if (type == ChildEventType::heartbeat) return name == "state" || name == "targets" || name == "ready";
-    if (type == ChildEventType::fatal || type == ChildEventType::target_failed) return name == "id" || name == "stage" || name == "code";
+    if (type == ChildEventType::fatal) return name == "stage" || name == "code";
+    if (type == ChildEventType::target_failed) return name == "id" || name == "stage" || name == "code";
     return false;
 }
 
@@ -450,7 +451,13 @@ ParseResult parse_v1_event(std::string_view line) {
         const auto it = e.fields.find("udp");
         if (it == e.fields.end() || !parse_loopback_endpoint(it->second)) return {{}, "TRANSPORT_READY requires valid loopback udp field"};
     } else if (e.type == ChildEventType::fatal) {
-        if (!e.fields.contains("stage") || !e.fields.contains("code")) return {{}, "FATAL requires stage and code fields"};
+        if (e.fields.size() != 2U || !e.fields.contains("stage") || !e.fields.contains("code") ||
+            std::any_of(e.fields.begin(), e.fields.end(), [](const auto& field) {
+                return !safe_event_field_value(field.second) || is_room_alias_value(field.second) ||
+                       field_name_is_forbidden(field.second);
+            })) {
+            return {{}, "FATAL requires safe stage and code fields"};
+        }
     }
     return {std::move(e), {}};
 }
@@ -467,6 +474,7 @@ ParseResult parse_v2_event(std::string_view line) {
     if (type_text == "READY") e.type = ChildEventType::transport_ready;
     else if (type_text == "CLOSED") e.type = ChildEventType::room_closed;
     else if (type_text == "FAILED") e.type = ChildEventType::target_failed;
+    else if (type_text == "FATAL") e.type = ChildEventType::fatal;
     else if (type_text == "HEARTBEAT") e.type = ChildEventType::heartbeat;
     else return {{}, "unknown HUB/2 event"};
     if (sp != std::string_view::npos) line.remove_prefix(sp + 1U); else line = {};
@@ -486,7 +494,7 @@ ParseResult parse_v2_event(std::string_view line) {
         if (next == std::string_view::npos) break;
         line.remove_prefix(next + 1U);
     }
-    if (e.type != ChildEventType::heartbeat) {
+    if (e.type != ChildEventType::heartbeat && e.type != ChildEventType::fatal) {
         const auto id = e.fields.find("id");
         std::uint64_t parsed = 0;
         if (id == e.fields.end() || !parse_u64(id->second, parsed, false)) return {{}, "HUB/2 event requires nonzero id"};
@@ -500,6 +508,8 @@ ParseResult parse_v2_event(std::string_view line) {
         }
     } else if (e.type == ChildEventType::room_closed) {
         if (!e.fields.contains("reason")) return {{}, "CLOSED requires reason"};
+    } else if (e.type == ChildEventType::fatal) {
+        if (!e.fields.contains("stage") || !e.fields.contains("code")) return {{}, "FATAL requires stage and code"};
     } else if (e.type == ChildEventType::target_failed) {
         if (!e.fields.contains("stage") || !e.fields.contains("code")) return {{}, "FAILED requires stage and code"};
     } else {
@@ -524,7 +534,7 @@ void append_hub_event_fields(std::string& out,
     switch (type) {
         case ChildEventType::transport_ready: order = {"id", "udp", "peer", {}}; count = 3; break;
         case ChildEventType::room_closed: order = {"id", "reason", {}, {}}; count = 2; break;
-        case ChildEventType::fatal: order = {"id", "stage", "code", {}}; count = 3; break;
+        case ChildEventType::fatal: order = {"stage", "code", {}, {}}; count = 2; break;
         case ChildEventType::target_failed: order = {"id", "stage", "code", {}}; count = 3; break;
         case ChildEventType::heartbeat: order = {"state", "targets", "ready", {}}; count = 3; break;
     }
@@ -703,13 +713,12 @@ ParseResult ChildEventParser::parse(std::string_view line) {
 
 std::string format_child_event(ChildEventType type,
                                const std::map<std::string, std::string, std::less<>>& fields) {
-    if (type == ChildEventType::fatal) return {};
     if (!valid_hub_event_fields(type, fields)) return {};
     std::string out = "Q2DZ/HUB/2 ";
     switch (type) {
         case ChildEventType::transport_ready: out += "READY"; break;
         case ChildEventType::room_closed: out += "CLOSED"; break;
-        case ChildEventType::fatal: out += "FAILED"; break;
+        case ChildEventType::fatal: out += "FATAL"; break;
         case ChildEventType::target_failed: out += "FAILED"; break;
         case ChildEventType::heartbeat: out += "HEARTBEAT"; break;
     }

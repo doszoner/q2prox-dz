@@ -70,11 +70,16 @@ Windows использует WebView2, Linux — нативный WebRTC-NET tra
 
 ## Состояние
 
-`1.0.0-rc15` заменяет фиксированные слоты общим многокомнатным gateway. Точный
+В Windows-кандидате `1.0.0-rc16` исправлены причины пустого `Custom`:
+проверка карт, ротация ICE и обмен gateway. Portable/setup ZIP собраны
+и прошли Windows build/package gates; gameplay у пользователя ещё не проверен.
+Linux-поставка остаётся `1.0.0-rc15`.
+Используется общий многокомнатный gateway. Точный
 контракт Q2PRO-X для локального HTTP-источника и последовательности
 `status`/`connect` зафиксирован в [отчёте проверки](docs/verification/2026-08-29-q2pro-x-live-custom-source.md).
 Результаты сборки, проверки готовых архивов и оставшиеся live-gates приведены
-отдельными строками в [rc15 verification](docs/verification/1.0.0-rc15.md).
+отдельными строками в [Windows rc16 verification](docs/verification/1.0.0-rc16.md)
+и [Linux rc15 verification](docs/verification/1.0.0-rc15.md).
 
 Windows RC artifacts не подписаны Authenticode. Для каждого публикуемого
 архива нужен соседний SHA-256; до широкого распространения должны быть

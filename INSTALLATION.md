@@ -33,7 +33,10 @@ Launcher опрашивает каталог примерно раз в 15 се�
 
 ## Windows setup
 
-1. Скачайте `q2prox-dz-1.0.0-rc15-windows-x64-setup.zip` и полностью
+Rc16-архивы собраны и проверены в Windows. Хеши и оставшиеся live-gates:
+[rc16 verification](docs/verification/1.0.0-rc16.md).
+
+1. Скачайте `q2prox-dz-1.0.0-rc16-windows-x64-setup.zip` и полностью
    распакуйте его.
 2. Закройте уже запущенный Q2PRO-X и запустите `Install.cmd`.
 3. `Install.cmd` сам откроет первый запуск. Укажите в нём установленный
@@ -48,7 +51,7 @@ Q2PRO-X - Dos.Zone**.
 
 ## Windows portable
 
-1. Скачайте `q2prox-dz-1.0.0-rc15-windows-x64-portable.zip` и распакуйте его в
+1. Скачайте `q2prox-dz-1.0.0-rc16-windows-x64-portable.zip` и распакуйте его в
    отдельную папку.
 2. Закройте уже запущенный Q2PRO-X и запустите `Run.cmd`.
 3. При первом запуске укажите `Q2PRO-X.exe`.

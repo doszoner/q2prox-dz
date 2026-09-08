@@ -54,6 +54,15 @@ Q2DZ/1 ROOM_CLOSED reason=<percent-encoded-reason>
 Q2DZ/1 FATAL stage=<stage> code=<stable-code>
 ```
 
+The shared multi-room mode uses the equivalent HUB/2 form for its events:
+
+```text
+Q2DZ/HUB/2 FATAL stage=<stage> code=<stable-code>
+```
+
+`FATAL` is a global gateway failure and therefore has no `id`; only a
+per-target `FAILED` event carries `id`.
+
 Event keys and values must never contain ICE, TURN credentials, token, secret, username, SDP or candidates. Values use percent encoding for spaces and non-token characters.
 
 `TRANSPORT_READY` is emitted exactly once and only after all of the following are true:

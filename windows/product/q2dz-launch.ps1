@@ -214,8 +214,15 @@ function Get-Q2DzLiveTargets {
   $check = if ($RunContentCheck) { $RunContentCheck } else {
     {
       param($Path, $Map, $Root)
-      & $Path --root $Root --game $Q2DZ_GAME --map $Map | Out-Null
-      return ($LASTEXITCODE -eq 0)
+      try {
+        & $Path --root $Root --game $Q2DZ_GAME --map $Map | Out-Null
+      } catch {
+        throw 'content checker execution failed'
+      }
+      $exitCode = [int]$LASTEXITCODE
+      if ($exitCode -eq 0) { return $true }
+      if ($exitCode -eq 3) { return $false }
+      throw 'content checker execution failed'
     }
   }
   $makeConfig = {
