@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import gzip
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -448,26 +450,71 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn(first.room_id, two_misses.targets)
         self.assertEqual(two_misses.drops, (first.room_id,))
 
-    def test_map_content_failure_preserves_prior_working_target_and_emits_nothing(self):
+    def test_map_only_refresh_updates_q2_and_q2ded_without_drop(self):
+        for selected in (room("room.q2.map.1"), dedicated_room("room.q2ded.map.1")):
+            with self.subTest(prefix=selected["createSettings"]["prefix"]):
+                old_config = launch.make_room_config(selected, lookup_for([selected]), rtc_rows())
+                current = {
+                    selected["room"]: launch.HubTarget(
+                        selected["room"], launch._config_text(old_config), map_name="q2dm1"
+                    )
+                }
+                changed = dict(selected, createSettings=dict(selected["createSettings"], map="q2dm2"))
+                checked = []
+                plan = launch.reconcile_targets(
+                    current, [changed],
+                    lambda row: launch.make_room_config(row, lookup_for([row]), rtc_rows()),
+                    map_available=lambda row: checked.append(row["room"]) or True,
+                )
+                self.assertEqual(checked, [selected["room"]])
+                self.assertEqual(plan.drops, ())
+                self.assertEqual(plan.targets[selected["room"]].map_name, "q2dm2")
+                self.assertEqual(json.loads(plan.targets[selected["room"]].config)["map"], "q2dm2")
+
+    def test_missing_existing_map_drops_only_that_room_and_recovers(self):
+        changed = room("room.q2.map.1", map_name="missing")
+        sibling = room("room.q2.keep.2", owner="2")
         old = launch.HubTarget(
-            "room.q2.map.1",
-            json.dumps({"roomId": "room.q2.map.1", "map": "q2dm1"}, separators=(",", ":")),
+            changed["room"],
+            launch._config_text({"roomId": changed["room"], "map": "q2dm1"}),
             map_name="q2dm1",
         )
-        changed = room(old.room_id, map_name="missing")
-        writer = mock.Mock()
-        result = launch.poll_once(
-            {old.room_id: old},
-            lambda: launch.reconcile_targets(
-                {old.room_id: old}, [changed],
-                lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
-                map_available=lambda _row: False,
-            ),
-            writer,
+        checked = []
+        plan = launch.reconcile_targets(
+            {old.room_id: old}, [changed, sibling],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+            map_available=lambda row: checked.append(row["room"]) or row["createSettings"]["map"] != "missing",
         )
-        self.assertIn(old.room_id, result)
-        writer.assert_not_called()
-        self.assertEqual(result[old.room_id].config, old.config)
+        self.assertEqual(checked.count(old.room_id), 1)
+        self.assertNotIn(old.room_id, plan.targets)
+        self.assertEqual(plan.drops, (old.room_id,))
+        self.assertIn(sibling["room"], plan.targets)
+        recovered = launch.reconcile_targets(
+            plan.targets, [changed, sibling],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+        )
+        self.assertIn(old.room_id, recovered.targets)
+        self.assertEqual(recovered.drops, ())
+
+    def test_missing_new_map_skips_only_that_room_and_recovers(self):
+        missing = room("room.q2.missing.1", map_name="missing")
+        sibling = room("room.q2.valid.2", owner="2")
+        checked = []
+        plan = launch.reconcile_targets(
+            {}, [missing, sibling],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+            map_available=lambda row: checked.append(row["room"]) or row["createSettings"]["map"] != "missing",
+        )
+        self.assertEqual(checked.count(missing["room"]), 1)
+        self.assertNotIn(missing["room"], plan.targets)
+        self.assertIn(sibling["room"], plan.targets)
+        self.assertEqual(plan.drops, ())
+        recovered = launch.reconcile_targets(
+            plan.targets, [missing, sibling],
+            lambda row: {"roomId": row["room"], "map": row["createSettings"]["map"]},
+        )
+        self.assertIn(missing["room"], recovered.targets)
+        self.assertEqual(recovered.drops, ())
 
     def test_full_existing_room_is_retained_but_new_full_room_is_not_added(self):
         existing = room("room.q2.existing.1", "1")
@@ -598,6 +645,94 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(endpoints, [launch.ROOM_ENDPOINT, launch.LOOKUP_ENDPOINT, launch.RTC_ENDPOINT])
         self.assertEqual(len(plan.targets), 1)
         self.assertEqual(plan.ice_servers, rtc_rows()[0]["iceservers"])
+
+    def test_content_checker_exit_contract_and_execution_failure(self):
+        for code, expected in ((0, True), (3, False)):
+            with self.subTest(code=code):
+                self.assertIs(
+                    launch.content_ready(
+                        "/games/Q2PRO-X.exe", "q2dm1", content_checker="checker",
+                        runner=lambda *_args, code=code, **_kwargs: subprocess.CompletedProcess([], code),
+                    ),
+                    expected,
+                )
+        for code in (64, 70):
+            with self.subTest(code=code), self.assertRaisesRegex(
+                launch.LaunchError, "content checker execution failed"
+            ):
+                launch.content_ready(
+                    "/games/Q2PRO-X.exe", "q2dm1", content_checker="checker",
+                    runner=lambda *_args, code=code, **_kwargs: subprocess.CompletedProcess([], code),
+                )
+        with self.assertRaisesRegex(launch.LaunchError, "content checker execution failed"):
+            launch.content_ready(
+                "/games/Q2PRO-X.exe", "q2dm1", content_checker="checker",
+                runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("secret-marker")),
+            )
+
+    def test_refresh_diagnostics_cover_success_partial_empty_and_failures(self):
+        rows = [room("room.q2.log.1", "1"), room("room.q2.log.2", "2")]
+
+        def run_refresh(catalog_rows, aliases, current=None, runner=None):
+            replies = {
+                launch.ROOM_ENDPOINT: catalog(catalog_rows),
+                launch.LOOKUP_ENDPOINT: {"aliases": aliases},
+                launch.RTC_ENDPOINT: rtc_rows(),
+            }
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                plan = launch.refresh_targets(
+                    current or {}, "/games/Q2PRO-X.exe", fetch=lambda endpoint: replies[endpoint],
+                    content_checker="checker",
+                    runner=runner or (lambda *args, **kwargs: subprocess.CompletedProcess(args, 0)),
+                )
+            return plan, output.getvalue()
+
+        for catalog_rows, aliases, counts in (
+            (rows, lookup_for(rows)["aliases"], "previous=0 ready=2 registered=2 targets=2 drops=0"),
+            ([], [], "previous=0 ready=0 registered=0 targets=0 drops=0"),
+            (rows, [launch._room_alias(rows[0])], "previous=0 ready=2 registered=1 targets=1 drops=0"),
+        ):
+            with self.subTest(counts=counts):
+                _plan, log = run_refresh(catalog_rows, aliases)
+                self.assertRegex(
+                    log,
+                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z CATALOG_REFRESH "
+                    rf"result=ok stage=plan elapsed_ms=\d+ {counts}\n$",
+                )
+
+        current = {"room.q2.old.1": launch.HubTarget("room.q2.old.1", '{"roomId":"room.q2.old.1"}')}
+        for failure, stage in (("lookup", "lookup"), ("checker", "plan")):
+            with self.subTest(failure=failure):
+                output = io.StringIO()
+
+                def fetch(endpoint):
+                    if failure == "lookup" and endpoint == launch.LOOKUP_ENDPOINT:
+                        raise launch.LaunchError("secret-marker")
+                    return {
+                        launch.ROOM_ENDPOINT: catalog(rows),
+                        launch.LOOKUP_ENDPOINT: lookup_for(rows),
+                        launch.RTC_ENDPOINT: rtc_rows(),
+                    }[endpoint]
+
+                runner = (
+                    (lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("secret-marker")))
+                    if failure == "checker" else
+                    (lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+                )
+                with self.assertRaises(launch.LaunchError), contextlib.redirect_stderr(output):
+                    launch.refresh_targets(
+                        current, "/games/Q2PRO-X.exe", fetch=fetch,
+                        content_checker="checker", runner=runner,
+                    )
+                log = output.getvalue()
+                self.assertNotIn("secret-marker", log)
+                self.assertRegex(
+                    log,
+                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z CATALOG_REFRESH "
+                    rf"result=error stage={stage} elapsed_ms=\d+ previous=1 ready=2 "
+                    rf"registered={'0' if failure == 'lookup' else '2'} targets=1 drops=0\n$",
+                )
 
     def test_protocol_commands_are_utf8_and_keep_credentials_out_of_argv(self):
         config = {

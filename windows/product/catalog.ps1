@@ -19,6 +19,11 @@ $Q2DZ_MAX_TARGETS = 256
 $Q2DZ_MAX_ICE_SNAPSHOT_BYTES = 65536
 $Q2DZ_SIGNALING_URL = 'wss://net.js-dos.com:444'
 
+function Write-Q2DzCatalogEvent {
+  param([Parameter(Mandatory = $true)][string]$Message)
+  [Console]::Error.WriteLine(('{0} {1}' -f [DateTime]::UtcNow.ToString('o'), $Message))
+}
+
 function Test-Q2DzEndpoint {
   param([Parameter(Mandatory = $true)][string]$Uri)
   if (@($Q2DZ_ROOM_ENDPOINT,$Q2DZ_LOOKUP_ENDPOINT,$Q2DZ_RTC_ENDPOINT) -cnotcontains $Uri) {
@@ -369,8 +374,10 @@ function Test-Q2DzRoomConfigChanged {
     if ($null -eq $value -or $value -is [array] -or $null -eq $value.PSObject) {
       throw 'room configuration must be a JSON object'
     }
-    if ($value.PSObject.Properties.Name -contains 'iceServers') {
-      [void]$value.PSObject.Properties.Remove('iceServers')
+    foreach ($property in @('iceServers','map')) {
+      if ($value.PSObject.Properties.Name -contains $property) {
+        [void]$value.PSObject.Properties.Remove($property)
+      }
     }
   }
   $previousJson = ConvertTo-Json -InputObject (ConvertTo-Q2DzCanonicalJsonValue $previousValue) -Depth 8 -Compress
@@ -506,6 +513,7 @@ function Get-Q2DzTargetPlan {
     $changed = Test-Q2DzRoomConfigChanged -Previous ([string]$target.Config) -Current $config
     $mapChanged = -not [string]::IsNullOrEmpty([string]$target.MapName) -and [string]$target.MapName -cne $map
     if ($mapChanged -and -not (& $MapAvailable $row)) {
+      Write-Q2DzCatalogEvent ('CATALOG_MAP result=missing room={0} map={1}' -f $roomId,$map)
       [void]$drops.Add([string]$roomId)
       continue
     }
@@ -515,8 +523,11 @@ function Get-Q2DzTargetPlan {
 
   foreach ($row in (Sort-Q2DzRoomRows $desired)) {
     $roomId = [string]$row.room
-    if ($updated.ContainsKey($roomId)) { continue }
-    if (-not (& $MapAvailable $row)) { continue }
+    if ($current.ContainsKey($roomId) -or $updated.ContainsKey($roomId)) { continue }
+    if (-not (& $MapAvailable $row)) {
+      Write-Q2DzCatalogEvent ('CATALOG_MAP result=missing room={0} map={1}' -f $roomId,[string]$row.createSettings.map)
+      continue
+    }
     if ($updated.Count -ge $Q2DZ_MAX_TARGETS) { continue }
     $values = @(& $MakeConfig $row)
     if ($values.Count -ne 1 -or $values[0] -isnot [string]) { throw 'room configuration must be one string' }

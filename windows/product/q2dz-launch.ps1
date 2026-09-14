@@ -200,43 +200,66 @@ function Get-Q2DzLiveTargets {
     [scriptblock]$FetchJson = { param($Endpoint) Get-Q2DzJson $Endpoint },
     [scriptblock]$RunContentCheck = $null
   )
-  $catalog = & $FetchJson $Q2DZ_ROOM_ENDPOINT
-  if (-not (Test-Q2DzRoomPayload $catalog) -and
-      -not (Test-Q2DzEmptyRoomCatalog $catalog)) {
-    try { Get-Q2DzReadyRooms $catalog | Out-Null } catch { throw }
-    throw 'room catalog has an invalid schema'
-  }
-  $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
-  $readyRows = @(Get-Q2DzReadyRooms $catalog)
-  $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
-  $rtcRows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
-  $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows)
-  $check = if ($RunContentCheck) { $RunContentCheck } else {
-    {
-      param($Path, $Map, $Root)
-      try {
-        & $Path --root $Root --game $Q2DZ_GAME --map $Map | Out-Null
-      } catch {
+  $timer = [Diagnostics.Stopwatch]::StartNew()
+  $result = 'error'
+  $stage = 'catalog'
+  $previousCount = $Targets.Count
+  $readyCount = 0
+  $registeredCount = 0
+  $targetCount = $previousCount
+  $dropCount = 0
+  try {
+    $catalog = & $FetchJson $Q2DZ_ROOM_ENDPOINT
+    if (-not (Test-Q2DzRoomPayload $catalog) -and
+        -not (Test-Q2DzEmptyRoomCatalog $catalog)) {
+      try { Get-Q2DzReadyRooms $catalog | Out-Null } catch { throw }
+      throw 'room catalog has an invalid schema'
+    }
+    $readyRows = @(Get-Q2DzReadyRooms $catalog)
+    $readyCount = $readyRows.Count
+    $stage = 'lookup'
+    $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
+    $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
+    $registeredCount = $registeredReady.Count
+    $stage = 'rtc'
+    $rtcRows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
+    $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows)
+    $check = if ($RunContentCheck) { $RunContentCheck } else {
+      {
+        param($Path, $Map, $Root)
+        try {
+          & $Path --root $Root --game $Q2DZ_GAME --map $Map | Out-Null
+        } catch {
+          throw 'content checker execution failed'
+        }
+        $exitCode = [int]$LASTEXITCODE
+        if ($exitCode -eq 0) { return $true }
+        if ($exitCode -eq 3) { return $false }
         throw 'content checker execution failed'
       }
-      $exitCode = [int]$LASTEXITCODE
-      if ($exitCode -eq 0) { return $true }
-      if ($exitCode -eq 3) { return $false }
-      throw 'content checker execution failed'
     }
+    $makeConfig = {
+      param($row)
+      New-Q2DzRoomConfig -Room $row -LookupPayload $lookup -RtcPayload $rtcRows -IceServers $iceServers
+    }
+    $mapAvailable = {
+      param($row)
+      $root = Split-Path -Parent $Q2Path
+      return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
+    }
+    $stage = 'plan'
+    $updated = Get-Q2DzTargetPlan -Targets $Targets -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable
+    $updated.IceServers = @($iceServers)
+    $targetCount = $updated.Targets.Count
+    $dropCount = $updated.Drops.Count
+    $result = 'ok'
+    return $updated
   }
-  $makeConfig = {
-    param($row)
-    New-Q2DzRoomConfig -Room $row -LookupPayload $lookup -RtcPayload $rtcRows -IceServers $iceServers
+  finally {
+    $timer.Stop()
+    Write-Q2DzCatalogEvent ('CATALOG_REFRESH result={0} stage={1} elapsed_ms={2} previous={3} ready={4} registered={5} targets={6} drops={7}' -f `
+      $result,$stage,$timer.ElapsedMilliseconds,$previousCount,$readyCount,$registeredCount,$targetCount,$dropCount)
   }
-  $mapAvailable = {
-    param($row)
-    $root = Split-Path -Parent $Q2Path
-    return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
-  }
-  $updated = Get-Q2DzTargetPlan -Targets $Targets -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable
-  $updated.IceServers = @($iceServers)
-  return $updated
 }
 
 function Invoke-Q2DzHub {

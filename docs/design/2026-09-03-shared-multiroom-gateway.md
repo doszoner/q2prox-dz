@@ -18,6 +18,9 @@ Linux/Windows gateway. Dos.Zone server менять не требуется.
 `PENDING`, пока evidence не записан в durable verification docs; он не
 доказывает handshake, map entry или gameplay. Gameplay здесь не объявляется.
 
+**Amendment 2026-09-14:** поведение обновления карты и диагностика refresh
+уточнены в [catalog map refresh design](../superpowers/specs/2026-09-14-catalog-map-refresh-design.md).
+
 ## Решение кратко
 
 В одном сеансе q2prox-dz запускаются:
@@ -354,8 +357,10 @@ thread. WebRTC-NET применяет список к общему context: со
 - новая цель -> `PUT`;
 - исчезнувшая два опроса подряд -> `DROP`;
 - неизменная работающая цель -> payload очищается без restart;
-- изменившиеся alias, map, game, ordered или общий transport contract ->
+- изменившиеся alias, game, ordered или общий transport contract ->
   `DROP` старой версии и `PUT` новой;
+- новая карта повторно проходит content check: доступная обновляет config без
+  `DROP`, отсутствующая удаляет только эту цель до следующего успешного опроса;
 - изменение только отображаемых полей -> transport не трогается.
 
 Невалидный общий ответ не считается пустым каталогом и не закрывает текущие

@@ -53,6 +53,11 @@ class LaunchError(RuntimeError):
     pass
 
 
+def catalog_event(message):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"{stamp} {message}", file=sys.stderr, flush=True)
+
+
 @dataclasses.dataclass
 class HubTarget:
     room_id: str
@@ -547,20 +552,28 @@ def reconcile_targets(targets, rows, make_config, map_available=lambda _row: Tru
         # ICE is refreshed separately; rotating TURN credentials must not drop a room.
         previous_config.pop("iceServers", None)
         fresh_config.pop("iceServers", None)
+        # Map changes are checked and published without recreating the UDP transport.
+        previous_config.pop("map", None)
+        fresh_config.pop("map", None)
         changed = fresh_config != previous_config
         map_changed = bool(target.map_name) and target.map_name != map_name
-        if changed and map_changed and not map_available(row):
-            raise LaunchError("map content check failed")
+        if map_changed and not map_available(row):
+            catalog_event(f"CATALOG_MAP result=missing room={room_id} map={map_name}")
+            drops.add(room_id)
+            continue
         updated[room_id] = HubTarget(room_id, config_text, 0, map_name)
         if changed:
             drops.add(room_id)
 
     for row in sorted(desired_rows, key=lambda value: value["room"]):
         room_id = row["room"]
-        if room_id in updated:
+        if room_id in current or room_id in updated:
             continue
         if not map_available(row):
-            raise LaunchError("map content check failed")
+            catalog_event(
+                f"CATALOG_MAP result=missing room={room_id} map={row['createSettings']['map']}"
+            )
+            continue
         if len(updated) >= MAX_HUB_TARGETS:
             continue
         config_text = _config_text(make_config(row))
@@ -758,11 +771,18 @@ def _installed_paths():
 def content_ready(q2_path, map_name, content_checker=None, runner=subprocess.run):
     paths = _installed_paths()
     checker = Path(content_checker or paths["content"])
-    result = runner(
-        [str(checker), "--q2-root", str(Path(q2_path).parent), "--game", GAME, "--map", map_name],
-        check=False,
-    )
-    return result.returncode == 0
+    try:
+        result = runner(
+            [str(checker), "--q2-root", str(Path(q2_path).parent), "--game", GAME, "--map", map_name],
+            check=False,
+        )
+    except OSError as exc:
+        raise LaunchError("content checker execution failed") from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 3:
+        return False
+    raise LaunchError("content checker execution failed")
 
 
 def wait_child(process, timeout=10.0):
@@ -815,29 +835,53 @@ def _room_catalog_is_empty(catalog):
 
 def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runner=subprocess.run):
     fetch = fetch or fetch_json
-    catalog = fetch(ROOM_ENDPOINT)
-    if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
-        try:
-            ready_rooms(catalog)
-        except LaunchError:
-            raise
-        raise LaunchError("room catalog has an invalid schema")
-    lookup = fetch(LOOKUP_ENDPOINT)
-    rows = registered_rooms(ready_rooms(catalog), lookup)
-    rtc_rows = fetch(RTC_ENDPOINT)
-    ice_servers = _ice_snapshot(rtc_rows)
+    started = time.monotonic()
+    result = "error"
+    stage = "catalog"
+    previous_count = len(targets)
+    ready_count = registered_count = 0
+    target_count = previous_count
+    drop_count = 0
+    try:
+        catalog = fetch(ROOM_ENDPOINT)
+        if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
+            try:
+                ready_rooms(catalog)
+            except LaunchError:
+                raise
+            raise LaunchError("room catalog has an invalid schema")
+        ready = ready_rooms(catalog)
+        ready_count = len(ready)
+        stage = "lookup"
+        lookup = fetch(LOOKUP_ENDPOINT)
+        rows = registered_rooms(ready, lookup)
+        registered_count = len(rows)
+        stage = "rtc"
+        rtc_rows = fetch(RTC_ENDPOINT)
+        ice_servers = _ice_snapshot(rtc_rows)
 
-    def make_config(row):
-        return make_room_config(row, lookup, rtc_rows, ice_servers)
+        def make_config(row):
+            return make_room_config(row, lookup, rtc_rows, ice_servers)
 
-    plan = reconcile_targets(
-        targets,
-        rows,
-        make_config,
-        lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
-    )
-    plan.ice_servers = ice_servers
-    return plan
+        stage = "plan"
+        plan = reconcile_targets(
+            targets,
+            rows,
+            make_config,
+            lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
+        )
+        plan.ice_servers = ice_servers
+        target_count = len(plan.targets)
+        drop_count = len(plan.drops)
+        result = "ok"
+        return plan
+    finally:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        catalog_event(
+            f"CATALOG_REFRESH result={result} stage={stage} elapsed_ms={elapsed_ms} "
+            f"previous={previous_count} ready={ready_count} registered={registered_count} "
+            f"targets={target_count} drops={drop_count}"
+        )
 
 
 def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
