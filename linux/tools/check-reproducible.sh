@@ -34,6 +34,7 @@ build_one() {
   SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" TZ=UTC LC_ALL=C \
   cmake -S "$src" -B "$build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=OFF \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DQ2DZ_WERROR=ON \
     -DQ2DZ_REPRODUCIBLE=ON \
