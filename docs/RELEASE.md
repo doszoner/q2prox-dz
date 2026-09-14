@@ -5,10 +5,10 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Windows-кандидат `1.0.0-rc16` получает PASS только из
-[`1.0.0-rc16`](verification/1.0.0-rc16.md), где должны быть зафиксированы
+rollback. Кандидат Linux/Windows `1.0.0-rc17` получает PASS только из
+[`1.0.0-rc17`](verification/1.0.0-rc17.md), где должны быть зафиксированы
 точные результаты компонентных, live и package gates.
-Linux-поставка остаётся `1.0.0-rc15`; rc16 выпускается только для Windows.
+Предыдущие архивы Linux rc15 и Windows rc16 сохраняются отдельно.
 
 Пользователю следует публиковать только canonical архивы и соседние
 `.sha256`:
@@ -26,7 +26,7 @@ python3 tools/build-test-bundle.py
 Он кладёт рядом с тремя поставками документы проверки и
 `tests/tools/controlled-room-set.py`, нужный для exact Q2PRO-X 40-source gate.
 Этот bundle не является отдельной пользовательской поставкой.
-Для Windows-only rc16 этот скрипт не применяется: Linux rc16 не собирался.
+Для исторической Windows-only rc16 этот скрипт не применялся: Linux rc16 не собирался.
 
 ## Публичная граница
 
@@ -45,7 +45,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc16
+  -OutputDir .\dist\windows-1.0.0-rc17
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
