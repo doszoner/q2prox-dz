@@ -238,6 +238,7 @@ class HubTarget:
     config: str
     misses: int = 0
     map_name: str = ""
+    invalid: int = 0
 
 
 @dataclasses.dataclass
@@ -245,6 +246,8 @@ class TargetPlan:
     targets: dict[str, HubTarget]
     ice_servers: list[dict]
     drops: tuple[str, ...] = ()
+    accepted: tuple[str, ...] = ()
+    registered: tuple[str, ...] = ()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -728,7 +731,7 @@ def _validate_rows(rows):
         seen_aliases.add(alias)
 
 
-def reconcile_targets(targets, rows, make_config, map_available=lambda _row: True):
+def reconcile_targets(targets, rows, make_config, map_available=lambda _row: True, rejected_ids=None):
     """Build one complete room-id snapshot without mutating the live state."""
     current = _copy_targets(targets)
     rows = list(rows)
@@ -747,8 +750,17 @@ def reconcile_targets(targets, rows, make_config, map_available=lambda _row: Tru
         target = current[room_id]
         row = by_id.get(room_id)
         if row is None:
-            if target.misses < 1:
-                updated[room_id] = dataclasses.replace(target, misses=target.misses + 1)
+            if rejected_ids is not None and room_id in rejected_ids:
+                # Row present but rejected this refresh: retain the last
+                # accepted config for one successful refresh, then drop (D5).
+                if target.invalid < 1:
+                    updated[room_id] = dataclasses.replace(target, misses=0, invalid=target.invalid + 1)
+                else:
+                    drops.add(room_id)
+            elif target.misses < 1:
+                # Absent from the catalog: misses count down, the invalid
+                # retention starts over on the next rejected sighting.
+                updated[room_id] = dataclasses.replace(target, misses=target.misses + 1, invalid=0)
             else:
                 drops.add(room_id)
             continue
@@ -1170,8 +1182,40 @@ def emit_catalog_row_rejections(rejections):
         )
 
 
-def _room_catalog_is_empty(catalog):
-    return isinstance(catalog, dict) and catalog.get("rooms") == []
+def _accept_catalog_rows(catalog):
+    """Tolerant row gate (D4/D5) for a shape-valid catalog: emit every row
+    rejection, then return (accepted rows, rejected room ids)."""
+    rejections = classify_catalog_rows(catalog)
+    emit_catalog_row_rejections(rejections)
+    rejected_index = {rejection["index"] for rejection in rejections}
+    rejected_rooms = {
+        rejection["room"] for rejection in rejections if rejection["room"] is not None
+    }
+    accepted = [
+        row for index, row in enumerate(catalog["rooms"])
+        if index not in rejected_index and _row_classifiable(row)
+    ]
+    return accepted, rejected_rooms
+
+
+def _sanitize_lookup_aliases(lookup):
+    """Lookup sanitation (D6), single pass (B3): a missing/non-array shape
+    still fails the refresh; otherwise each entry either gets a CATALOG_ROW
+    rejection diagnostic (unsafe format, or a duplicate of an earlier entry)
+    or is appended to the sanitized list, never both."""
+    if not isinstance(lookup, dict) or not isinstance(lookup.get("aliases"), list):
+        raise LaunchError("alias lookup has an invalid schema", category="schema")
+    sanitized = []
+    seen = set()
+    for index, alias in enumerate(lookup["aliases"]):
+        if not _safe_token(alias):
+            catalog_event(f"CATALOG_ROW result=rejected kind=alias index={index} reason=format")
+        elif alias in seen:
+            catalog_event(f"CATALOG_ROW result=rejected kind=alias index={index} reason=duplicate")
+        else:
+            seen.add(alias)
+            sanitized.append(alias)
+    return {"aliases": sanitized}
 
 
 def _refresh_error(exc):
@@ -1226,20 +1270,17 @@ def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runne
     drop_count = put_count = 0
     try:
         catalog = fetch(ROOM_ENDPOINT)
-        # Diagnostics only (B): classify and log every rejected row/alias so
-        # tester logs name the culprit, but the gate below is still strict —
-        # one invalid row still fails the whole refresh, as in rc17.
-        emit_catalog_row_rejections(classify_catalog_rows(catalog))
-        if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
-            try:
-                ready_rooms(catalog)
-            except LaunchError:
-                raise
+        if not isinstance(catalog, dict) or not isinstance(catalog.get("rooms"), list):
             raise LaunchError("room catalog has an invalid schema", category="schema")
-        ready = ready_rooms(catalog)
+        # Tolerant row gate (D4/D5): identity is resolved before validity,
+        # unidentifiable/invalid/duplicate-grouped rows are rejected one by
+        # one, and the accepted rows alone drive selection and planning.
+        accepted, rejected_rooms = _accept_catalog_rows(catalog)
+        # Strict selector on the filtered set: unchanged checks always pass.
+        ready = ready_rooms({"rooms": accepted})
         ready_count = len(ready)
         stage = "lookup"
-        lookup = fetch(LOOKUP_ENDPOINT)
+        lookup = _sanitize_lookup_aliases(fetch(LOOKUP_ENDPOINT))
         rows = registered_rooms(ready, lookup)
         registered_count = len(rows)
         stage = "servers"
@@ -1255,8 +1296,11 @@ def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runne
             rows,
             make_config,
             lambda row: content_ready(q2_path, row["createSettings"]["map"], content_checker, runner=runner),
+            rejected_ids=rejected_rooms,
         )
         plan.ice_servers = ice_servers
+        plan.accepted = tuple(sorted(row["room"] for row in accepted))
+        plan.registered = tuple(sorted(row["room"] for row in rows))
         target_count = len(plan.targets)
         drop_count = len(plan.drops)
         put_count = len(plan.targets)
@@ -1379,14 +1423,11 @@ def _targets_ice_servers(targets):
 
 
 def make_hub_targets(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
-    emit_catalog_row_rejections(classify_catalog_rows(catalog))
-    if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
-        try:
-            ready_rooms(catalog)
-        except LaunchError:
-            raise
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("rooms"), list):
         raise LaunchError("room catalog has an invalid schema", category="schema")
-    rows = registered_rooms(ready_rooms(catalog), lookup)
+    accepted, _rejected = _accept_catalog_rows(catalog)
+    lookup = _sanitize_lookup_aliases(lookup)
+    rows = registered_rooms(ready_rooms({"rooms": accepted}), lookup)
     ice_servers = _ice_snapshot(rtc_rows)
     plan = reconcile_targets(
         {}, rows,

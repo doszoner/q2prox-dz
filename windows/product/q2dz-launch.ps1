@@ -366,19 +366,37 @@ function Get-Q2DzLiveTargets {
   $putCount = 0
   try {
     $catalog = & $FetchJson $Q2DZ_ROOM_ENDPOINT
-    # Diagnostics only (B): classify and log every rejected row/alias so
-    # tester logs name the culprit, but the gate below is still strict —
-    # one invalid row still fails the whole refresh, as in rc17.
-    Write-Q2DzCatalogRowRejections @(Get-Q2DzCatalogRowRejections $catalog)
-    if (-not (Test-Q2DzRoomPayload $catalog) -and
-        -not (Test-Q2DzEmptyRoomCatalog $catalog)) {
-      try { Get-Q2DzReadyRooms $catalog | Out-Null } catch { throw }
+    if ($null -eq $catalog -or $null -eq $catalog.PSObject -or
+        $catalog.PSObject.Properties.Name -notcontains 'rooms' -or
+        $catalog.rooms -isnot [array]) {
       throw 'room catalog has an invalid schema'
     }
-    $readyRows = @(Get-Q2DzReadyRooms $catalog)
+    # Tolerant row gate (D4/D5): identity is resolved before validity,
+    # unidentifiable/invalid/duplicate-grouped rows are rejected one by
+    # one, and the accepted rows alone drive selection and planning.
+    $rejections = @(Get-Q2DzCatalogRowRejections $catalog)
+    Write-Q2DzCatalogRowRejections $rejections
+    $rejectedIndex = @{}
+    $rejectedRooms = New-Q2DzTargetMap
+    foreach ($rejection in $rejections) {
+      $rejectedIndex[[int]$rejection.Index] = $true
+      if ($null -ne $rejection.Room) { $rejectedRooms[[string]$rejection.Room] = $true }
+    }
+    $acceptedRows = @()
+    $index = -1
+    foreach ($row in @($catalog.rooms)) {
+      $index++
+      if ($rejectedIndex.ContainsKey($index)) { continue }
+      if (-not (Test-Q2DzCatalogRowClassifiable $row)) { continue }
+      $acceptedRows += $row
+    }
+    # Strict selector on the filtered set: its row and duplicate checks are
+    # unchanged; an accepted row always passes them.
+    $readyRows = @(Get-Q2DzReadyRooms ([pscustomobject]@{ rooms = [object[]]$acceptedRows }))
     $readyCount = $readyRows.Count
     $stage = 'lookup'
     $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
+    $lookup = [pscustomobject]@{ aliases = @(Select-Q2DzSanitizedAliases $lookup) }
     $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
     $registeredCount = $registeredReady.Count
     $stage = 'servers'
@@ -408,8 +426,10 @@ function Get-Q2DzLiveTargets {
       return [bool](& $check $ContentCheckPath ([string]$row.createSettings.map) $root)
     }
     $stage = 'plan'
-    $updated = Get-Q2DzTargetPlan -Targets $Targets -Rows $registeredReady -MakeConfig $makeConfig -MapAvailable $mapAvailable
+    $updated = Get-Q2DzTargetPlan -Targets $Targets -Rows $registeredReady -RejectedRooms $rejectedRooms -MakeConfig $makeConfig -MapAvailable $mapAvailable
     $updated.IceServers = @($iceServers)
+    $updated | Add-Member -NotePropertyName Accepted -NotePropertyValue (Sort-Q2DzStrings @($acceptedRows | ForEach-Object { [string]$_.room })) -Force
+    $updated | Add-Member -NotePropertyName Registered -NotePropertyValue (Sort-Q2DzStrings @($registeredReady | ForEach-Object { [string]$_.room })) -Force
     $targetCount = $updated.Targets.Count
     $dropCount = $updated.Drops.Count
     $putCount = $updated.Targets.Count

@@ -224,6 +224,362 @@ function Invoke-HeartbeatScenario {
   throw "Unhandled heartbeat scenario: $name"
 }
 
+# --- refresh-scenario shared cases (spec q2prox-catalog-refresh) ---
+# steps[]; each step: rooms? (rows of the room/get body, or a generator
+# {"gen":{"kind":"q2"|"q2ded","count":N,"start":N}}), aliases? (defaults to
+# every derivable row alias), rtc? (default one valid row), fail?
+# (http|timeout|json|rtc|capacity|content_check), expected {result,
+# accepted, registered, targets, drops, puts, rows}.
+
+function Expand-RefreshIds {
+  param($Entries)
+  $result = [System.Collections.Generic.List[string]]::new()
+  foreach ($item in @($Entries)) {
+    if ($null -ne $item -and $null -ne $item.PSObject -and
+        $item.PSObject.Properties.Name -contains 'gen') {
+      $gen = $item.gen
+      $start = if ($gen.PSObject.Properties.Name -contains 'start') { [int]$gen.start } else { 0 }
+      for ($offset = 0; $offset -lt [int]$gen.count; $offset++) {
+        $result.Add(('{0}{1:D3}' -f [string]$gen.prefix, ($start + $offset)))
+      }
+      continue
+    }
+    $result.Add([string]$item)
+  }
+  return @($result)
+}
+
+function Expand-RefreshRows {
+  param($Entries)
+  $result = [System.Collections.Generic.List[object]]::new()
+  foreach ($item in @($Entries)) {
+    if ($null -ne $item -and $null -ne $item.PSObject -and
+        $item.PSObject.Properties.Name -contains 'gen') {
+      $gen = $item.gen
+      $start = if ($gen.PSObject.Properties.Name -contains 'start') { [int]$gen.start } else { 0 }
+      for ($offset = 0; $offset -lt [int]$gen.count; $offset++) {
+        $suffix = '{0:D3}' -f ($start + $offset)
+        if ([string]$gen.kind -ceq 'q2ded') {
+          $result.Add((New-TestDedicatedRoom -RoomId ('room.q2ded.gen.{0}' -f $suffix) -Name ('DED GEN {0}' -f $suffix)))
+        } else {
+          $result.Add((New-TestRoom -RoomId ('room.q2.gen.{0}' -f $suffix) -Owner ('gen{0}' -f $suffix) -Name ('GEN {0}' -f $suffix)))
+        }
+      }
+      continue
+    }
+    $result.Add($item)
+  }
+  return @($result)
+}
+
+function Expand-RefreshExpectedTargets {
+  param($Entries)
+  $result = [System.Collections.Generic.List[object]]::new()
+  foreach ($item in @($Entries)) {
+    if ($null -ne $item -and $null -ne $item.PSObject -and
+        $item.PSObject.Properties.Name -contains 'gen') {
+      $gen = $item.gen
+      $start = if ($gen.PSObject.Properties.Name -contains 'start') { [int]$gen.start } else { 0 }
+      for ($offset = 0; $offset -lt [int]$gen.count; $offset++) {
+        $result.Add([pscustomobject]@{
+          room = ('{0}{1:D3}' -f [string]$gen.prefix, ($start + $offset)); misses = 0; invalid = 0 })
+      }
+      continue
+    }
+    $misses = if ($item.PSObject.Properties.Name -contains 'misses') { [int]$item.misses } else { 0 }
+    $invalid = if ($item.PSObject.Properties.Name -contains 'invalid') { [int]$item.invalid } else { 0 }
+    $result.Add([pscustomobject]@{ room = [string]$item.room; misses = $misses; invalid = $invalid })
+  }
+  return @($result)
+}
+
+function Get-RefreshRowAlias {
+  param($Row)
+  # Test-side alias derivation for the default lookup payload (not a
+  # validity check): q2ded -> room id; q2 -> q2.<owner> when owner is a
+  # string or integer; $null when no alias can be derived.
+  if ($null -eq $Row -or $null -eq $Row.PSObject -or
+      $Row.PSObject.Properties.Name -notcontains 'createSettings' -or
+      $null -eq $Row.createSettings -or $null -eq $Row.createSettings.PSObject -or
+      $Row.createSettings.PSObject.Properties.Name -notcontains 'prefix') { return $null }
+  $prefix = $Row.createSettings.prefix
+  if ($prefix -isnot [string]) { return $null }
+  if ($prefix -ceq 'q2ded') {
+    if ($Row.PSObject.Properties.Name -contains 'room' -and $Row.room -is [string]) {
+      return [string]$Row.room
+    }
+    return $null
+  }
+  if ($prefix -cne 'q2' -or
+      $Row.PSObject.Properties.Name -notcontains 'owner') { return $null }
+  $owner = $Row.owner
+  if ($null -eq $owner -or $owner -is [bool]) { return $null }
+  # Mirrors Get-Q2DzClassifiedRoomAlias (catalog.ps1).
+  if ($owner -isnot [string] -and -not (Test-Q2DzIntegerKind $owner)) { return $null }
+  return ('q2.{0}' -f [string]$owner)
+}
+
+function Get-RefreshTargetState {
+  param($Targets)
+  $state = New-Q2DzTargetMap
+  foreach ($key in @($Targets.Keys)) {
+    $target = $Targets[$key]
+    $invalid = 0
+    if ($null -ne $target -and $null -ne $target.PSObject -and
+        $target.PSObject.Properties.Name -contains 'Invalid') { $invalid = [int]$target.Invalid }
+    $state[[string]$key] = [pscustomobject]@{
+      misses = [int]$target.Misses; invalid = $invalid; config = [string]$target.Config }
+  }
+  return $state
+}
+
+function Assert-RefreshIdList {
+  param($Expected, $Actual, [string]$Label)
+  $expectedIds = (Sort-Q2DzStrings (Expand-RefreshIds $Expected)) -join ' '
+  $actualIds = (Sort-Q2DzStrings @($Actual)) -join ' '
+  Assert-Equal $expectedIds $actualIds $Label
+}
+
+function New-RefreshHeartbeatSink {
+  # Minimal fake coordinator stdin for heartbeat evidence — the same shape
+  # launcher-stdin.tests.ps1's New-FakeHubWriter exposes (Text, Writes,
+  # BaseStream.Write/Flush).
+  $sink = [pscustomobject]@{ Text = New-Object System.Text.StringBuilder; Writes = 0 }
+  $stream = [pscustomobject]@{ Owner = $sink }
+  $stream | Add-Member ScriptMethod Write {
+    param([byte[]]$Bytes, [int]$Offset, [int]$Count)
+    [void]$this.Owner.Text.Append([Text.Encoding]::UTF8.GetString($Bytes, $Offset, $Count))
+    $this.Owner.Writes++
+  }
+  $stream | Add-Member ScriptMethod Flush { }
+  $sink | Add-Member NoteProperty BaseStream $stream
+  return $sink
+}
+
+function Invoke-RefreshScenario {
+  param($Case)
+  Assert-True (@($Case.steps).Count -gt 0) 'refresh-scenario has steps'
+  $targets = New-Q2DzTargetMap
+  foreach ($stepIndex in 0..(@($Case.steps).Count - 1)) {
+    $step = $Case.steps[$stepIndex]
+    $label = '{0} step {1}' -f [string]$Case.name,$stepIndex
+    Assert-True ($step.PSObject.Properties.Name -contains 'expected') "${label}: expected block is required"
+    $expected = $step.expected
+    $fail = ''
+    if ($step.PSObject.Properties.Name -contains 'fail') { $fail = [string]$step.fail }
+    Assert-True (@('','http','timeout','json','rtc','capacity','content_check') -ccontains $fail) "${label}: unknown fail kind '$fail'"
+    $rows = @()
+    if ($step.PSObject.Properties.Name -contains 'rooms') { $rows = @(Expand-RefreshRows $step.rooms) }
+    if ($fail -ceq 'capacity') {
+      $joinable = 0
+      foreach ($row in $rows) {
+        if ((Test-Q2DzRoomRow $row) -and [int]$row.players -lt [int]$row.createSettings.maxPlayers) { $joinable++ }
+      }
+      for ($i = 0; $i -lt (257 - $joinable); $i++) {
+        $suffix = '{0:D3}' -f $i
+        $rows += New-TestRoom -RoomId ('room.q2.cap.{0}' -f $suffix) -Owner ('cap{0}' -f $suffix) -Name ('CAP {0}' -f $suffix)
+      }
+    }
+    $catalog = [pscustomobject]@{ rooms = [object[]]$rows }
+    $aliasList = [System.Collections.Generic.List[string]]::new()
+    if ($step.PSObject.Properties.Name -contains 'aliases') {
+      foreach ($alias in @($step.aliases)) { $aliasList.Add([string]$alias) }
+    } else {
+      $seenAlias = New-Q2DzTargetMap
+      foreach ($row in $rows) {
+        $alias = Get-RefreshRowAlias $row
+        if ($null -ne $alias -and -not $seenAlias.ContainsKey($alias)) {
+          $seenAlias[$alias] = $true
+          $aliasList.Add($alias)
+        }
+      }
+    }
+    $lookup = [pscustomobject]@{ aliases = [string[]]$aliasList.ToArray() }
+    $rtc = @(New-TestRtc)
+    if ($step.PSObject.Properties.Name -contains 'rtc') { $rtc = @($step.rtc) }
+    if ($fail -ceq 'rtc') { $rtc = @([pscustomobject]@{ domain = 'bad domain'; iceservers = @() }) }
+    $fetch = {
+      param($endpoint)
+      if ($fail -ceq 'http') {
+        $statusError = [Exception]::new('Dos.Zone endpoint returned a non-success status')
+        $statusError.Data['q2dz.http'] = 503
+        throw $statusError
+      }
+      if ($fail -ceq 'timeout') { throw [System.TimeoutException]::new('Dos.Zone response timed out') }
+      if ($fail -ceq 'json') { throw 'Dos.Zone endpoint returned invalid JSON' }
+      switch ($endpoint) {
+        $Q2DZ_ROOM_ENDPOINT { return $catalog }
+        $Q2DZ_LOOKUP_ENDPOINT { return $lookup }
+        $Q2DZ_RTC_ENDPOINT { return $rtc }
+        default { throw "unexpected endpoint $endpoint" }
+      }
+    }
+    $check = {
+      param($path, $map, $root)
+      if ($fail -ceq 'content_check') { throw 'content checker execution failed' }
+      return $true
+    }
+    $before = Get-RefreshTargetState $targets
+    $writer = [IO.StringWriter]::new()
+    $previousError = [Console]::Error
+    $plan = $null
+    try {
+      [Console]::SetError($writer)
+      $items = @(Get-Q2DzLiveTargets -Targets $targets -Q2Path 'C:\Games\Q2PRO-X.exe' `
+        -ContentCheckPath 'q2dz-content-check.exe' -FetchJson $fetch -RunContentCheck $check)
+      if ($items.Count -eq 1) { $plan = $items[0] }
+    } catch {
+      $plan = $null
+    } finally {
+      [Console]::SetError($previousError)
+      $logText = $writer.ToString()
+      $writer.Dispose()
+    }
+    # The real heartbeat writer into a fake stdin sink, gated like
+    # Invoke-Q2DzHub (it publishes only a complete plan): an ok step writes
+    # exactly the planned targets, a failed refresh writes nothing.
+    $heartbeatSink = New-RefreshHeartbeatSink
+    if ($null -ne $plan -and $null -ne $plan.Targets -and $null -ne $plan.IceServers) {
+      $heartbeatCode = Write-Q2DzHeartbeat -Process ([pscustomobject]@{ HasExited = $false }) `
+        -Writer $heartbeatSink -Plan $plan -Generation ([UInt64]($stepIndex + 1))
+      Assert-True ($null -eq $heartbeatCode) "${label}: heartbeat write completes"
+    }
+    $heartbeatPuts = [System.Collections.Generic.List[string]]::new()
+    foreach ($heartbeatLine in ($heartbeatSink.Text.ToString() -split "`n")) {
+      $putMatch = [regex]::Match($heartbeatLine, ' PUT room=([A-Za-z0-9._-]+) json=')
+      if ($putMatch.Success) { $heartbeatPuts.Add($putMatch.Groups[1].Value) }
+    }
+    if ($null -ne $plan) {
+      Assert-RefreshIdList @($plan.Targets.Keys) $heartbeatPuts "${label}: heartbeat PUTs exactly the planned targets"
+    } else {
+      Assert-Equal 0 $heartbeatSink.Writes "${label}: failed refresh writes no heartbeat"
+    }
+    $emittedRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in ($logText -split "`n")) {
+      $match = [regex]::Match($line, 'LAUNCHER CATALOG_ROW result=rejected (\S[^\r\n]*)$')
+      if (-not $match.Success) { continue }
+      $entry = [ordered]@{}
+      foreach ($field in ($match.Groups[1].Value -split ' ')) {
+        if (-not $field) { continue }
+        $pair = $field -split '=', 2
+        $entry[$pair[0]] = $pair[1]
+      }
+      $emittedRows.Add([pscustomobject]$entry)
+    }
+    $actualTargets = New-Q2DzTargetMap
+    if ($null -ne $plan) {
+      $targets = $plan.Targets
+      $actualTargets = Get-RefreshTargetState $targets
+      foreach ($key in @($actualTargets.Keys)) {
+        $state = $actualTargets[$key]
+        if ($before.ContainsKey($key) -and ($state.misses -gt 0 -or $state.invalid -gt 0)) {
+          Assert-Equal $before[$key].config $state.config "${label}: retained target $key keeps its accepted config"
+        }
+      }
+      # A room that recovers (was stale/invalid, now re-accepted) must get the
+      # NEW row's serialized config, not the old cached one: check both the
+      # in-memory target config and the actual heartbeat PUT payload against
+      # the row's current map, and that a changed map actually changed the
+      # serialized config relative to the prior step.
+      $rowsById = @{}
+      foreach ($row in $rows) {
+        if ($row.PSObject.Properties.Name -contains 'room' -and $null -ne $row.room -and $row.room -is [string]) {
+          $rowsById[[string]$row.room] = $row
+        }
+      }
+      $putJsonByRoom = @{}
+      foreach ($heartbeatLine in ($heartbeatSink.Text.ToString() -split "`n")) {
+        $putJsonMatch = [regex]::Match($heartbeatLine, ' PUT room=([A-Za-z0-9._-]+) json=(.*)$')
+        if ($putJsonMatch.Success) { $putJsonByRoom[$putJsonMatch.Groups[1].Value] = $putJsonMatch.Groups[2].Value }
+      }
+      $acceptedList = @()
+      if ($plan.PSObject.Properties.Name -contains 'Accepted') { $acceptedList = @($plan.Accepted) }
+      foreach ($roomId in $acceptedList) {
+        if ($null -eq $roomId -or $roomId -isnot [string] -or $roomId -eq '') { continue }
+        $row = $rowsById[$roomId]
+        if ($null -eq $row -or -not $actualTargets.ContainsKey($roomId)) { continue }
+        $currentMap = $null
+        if ($row.PSObject.Properties.Name -contains 'createSettings' -and
+            $row.createSettings.PSObject.Properties.Name -contains 'map') {
+          $currentMap = [string]$row.createSettings.map
+        }
+        if ([string]::IsNullOrEmpty($currentMap)) { continue }
+        $recoveredConfig = [string]$actualTargets[$roomId].config
+        Assert-True ($recoveredConfig.Contains($currentMap)) "${label}: recovered target $roomId config reflects the current row"
+        Assert-True ($putJsonByRoom.ContainsKey($roomId) -and $putJsonByRoom[$roomId].Contains($currentMap)) "${label}: recovered target $roomId heartbeat PUT reflects the current row"
+        if ($before.ContainsKey($roomId)) {
+          $priorConfig = [string]$before[$roomId].config
+          if (-not $priorConfig.Contains($currentMap)) {
+            Assert-True ($recoveredConfig -ne $priorConfig) "${label}: recovered target $roomId config replaces the stale cached one"
+          }
+        }
+      }
+    } else {
+      $actualTargets = Get-RefreshTargetState $targets
+      foreach ($key in @($actualTargets.Keys)) {
+        $state = $actualTargets[$key]
+        Assert-True ($before.ContainsKey($key)) "${label}: failed refresh must not add target $key"
+        Assert-Equal $before[$key].misses $state.misses "${label}: failed refresh keeps misses for $key"
+        Assert-Equal $before[$key].invalid $state.invalid "${label}: failed refresh keeps invalid for $key"
+        Assert-Equal $before[$key].config $state.config "${label}: failed refresh keeps config for $key"
+      }
+      Assert-Equal @($before.Keys).Count @($actualTargets.Keys).Count "${label}: failed refresh keeps the target set"
+    }
+    Assert-Equal ([string]$expected.result) $(if ($null -ne $plan) { 'ok' } else { 'error' }) "${label}: result"
+    if ($expected.PSObject.Properties.Name -contains 'accepted') {
+      $accepted = @()
+      if ($null -ne $plan -and $plan.PSObject.Properties.Name -contains 'Accepted') { $accepted = @($plan.Accepted) }
+      Assert-RefreshIdList $expected.accepted $accepted "${label}: accepted"
+    }
+    if ($expected.PSObject.Properties.Name -contains 'registered') {
+      $registered = @()
+      if ($null -ne $plan -and $plan.PSObject.Properties.Name -contains 'Registered') { $registered = @($plan.Registered) }
+      Assert-RefreshIdList $expected.registered $registered "${label}: registered"
+    }
+    if ($expected.PSObject.Properties.Name -contains 'puts') {
+      Assert-RefreshIdList $expected.puts $heartbeatPuts "${label}: puts"
+    }
+    if ($expected.PSObject.Properties.Name -contains 'drops') {
+      $drops = @()
+      if ($null -ne $plan) { $drops = @($plan.Drops) }
+      Assert-RefreshIdList $expected.drops $drops "${label}: drops"
+    }
+    if ($expected.PSObject.Properties.Name -contains 'targets') {
+      $wanted = @{}
+      foreach ($entry in @(Expand-RefreshExpectedTargets $expected.targets)) {
+        $wanted[[string]$entry.room] = $entry
+      }
+      Assert-Equal ((Sort-Q2DzStrings @($wanted.Keys)) -join ' ') ((Sort-Q2DzStrings @($actualTargets.Keys)) -join ' ') "${label}: target ids"
+      foreach ($key in @($wanted.Keys)) {
+        Assert-True ($actualTargets.ContainsKey($key)) "${label}: target $key exists"
+        Assert-Equal ([int]$wanted[$key].misses) ([int]$actualTargets[$key].misses) "${label}: $key misses"
+        Assert-Equal ([int]$wanted[$key].invalid) ([int]$actualTargets[$key].invalid) "${label}: $key invalid"
+      }
+    }
+    if ($expected.PSObject.Properties.Name -contains 'rows') {
+      $expectedRows = @($expected.rows)
+      Assert-Equal $expectedRows.Count $emittedRows.Count "${label}: CATALOG_ROW count"
+      for ($rowIndex = 0; $rowIndex -lt $expectedRows.Count; $rowIndex++) {
+        $exp = @{}
+        foreach ($property in $expectedRows[$rowIndex].PSObject.Properties) { $exp[$property.Name] = [string]$property.Value }
+        $act = @{}
+        foreach ($property in $emittedRows[$rowIndex].PSObject.Properties) { $act[$property.Name] = [string]$property.Value }
+        Assert-Equal ((@($exp.Keys) | Sort-Object) -join ',') ((@($act.Keys) | Sort-Object) -join ',') "${label}: row $rowIndex fields"
+        foreach ($key in $exp.Keys) {
+          Assert-Equal $exp[$key] $act[$key] "${label}: row $rowIndex field $key"
+        }
+      }
+    }
+    foreach ($event in $emittedRows) {
+      if ($event.PSObject.Properties.Name -contains 'kind' -and [string]$event.kind -ceq 'alias' -and
+          [string]$event.reason -ceq 'format') {
+        $rawAlias = [string]$aliasList[[int]$event.index]
+        Assert-True (-not $logText.Contains($rawAlias)) "${label}: rejected alias value never reaches the log"
+      }
+    }
+  }
+}
+
 $repo = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
 $fixturePath = Join-Path $repo 'tests\contracts\doszone-api-cases.json'
 $cases = @(Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json)
@@ -233,6 +589,9 @@ $scenarioNames = [System.Collections.Generic.List[string]]::new()
 $refreshFailures = [System.Collections.Generic.List[string]]::new()
 foreach ($case in $cases) {
   if ($case.kind -eq 'refresh-scenario') {
+    # Collected, not thrown: one bad case must not hide the verdicts of the rest.
+    try { Invoke-RefreshScenario $case }
+    catch { [void]$refreshFailures.Add(('{0}: {1}' -f [string]$case.name, $_.Exception.Message)) }
     continue
   }
   if ($case.kind -eq 'heartbeat-scenario') {

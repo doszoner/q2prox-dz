@@ -91,12 +91,11 @@ SDP, тела сообщений чата, отвергнутые алиасы �
 
 - **Пустой список при старте.** Ищите последний `CATALOG_REFRESH`:
   `result=error stage=catalog error=http http=503` — облако ответило не-2xx;
-  `error=timeout` — сеть; `result=error stage=catalog error=schema` вместе с
-  `CATALOG_ROW result=rejected … field=<поле> reason=<код>` — в ответе была
-  хотя бы одна битая строка: она названа по `CATALOG_ROW`, но всё обновление
-  всё равно отказано (как в rc17); `result=ok targets=0` — каталог сам пустой.
-  Отказ всего обновления `error=schema` остаётся также для тела без
-  `rooms`/`aliases` или где
+  `error=timeout` — сеть; `result=ok` вместе с `CATALOG_ROW
+  result=rejected … field=<поле> reason=<код>` — в ответе были битые
+  строки, валидные приняты (`ready=`/`targets=` уже после отбора);
+  `result=ok targets=0` — каталог сам пустой. Отказ всего обновления
+  `error=schema` остаётся только для тела без `rooms`/`aliases` или где
   они не массивы и для ключей, различающихся регистром.
 - **Комната есть, а в списке её нет.** Ищите `TARGET room=<id>`.
   `state=pending` без `ready` — транспорт не поднял endpoint;

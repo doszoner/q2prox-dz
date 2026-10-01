@@ -115,6 +115,105 @@ def scenario_rows(payload):
     return rows
 
 
+# refresh-scenario shared cases (spec q2prox-catalog-refresh): steps[] with
+# rooms? (row objects or a {"gen": {"kind": "q2"|"q2ded", "count", "start"}}
+# generator), aliases? (defaults to every derivable row alias), rtc?
+# (default one valid row), fail? (http|timeout|json|rtc|capacity|
+# content_check), expected {result, accepted, registered, targets, drops,
+# puts, rows}. Expected id lists accept {"gen": {"prefix", "count",
+# "start"}}; targets entries are {"room", "misses", "invalid"}.
+
+
+def expand_refresh_rows(entries):
+    rows = []
+    for item in entries:
+        gen = item.get("gen") if isinstance(item, dict) else None
+        if gen is None:
+            rows.append(item)
+            continue
+        for offset in range(gen["count"]):
+            suffix = f"{gen.get('start', 0) + offset:03d}"
+            if gen.get("kind") == "q2ded":
+                rows.append(dedicated_room(f"room.q2ded.gen.{suffix}", name=f"DED GEN {suffix}"))
+            else:
+                rows.append(room(f"room.q2.gen.{suffix}", f"gen{suffix}", name=f"GEN {suffix}"))
+    return rows
+
+
+def expand_refresh_ids(entries):
+    ids = []
+    for item in entries:
+        gen = item.get("gen") if isinstance(item, dict) else None
+        if gen is None:
+            ids.append(item)
+            continue
+        ids.extend(
+            f"{gen['prefix']}{gen.get('start', 0) + offset:03d}"
+            for offset in range(gen["count"])
+        )
+    return ids
+
+
+def expand_refresh_targets(entries):
+    result = {}
+    for item in entries:
+        gen = item.get("gen") if isinstance(item, dict) else None
+        if gen is not None:
+            for offset in range(gen["count"]):
+                room_id = f"{gen['prefix']}{gen.get('start', 0) + offset:03d}"
+                result[room_id] = {
+                    "misses": gen.get("misses", 0), "invalid": gen.get("invalid", 0)
+                }
+            continue
+        result[item["room"]] = {
+            "misses": item.get("misses", 0), "invalid": item.get("invalid", 0)
+        }
+    return result
+
+
+def refresh_row_aliases(rows):
+    # Test-side alias derivation for the default lookup payload (not a
+    # validity check): q2ded -> room id; q2 -> q2.<owner> when owner is a
+    # string or integer; None when no alias can be derived.
+    aliases = []
+    seen = set()
+    for row in rows:
+        alias = None
+        if isinstance(row, dict) and isinstance(row.get("createSettings"), dict):
+            prefix = row["createSettings"].get("prefix")
+            if prefix == "q2ded" and isinstance(row.get("room"), str):
+                alias = row["room"]
+            elif prefix == "q2":
+                owner = row.get("owner")
+                if isinstance(owner, str) or (isinstance(owner, int) and not isinstance(owner, bool)):
+                    alias = f"q2.{owner}"
+        if alias is not None and alias not in seen:
+            seen.add(alias)
+            aliases.append(alias)
+    return aliases
+
+
+def refresh_row_events(log):
+    marker = "LAUNCHER CATALOG_ROW result=rejected "
+    events = []
+    for line in log.splitlines():
+        if marker not in line:
+            continue
+        entry = {}
+        for token in line.split(marker, 1)[1].split():
+            key, _, value = token.partition("=")
+            entry[key] = value
+        events.append(entry)
+    return events
+
+
+def target_state(targets):
+    return {
+        room_id: (target.misses, getattr(target, "invalid", 0), target.config)
+        for room_id, target in targets.items()
+    }
+
+
 def generated_oversized_rtc(payload):
     servers = []
     for server_index in range(payload["serverCount"]):
@@ -280,19 +379,15 @@ class LauncherTests(unittest.TestCase):
             return {"error": "accepted"}
 
         if name in {"heartbeat-duplicate-room-id", "heartbeat-duplicate-derived-alias"}:
+            # The strict selector check stays strict: the tolerant refresh
+            # gate skips duplicate groups instead of failing the refresh,
+            # so these cases must go through ready_rooms directly.
             if name.endswith("room-id"):
                 rows = [room("room.q2.shared-scenario.1", "1"), room("room.q2.shared-scenario.1", "2")]
             else:
                 rows = [room("room.q2.alias-scenario.1", "3"), room("room.q2.alias-scenario.2", "3")]
             try:
-                launch.refresh_targets(
-                    {}, "/games/Q2PRO-X.exe",
-                    fetch=lambda endpoint: {
-                        launch.ROOM_ENDPOINT: catalog(rows),
-                        launch.LOOKUP_ENDPOINT: lookup_for(rows),
-                        launch.RTC_ENDPOINT: rtc_rows(),
-                    }[endpoint],
-                )
+                launch.ready_rooms(catalog(rows))
             except launch.LaunchError as exc:
                 message = str(exc)
                 return {
@@ -354,6 +449,182 @@ class LauncherTests(unittest.TestCase):
 
         self.fail(f"unhandled heartbeat scenario {name}")
 
+    def _execute_refresh_scenario(self, case):
+        targets = {}
+        self.assertTrue(case["steps"], "refresh-scenario has steps")
+        for index, step in enumerate(case["steps"]):
+            with self.subTest(case=case["name"], step=index):
+                self.assertIn("expected", step)
+                expected = step["expected"]
+                fail = step.get("fail")
+                self.assertIn(
+                    fail,
+                    (None, "http", "timeout", "json", "rtc", "capacity", "content_check"),
+                )
+                rooms = expand_refresh_rows(step.get("rooms", []))
+                if fail == "capacity":
+                    joinable = sum(
+                        1 for row in rooms
+                        if launch._strict_room(row)
+                        and row["players"] < row["createSettings"]["maxPlayers"]
+                    )
+                    rooms += [
+                        room(f"room.q2.cap.{offset:03d}", f"cap{offset:03d}", name=f"CAP {offset:03d}")
+                        for offset in range(max(0, 257 - joinable))
+                    ]
+                aliases = list(step["aliases"]) if "aliases" in step else refresh_row_aliases(rooms)
+                rtc = step.get("rtc")
+                if fail == "rtc":
+                    rtc = [{"domain": "bad domain", "iceservers": []}]
+                if rtc is None:
+                    rtc = rtc_rows()
+
+                def fetch(endpoint, fail=fail, rooms=rooms, aliases=aliases, rtc=rtc):
+                    if fail == "http":
+                        error = launch.LaunchError("Dos.Zone endpoint returned a non-success status")
+                        error.http_status = 503
+                        raise error
+                    if fail == "timeout":
+                        raise launch.LaunchError("Dos.Zone response timed out")
+                    if fail == "json":
+                        raise launch.LaunchError(f"invalid JSON from {endpoint}")
+                    return {
+                        launch.ROOM_ENDPOINT: {"rooms": rooms},
+                        launch.LOOKUP_ENDPOINT: {"aliases": aliases},
+                        launch.RTC_ENDPOINT: rtc,
+                    }[endpoint]
+
+                if fail == "content_check":
+                    runner = lambda *args, **kwargs: subprocess.CompletedProcess(args, 64)
+                else:
+                    runner = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0)
+                before = target_state(targets)
+                output = io.StringIO()
+                # The real heartbeat writer into a fake stdin sink, gated by
+                # the production poll_once (what run_hub uses): a successful
+                # refresh publishes exactly the planned targets, a failed
+                # one writes nothing.
+                process = FakeProcess()
+                writes = []
+
+                def publish(updated):
+                    writes.append(updated)
+                    launch.write_heartbeat(process, updated, generation=index + 1)
+
+                with contextlib.redirect_stderr(output):
+                    targets = launch.poll_once(
+                        targets,
+                        lambda: launch.refresh_targets(
+                            targets, "/games/Q2PRO-X.exe", fetch=fetch,
+                            content_checker="checker", runner=runner,
+                        ),
+                        publish,
+                    )
+                plan = writes[-1] if writes else None
+                log = output.getvalue()
+                heartbeat_puts = sorted(
+                    line.split(" room=", 1)[1].split(" json=", 1)[0]
+                    for line in decoded_lines(process)
+                    if " PUT " in line
+                )
+                if plan is not None:
+                    self.assertEqual(
+                        heartbeat_puts, sorted(plan.targets),
+                        "heartbeat PUTs exactly the planned targets",
+                    )
+                else:
+                    self.assertEqual(writes, [], "failed refresh writes no heartbeat")
+                    self.assertEqual(
+                        decoded_lines(process), [],
+                        "failed refresh emits no heartbeat commands",
+                    )
+                if plan is not None:
+                    after = target_state(targets)
+                    for room_id, state in after.items():
+                        if room_id in before and (state[0] or state[1]):
+                            self.assertEqual(
+                                state[2], before[room_id][2],
+                                "retained target keeps its accepted config",
+                            )
+                    # A room that recovers (was stale/invalid, now re-accepted)
+                    # must get the NEW row's serialized config, not the old
+                    # cached one: check both the in-memory target.config and
+                    # the actual heartbeat PUT payload against the row's
+                    # current map, and that a changed map actually changed
+                    # the serialized config relative to the prior step.
+                    rows_by_id = {row["room"]: row for row in rooms if "room" in row}
+                    puts_by_room = {
+                        line.split(" room=", 1)[1].split(" json=", 1)[0]:
+                            line.split(" json=", 1)[1]
+                        for line in decoded_lines(process)
+                        if " PUT " in line
+                    }
+                    for room_id in getattr(plan, "accepted", ()):
+                        row = rows_by_id.get(room_id)
+                        if row is None or room_id not in after:
+                            continue
+                        current_map = row.get("createSettings", {}).get("map")
+                        if current_map is None:
+                            continue
+                        self.assertIn(
+                            current_map, after[room_id][2],
+                            "recovered target's config reflects the current row",
+                        )
+                        self.assertIn(
+                            current_map, puts_by_room.get(room_id, ""),
+                            "recovered target's heartbeat PUT reflects the current row",
+                        )
+                        if room_id in before:
+                            prior_map = before[room_id][2]
+                            if current_map not in prior_map:
+                                self.assertNotEqual(
+                                    after[room_id][2], prior_map,
+                                    "recovered target's config replaces the stale cached one",
+                                )
+                else:
+                    self.assertEqual(
+                        before, target_state(targets),
+                        "failed refresh must not touch target state",
+                    )
+                self.assertEqual(expected.get("result"), "ok" if plan is not None else "error")
+                if "accepted" in expected:
+                    self.assertEqual(
+                        sorted(expand_refresh_ids(expected["accepted"])),
+                        sorted(getattr(plan, "accepted", ())) if plan is not None else [],
+                    )
+                if "registered" in expected:
+                    self.assertEqual(
+                        sorted(expand_refresh_ids(expected["registered"])),
+                        sorted(getattr(plan, "registered", ())) if plan is not None else [],
+                    )
+                if "puts" in expected:
+                    self.assertEqual(
+                        sorted(expand_refresh_ids(expected["puts"])),
+                        heartbeat_puts,
+                    )
+                if "drops" in expected:
+                    self.assertEqual(
+                        sorted(expand_refresh_ids(expected["drops"])),
+                        sorted(plan.drops) if plan is not None else [],
+                    )
+                if "targets" in expected:
+                    wanted = expand_refresh_targets(expected["targets"])
+                    actual = {
+                        room_id: {"misses": state[0], "invalid": state[1]}
+                        for room_id, state in target_state(targets).items()
+                    }
+                    self.assertEqual(wanted, actual)
+                emitted = refresh_row_events(log)
+                if "rows" in expected:
+                    wanted_rows = [
+                        {key: str(value) for key, value in entry.items()}
+                        for entry in expected["rows"]
+                    ]
+                    self.assertEqual(wanted_rows, emitted)
+                for event in emitted:
+                    if event.get("kind") == "alias" and event.get("reason") == "format":
+                        self.assertNotIn(aliases[int(event["index"])], log)
+
     def test_shared_catalog_contract_cases(self):
         validators = {
             "rooms": launch.validate_room_payload,
@@ -364,6 +635,7 @@ class LauncherTests(unittest.TestCase):
         for case in CONTRACT_CASES:
             with self.subTest(case=case["name"]):
                 if case["kind"] == "refresh-scenario":
+                    self._execute_refresh_scenario(case)
                     continue
                 if case["kind"] == "heartbeat-scenario":
                     scenario_names.add(case["name"])
@@ -573,28 +845,16 @@ class LauncherTests(unittest.TestCase):
         self.assertLess(drop, put)
 
     def test_duplicate_room_and_derived_alias_are_rejected(self):
+        # Direct selector checks stay strict even though the refresh gate
+        # now skips duplicate groups instead of failing the whole refresh.
         duplicate_id = room("room.q2.duplicate.1", "1")
         duplicate_id_again = room("room.q2.duplicate.1", "2")
         duplicate_alias_a = room("room.q2.alias-a.1", "3")
         duplicate_alias_b = room("room.q2.alias-b.2", "3")
         with self.assertRaisesRegex(launch.LaunchError, "duplicate room"):
-            launch.refresh_targets(
-                {}, "/games/Q2PRO-X.exe",
-                fetch=lambda endpoint: {
-                    launch.ROOM_ENDPOINT: catalog([duplicate_id, duplicate_id_again]),
-                    launch.LOOKUP_ENDPOINT: {"aliases": ["q2.1", "q2.2"]},
-                    launch.RTC_ENDPOINT: rtc_rows(),
-                }[endpoint],
-            )
+            launch.ready_rooms(catalog([duplicate_id, duplicate_id_again]))
         with self.assertRaisesRegex(launch.LaunchError, "duplicate Q2 aliases"):
-            launch.refresh_targets(
-                {}, "/games/Q2PRO-X.exe",
-                fetch=lambda endpoint: {
-                    launch.ROOM_ENDPOINT: catalog([duplicate_alias_a, duplicate_alias_b]),
-                    launch.LOOKUP_ENDPOINT: {"aliases": ["q2.3"]},
-                    launch.RTC_ENDPOINT: rtc_rows(),
-                }[endpoint],
-            )
+            launch.ready_rooms(catalog([duplicate_alias_a, duplicate_alias_b]))
 
     def test_invalid_global_rtc_preserves_state_and_writes_no_commands(self):
         old = room("room.q2.rtc.1", "1")
@@ -1188,15 +1448,13 @@ class SessionLogTests(unittest.TestCase):
             self.assertIn("LAUNCHER SESSION stop reason=error rc=1", log_text)
             self.assertNotIn("boom", log_text)
 
-    def test_catalog_row_missing_owner_is_logged_and_fails_the_refresh(self):
-        # B keeps rc17 strictness: one invalid row still fails the whole
-        # refresh, but it is now named by a CATALOG_ROW diagnostic first.
+    def test_catalog_row_missing_owner_does_not_crash_refresh(self):
         bad = room("room.q2.bad.1")
         del bad["owner"]
         rows = [bad, room("room.q2.ok.2", "42")]
         output = io.StringIO()
-        with self.assertRaises(launch.LaunchError), contextlib.redirect_stderr(output):
-            launch.refresh_targets(
+        with contextlib.redirect_stderr(output):
+            plan = launch.refresh_targets(
                 {}, "/games/Q2PRO-X.exe",
                 fetch=lambda endpoint: {
                     launch.ROOM_ENDPOINT: catalog(rows),
@@ -1207,12 +1465,13 @@ class SessionLogTests(unittest.TestCase):
                 runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
             )
         log = output.getvalue()
+        self.assertEqual(list(plan.targets), ["room.q2.ok.2"])
         self.assertRegex(
             log,
             r"CATALOG_ROW result=rejected kind=room room=room\.q2\.bad\.1 "
             r"index=0 field=owner reason=missing",
         )
-        self.assertIn("CATALOG_REFRESH result=error stage=catalog error=schema", log)
+        self.assertIn("CATALOG_REFRESH result=ok stage=plan error=none", log)
 
     def test_http_status_is_classified_on_the_refresh_event(self):
         output = io.StringIO()

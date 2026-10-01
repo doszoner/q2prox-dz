@@ -384,9 +384,10 @@ function New-Q2DzTarget {
     [string]$RoomId = '',
     [string]$Config = '',
     [int]$Misses = 0,
-    [string]$MapName = ''
+    [string]$MapName = '',
+    [int]$Invalid = 0
   )
-  return [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses; MapName = $MapName }
+  return [pscustomobject]@{ RoomId = $RoomId; Config = $Config; Misses = $Misses; MapName = $MapName; Invalid = $Invalid }
 }
 
 function New-Q2DzTargetMap {
@@ -537,7 +538,7 @@ function Copy-Q2DzTargetMap {
         [string]::IsNullOrEmpty([string]$target.Config)) {
       throw 'hub target state key does not match room id'
     }
-    $result[[string]$key] = New-Q2DzTarget ([string]$target.RoomId) ([string]$target.Config) ([int]$target.Misses) ([string]$target.MapName)
+    $result[[string]$key] = New-Q2DzTarget ([string]$target.RoomId) ([string]$target.Config) ([int]$target.Misses) ([string]$target.MapName) ([int]$target.Invalid)
   }
   if ($result.Count -gt $Q2DZ_MAX_TARGETS) { throw 'catalog_capacity_exceeded' }
   return $result
@@ -547,6 +548,7 @@ function Get-Q2DzTargetPlan {
   param(
     [Parameter(Mandatory = $true)]$Targets,
     [object[]]$Rows = @(),
+    $RejectedRooms,
     [Parameter(Mandatory = $true)][scriptblock]$MakeConfig,
     [scriptblock]$MapAvailable = { param($row) return $true }
   )
@@ -572,7 +574,15 @@ function Get-Q2DzTargetPlan {
     $target = $current[$roomId]
     $row = @($rows | Where-Object { [string]$_.room -ceq [string]$roomId }) | Select-Object -First 1
     if ($null -eq $row) {
-      if ([int]$target.Misses -lt 1) {
+      if ($null -ne $RejectedRooms -and $RejectedRooms.ContainsKey([string]$roomId)) {
+        # Row present but rejected this refresh: retain the last accepted
+        # config for one successful refresh, then drop (D5).
+        if ([int]$target.Invalid -lt 1) {
+          $updated[$roomId] = New-Q2DzTarget $target.RoomId $target.Config 0 $target.MapName ([int]$target.Invalid + 1)
+        } else {
+          [void]$drops.Add([string]$roomId)
+        }
+      } elseif ([int]$target.Misses -lt 1) {
         $updated[$roomId] = New-Q2DzTarget $target.RoomId $target.Config ([int]$target.Misses + 1) $target.MapName
       } else {
         [void]$drops.Add([string]$roomId)
@@ -832,13 +842,32 @@ function Write-Q2DzCatalogRowRejections {
   }
 }
 
-function Test-Q2DzEmptyRoomCatalog {
-  param($Value)
-  if ($null -eq $Value -or $null -eq $Value.PSObject -or
-      $Value.PSObject.Properties.Name -notcontains 'rooms' -or $Value.rooms -isnot [array]) {
-    return $false
+function Select-Q2DzSanitizedAliases {
+  param($LookupPayload)
+  # Lookup sanitation (D6), single pass (B3): a missing/non-array shape still
+  # fails the refresh; otherwise each entry either gets a CATALOG_ROW
+  # rejection diagnostic (unsafe format, or a duplicate of an earlier entry)
+  # or is appended to the sanitized list, never both.
+  if ($null -eq $LookupPayload -or $null -eq $LookupPayload.PSObject -or
+      $LookupPayload.PSObject.Properties.Name -notcontains 'aliases' -or
+      $LookupPayload.aliases -isnot [array]) {
+    throw 'alias lookup has an invalid schema'
   }
-  return @($Value.rooms).Count -eq 0
+  $seen = New-Q2DzTargetMap
+  $sanitized = [System.Collections.Generic.List[string]]::new()
+  $index = -1
+  foreach ($alias in @($LookupPayload.aliases)) {
+    $index++
+    if (-not (Test-Q2DzSafeToken $alias)) {
+      Write-Q2DzCatalogEvent ('CATALOG_ROW result=rejected kind=alias index={0} reason=format' -f $index)
+    } elseif ($seen.ContainsKey([string]$alias)) {
+      Write-Q2DzCatalogEvent ('CATALOG_ROW result=rejected kind=alias index={0} reason=duplicate' -f $index)
+    } else {
+      $seen[[string]$alias] = $true
+      $sanitized.Add([string]$alias)
+    }
+  }
+  return [string[]]$sanitized
 }
 
 function Get-Q2DzJoinableRooms {
