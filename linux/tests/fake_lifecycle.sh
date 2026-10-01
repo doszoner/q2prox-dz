@@ -333,6 +333,20 @@ start_case() {
   done
   [ -f "$CASE/mark.q2-source-empty" ]
   [ "$(<"$CASE/mark.q2-source-empty")" = 1 ]
+  expect_event 'SESSION start build=[A-Za-z0-9._-]+ session=[0-9a-f]{32} instance=[0-9]+ gateway_restarts=0$'
+}
+
+# Coordinator SESSION/TARGET/GATEWAY events land on the merged child output.
+# The fake's marker file is written before the coordinator consumes the event,
+# so the grep is retried until the event is drained.
+expect_event() {
+  for _ in $(seq 1 240); do
+    grep -Eq "$1" "$CASE/output" && return 0
+    sleep 0.025
+  done
+  echo "missing event in $CASE: $1" >&2
+  cat "$CASE/output" >&2
+  return 1
 }
 
 stop_case() {
@@ -344,6 +358,7 @@ stop_case() {
   set -e
   exec {WRITER}>&-
   [ "$rc" -eq "$expected" ]
+  expect_event 'SESSION stop reason=[A-Za-z0-9._-]+ rc=143$'
   ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
   ! find "$CASE" -type f -exec grep -q -F 'q2dz-secret-canary' {} +
 }
@@ -374,6 +389,7 @@ expect_protocol_failure() {
   local rc=$?
   set -e
   [ "$rc" -eq 65 ]
+  expect_event 'SESSION stop reason=[A-Za-z0-9._-]+ rc=65$'
   if [ -n "$expected_message" ]; then
     grep -Fq "$expected_message" "$CASE/output"
   fi
@@ -401,6 +417,8 @@ target = payload['targets'][0]
 assert target['room'] == 'room-a' and target['kind'] == 'q2'
 assert target['target'].isdigit() and target['endpoint'].startswith('127.0.0.1:')
 PY
+expect_event 'TARGET room=room-a id=1 state=pending reason=none recovery=0 retry=none published_ready=0$'
+expect_event 'TARGET room=room-a id=1 state=ready reason=none recovery=0 retry=none published_ready=1$'
 shared_pid=$(<"$CASE/mark.shared-pid")
 send_room room-a
 sleep 0.1
@@ -545,6 +563,7 @@ PY
 wait_file "$CASE/mark.shared-drops"
 wait_source_count 1
 wait_rooms_count 1
+expect_event 'TARGET room=room-a id=1 state=terminal reason=ready_timeout recovery=1 retry=none'
 stop_case
 
 # A timeout may produce a late READY for the tombstoned target; it must not
@@ -572,6 +591,10 @@ for terminal in target-closed target-failed; do
   send_room room-a
   send_room room-b
   wait_source_count 1
+  terminal_reason=test_closed
+  terminal_retry=none
+  [ "$terminal" = target-failed ] && { terminal_reason=test_failure; terminal_retry=immediate; }
+  expect_event "TARGET room=room-a id=1 state=terminal reason=$terminal_reason .* retry=$terminal_retry"
   kill -0 "$OWNER"
   stop_case
 done
@@ -582,15 +605,23 @@ start_case bounded-q2 'room-a=target-failed'
 send_ice
 send_room room-a
 wait_file "$CASE/mark.shared-failed"
+expect_event 'TARGET room=room-a id=1 state=terminal reason=test_failure recovery=0 retry=immediate'
 [ "$(<"$CASE/mark.shared-puts")" = 1 ]
 sleep 0.2
 send_room room-a
 for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ] && break; sleep 0.025; done
 [ "$(wc -l <"$CASE/mark.shared-failed")" -ge 2 ]
 [ "$(tr '\n' ' ' <"$CASE/mark.shared-failed")" = "1 2 " ]
+expect_event 'TARGET room=room-a id=2 state=terminal reason=test_failure recovery=1 retry=none'
 send_room room-a
 sleep 0.2
 [ "$(<"$CASE/mark.shared-puts")" = 2 ]
+# The exhausted tombstone logs the stuck PUT again instead of staying silent.
+for _ in $(seq 1 240); do
+  [ "$(grep -c 'TARGET room=room-a id=2 state=terminal' "$CASE/output")" -ge 2 ] && break
+  sleep 0.025
+done
+[ "$(grep -c 'TARGET room=room-a id=2 state=terminal' "$CASE/output")" -ge 2 ]
 stop_case
 
 start_case bounded-q2ded 'room.q2ded.server=target-failed'
@@ -624,9 +655,15 @@ send_room room.q2ded.server
 for _ in $(seq 1 120); do [ "$(wc -l <"$CASE/mark.shared-closed")" -ge 3 ] && break; sleep 0.025; done
 [ "$(wc -l <"$CASE/mark.shared-closed")" -ge 3 ]
 [ "$(tr '\n' ' ' <"$CASE/mark.shared-closed")" = "1 2 3 " ]
+expect_event 'TARGET room=room.q2ded.server id=3 state=terminal reason=test_closed recovery=2 retry=none'
 send_room room.q2ded.server
 sleep 0.2
 [ "$(<"$CASE/mark.shared-puts")" = 3 ]
+for _ in $(seq 1 240); do
+  [ "$(grep -c 'TARGET room=room.q2ded.server id=3 state=terminal' "$CASE/output")" -ge 2 ] && break
+  sleep 0.025
+done
+[ "$(grep -c 'TARGET room=room.q2ded.server id=3 state=terminal' "$CASE/output")" -ge 2 ]
 stop_case
 
 # READY may arrive in a different order than PUT; source publication remains
@@ -649,6 +686,8 @@ wait_source_count 1
 [ "$(<"$CASE/mark.shared-puts")" = 1 ]
 for _ in $(seq 1 120); do [ "$(<"$CASE/mark.shared-attempts")" -ge 2 ] && break; sleep 0.025; done
 [ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+expect_event 'GATEWAY event=stop reason=gateway-control-eof restarts=0$'
+expect_event 'GATEWAY event=restart reason=none restarts=1$'
 wait_source_count 0
 [ "$(<"$CASE/mark.shared-puts")" = 1 ]
 send_ice
@@ -812,6 +851,7 @@ send_ice
 send_room room-b
 sleep 0.2
 [ "$(<"$CASE/mark.shared-attempts")" = 2 ]
+expect_event 'GATEWAY event=fatal reason=transport_disabled restarts=1$'
 kill -0 "$(<"$CASE/mark.q2-pid")"
 stop_case
 
@@ -824,6 +864,7 @@ rc=$?
 set -e
 exec {WRITER}>&-
 [ "$rc" -eq 0 ]
+expect_event 'SESSION stop reason=q2-normal-exit rc=0$'
 ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
 ! kill -0 "$q2_exit_shared_pid" 2>/dev/null
 
@@ -849,6 +890,79 @@ done
 ! find "$CASE/runtime" -maxdepth 1 -type d -name 'session-*' | grep -q .
 ! kill -0 "$q2_pid" 2>/dev/null
 ! kill -0 "$shared_pid" 2>/dev/null
+
+# A gateway FATAL event whose stage/code contains a sensitivity-filter
+# substring (e.g. "ice", as managed_gateway_main.cpp's
+# emit_fatal("ice", "memfd-failed", 70) does) must be mapped to a safe code
+# before it reaches GATEWAY/TARGET logging, not leak the raw substring and
+# not get the whole line suppressed as a CHILD line (A7).
+cat >"$TMP/fake_fatal_gateway.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stdin.readline()
+sys.stdout.write("Q2DZ/1 FATAL stage=ice code=memfd-failed\n")
+sys.stdout.flush()
+sys.stdin.read()
+PY
+chmod +x "$TMP/fake_fatal_gateway.py"
+FATAL_CASE="$TMP/fatal-ice"
+mkdir -p "$FATAL_CASE"
+mkfifo "$FATAL_CASE/control"
+Q2DZ_TEST_MARKER="$FATAL_CASE/mark" Q2DZ_FAKE_LEGACY_MODE=normal \
+  Q2DZ_FAKE_Q2_MODE=sleep Q2DZ_SYNTHETIC_CREDENTIAL='q2dz-secret-canary' \
+  "$SESSION" --gateway "$TMP/fake_fatal_gateway.py" --legacy-gateway "$HERE/fake_legacy.py" \
+    --adapter "$ADAPTER" --q2 "$HERE/fake_q2.py" --wine "$HERE/fake_wine.sh" \
+    --game 3zb2 --runtime-base "$FATAL_CASE/runtime" --ready-timeout-ms 1200 \
+    --shutdown-grace-ms 300 <"$FATAL_CASE/control" >"$FATAL_CASE/output" 2>&1 &
+FATAL_OWNER=$!
+exec {FATAL_WRITER}>"$FATAL_CASE/control"
+printf '%s\n' 'Q2DZ/ROOMS/2 ICE generation=1 json=[{"urls":["stun:example.invalid"]}]' >&$FATAL_WRITER
+for _ in $(seq 1 240); do
+  grep -Eq 'GATEWAY event=fatal' "$FATAL_CASE/output" && break
+  sleep 0.025
+done
+grep -Eq 'GATEWAY event=fatal reason=transport_startup_failed restarts=0' "$FATAL_CASE/output" \
+  || { echo "fatal-ice: safe-mapped GATEWAY line missing" >&2; cat "$FATAL_CASE/output" >&2; exit 1; }
+grep -q 'memfd-failed' "$FATAL_CASE/output" && { echo "fatal-ice: raw code leaked" >&2; cat "$FATAL_CASE/output" >&2; exit 1; }
+grep -Eq '(^|[^A-Za-z])ice([^A-Za-z]|$)' "$FATAL_CASE/output" && { echo "fatal-ice: raw ice substring leaked" >&2; cat "$FATAL_CASE/output" >&2; exit 1; }
+exec {FATAL_WRITER}>&-
+kill "$FATAL_OWNER" 2>/dev/null || true
+wait "$FATAL_OWNER" 2>/dev/null || true
+
+# Same as above, but with a code the mapper previously omitted
+# (local-description/remote-description/session-description/aliaserror):
+# must still be mapped to a safe code, not leak the raw substring.
+cat >"$TMP/fake_fatal_gateway_omitted.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stdin.readline()
+sys.stdout.write("Q2DZ/1 FATAL stage=local-description code=local-description\n")
+sys.stdout.flush()
+sys.stdin.read()
+PY
+chmod +x "$TMP/fake_fatal_gateway_omitted.py"
+FATAL_OMITTED_CASE="$TMP/fatal-local-description"
+mkdir -p "$FATAL_OMITTED_CASE"
+mkfifo "$FATAL_OMITTED_CASE/control"
+Q2DZ_TEST_MARKER="$FATAL_OMITTED_CASE/mark" Q2DZ_FAKE_LEGACY_MODE=normal \
+  Q2DZ_FAKE_Q2_MODE=sleep Q2DZ_SYNTHETIC_CREDENTIAL='q2dz-secret-canary' \
+  "$SESSION" --gateway "$TMP/fake_fatal_gateway_omitted.py" --legacy-gateway "$HERE/fake_legacy.py" \
+    --adapter "$ADAPTER" --q2 "$HERE/fake_q2.py" --wine "$HERE/fake_wine.sh" \
+    --game 3zb2 --runtime-base "$FATAL_OMITTED_CASE/runtime" --ready-timeout-ms 1200 \
+    --shutdown-grace-ms 300 <"$FATAL_OMITTED_CASE/control" >"$FATAL_OMITTED_CASE/output" 2>&1 &
+FATAL_OMITTED_OWNER=$!
+exec {FATAL_OMITTED_WRITER}>"$FATAL_OMITTED_CASE/control"
+printf '%s\n' 'Q2DZ/ROOMS/2 ICE generation=1 json=[{"urls":["stun:example.invalid"]}]' >&$FATAL_OMITTED_WRITER
+for _ in $(seq 1 240); do
+  grep -Eq 'GATEWAY event=fatal' "$FATAL_OMITTED_CASE/output" && break
+  sleep 0.025
+done
+grep -Eq 'GATEWAY event=fatal reason=transport_reason_redacted restarts=0' "$FATAL_OMITTED_CASE/output" \
+  || { echo "fatal-local-description: safe-mapped GATEWAY line missing" >&2; cat "$FATAL_OMITTED_CASE/output" >&2; exit 1; }
+grep -q 'local-description' "$FATAL_OMITTED_CASE/output" && { echo "fatal-local-description: raw code leaked" >&2; cat "$FATAL_OMITTED_CASE/output" >&2; exit 1; }
+exec {FATAL_OMITTED_WRITER}>&-
+kill "$FATAL_OMITTED_OWNER" 2>/dev/null || true
+wait "$FATAL_OMITTED_OWNER" 2>/dev/null || true
 
 # Control framing remains fail-closed.
 start_case malformed

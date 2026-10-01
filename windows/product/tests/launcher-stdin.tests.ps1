@@ -170,8 +170,199 @@ $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -Coordinato
   -Refresh { return $plan } -PollIntervalSeconds 0
 Assert ($result -eq 74) 'broken stdin returns coordinator exit code'
 
+# A real child whose stderr exceeds the pipe buffer must not stall the hub,
+# and lines written right before exit must still reach the session log.
+$pwshExe = (Get-Process -Id $PID).Path
+$stderrFlood = @'
+$line = 'x' * 96
+foreach ($n in 1..4000) { [Console]::Error.WriteLine('flood-' + $n.ToString('D4') + '-' + $line) }
+[Console]::Error.WriteLine('TARGET room=room.q2ded.1 id=7 state=terminal reason=transport_failed recovery=3 retry=none published_ready=2')
+[Console]::Error.WriteLine('credential=CANARY1')
+[Console]::Error.WriteLine('a=candidate:CANARY2')
+[Console]::Error.WriteLine('turn:CANARY3@host')
+[Console]::Error.WriteLine('GATEWAY stats timerTicks=1 udpFromQ2Datagrams=0')
+[Console]::Error.WriteLine('final-marker before exit')
+exit 0
+'@
+$floodState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+$stderrCapture = [IO.StringWriter]::new()
+$previousError = [Console]::Error
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $floodState
+  [Console]::SetError($stderrCapture)
+  $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+    -CoordinatorArguments @() -StartCoordinator {
+      param($path,$args)
+      Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$stderrFlood)
+    } -Refresh { return $plan } -PollIntervalSeconds 0
+} finally {
+  [Console]::SetError($previousError)
+}
+Assert ($result -eq 0) 'child exit code survives the stderr drain'
+$floodLogPath = Join-Path $floodState 'logs\q2dz.log'
+Assert (Test-Path -LiteralPath $floodLogPath) 'session log file is written'
+$floodLog = Get-Content -LiteralPath $floodLogPath -Raw
+Assert ($floodLog -match '(?m)COORDINATOR TARGET room=room\.q2ded\.1 id=7 state=terminal reason=transport_failed recovery=3 retry=none published_ready=2\r?$') 'legitimate TARGET event passes the drain unchanged'
+Assert ($floodLog -match '(?m)GATEWAY stats timerTicks=1 udpFromQ2Datagrams=0\r?$') 'gateway self-report event passes verbatim'
+Assert (($floodLog -split "`n" | Where-Object { $_ -match 'CHILD suppressed=1' }).Count -eq 3) 'all three canary lines are suppressed'
+Assert ($floodLog -match '(?m)CHILD line=flood-0001-') 'first flooded line reached the file'
+Assert ($floodLog -match '(?m)CHILD line=flood-4000-') 'last flooded line reached the file'
+Assert ($floodLog -match '(?m)CHILD line=final-marker before exit\r?$') 'last lines before child exit are drained'
+Assert ($floodLog.IndexOf('flood-0001') -lt $floodLog.IndexOf('flood-4000')) 'stderr lines keep their order'
+Assert (-not $floodLog.Contains('CANARY')) 'no canary reaches the session log'
+$launcherStderr = $stderrCapture.ToString()
+Assert (-not $launcherStderr.Contains('CANARY')) 'no canary reaches launcher stderr'
+$stderrCapture.Dispose()
+Remove-Item -LiteralPath $floodState -Recurse -Force -ErrorAction SilentlyContinue
+
+# Rotation while a child is logging keeps the canary out of both files.
+$rotateScript = @'
+foreach ($n in 1..80) { [Console]::Error.WriteLine('credential=CANARY1 line=' + $n.ToString('D4') + '-' + ('x' * 96)) }
+[Console]::Error.WriteLine('rotation-marker-end')
+exit 0
+'@
+$rotateState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $rotateState
+  $previousMax = $Q2DZ_LOG_MAX_BYTES
+  try {
+    $Q2DZ_LOG_MAX_BYTES = 2048
+    $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+      -CoordinatorArguments @() -StartCoordinator {
+        param($path,$args)
+        Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$rotateScript)
+      } -Refresh { return $plan } -PollIntervalSeconds 0
+    Assert ($result -eq 0) 'rotation run keeps the child exit code'
+  } finally {
+    $Q2DZ_LOG_MAX_BYTES = $previousMax
+  }
+  $rotatedLogPath = Join-Path $rotateState 'logs\q2dz.1.log'
+  Assert (Test-Path -LiteralPath $rotatedLogPath) 'rotated log file exists after the bound'
+  Assert (-not (Get-Content -LiteralPath $rotatedLogPath -Raw).Contains('CANARY')) 'rotated log has no canary'
+  Assert (-not (Get-Content -LiteralPath (Join-Path $rotateState 'logs\q2dz.log') -Raw).Contains('CANARY')) 'live log has no canary'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $rotateState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# A room id containing a filter substring ("nice" contains "ice") must still
+# pass the drain unchanged when the whole line matches the event grammar;
+# the same substring outside the grammar is still suppressed (canary).
+$niceScript = @'
+[Console]::Error.WriteLine('TARGET room=room.q2ded.nice id=1 state=ready reason=none recovery=0 retry=none published_ready=1')
+[Console]::Error.WriteLine('a=candidate:deadbeef nice')
+exit 0
+'@
+$niceState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $niceState
+  $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+    -CoordinatorArguments @() -StartCoordinator {
+      param($path,$args)
+      Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$niceScript)
+    } -Refresh { return $plan } -PollIntervalSeconds 0
+  Assert ($result -eq 0) 'nice-room run keeps the child exit code'
+  $niceLog = Get-Content -LiteralPath (Join-Path $niceState 'logs\q2dz.log') -Raw
+  Assert ($niceLog -match '(?m)COORDINATOR TARGET room=room\.q2ded\.nice id=1 state=ready reason=none recovery=0 retry=none published_ready=1\r?$') 'room id with a filter substring passes the grammar unchanged'
+  Assert ($niceLog -match '(?m)CHILD suppressed=1') 'the canary outside the grammar is still suppressed'
+  Assert (-not $niceLog.Contains('a=candidate:deadbeef nice')) 'the canary text never reaches the log'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $niceState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# A child-stderr line that merely looks like "COMPONENT EVENT key=value" with
+# a disallowed/sensitive field must not pass through unfiltered (pass-through
+# leak canaries).
+$leakScript = @'
+[Console]::Error.WriteLine('COORDINATOR TARGET credential=CANARY')
+[Console]::Error.WriteLine('GATEWAY error password=CANARY')
+[Console]::Error.WriteLine('TARGET room=room.q2ded.1 id=7 state=terminal reason=credentialCANARY recovery=3 retry=none published_ready=2')
+exit 0
+'@
+$leakState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $leakState
+  $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+    -CoordinatorArguments @() -StartCoordinator {
+      param($path,$args)
+      Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$leakScript)
+    } -Refresh { return $plan } -PollIntervalSeconds 0
+  Assert ($result -eq 0) 'leak-probe run keeps the child exit code'
+  $leakLog = Get-Content -LiteralPath (Join-Path $leakState 'logs\q2dz.log') -Raw
+  Assert (-not $leakLog.Contains('CANARY')) 'event-shaped lines with a secret field never reach the log'
+  Assert (([regex]::Matches($leakLog, 'CHILD suppressed=1')).Count -eq 3) 'all three leak probes are suppressed'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $leakState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# A sensitive marker that only survives past the 2048-char truncation point
+# must still be suppressed: the sensitivity check must run on the full line,
+# not the truncated-for-display prefix.
+$truncScript = @'
+[Console]::Error.WriteLine('CANARY' + ('x' * 2048) + ' credential=hidden')
+exit 0
+'@
+$truncState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $truncState
+  $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+    -CoordinatorArguments @() -StartCoordinator {
+      param($path,$args)
+      Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$truncScript)
+    } -Refresh { return $plan } -PollIntervalSeconds 0
+  Assert ($result -eq 0) 'truncation-boundary run keeps the child exit code'
+  $truncLog = Get-Content -LiteralPath (Join-Path $truncState 'logs\q2dz.log') -Raw
+  Assert ($truncLog -match '(?m)CHILD suppressed=1') 'sensitive marker past the truncation point is still suppressed'
+  Assert (-not $truncLog.Contains('credential=hidden')) 'the sensitive suffix never reaches the log'
+  Assert (-not $truncLog.Contains('CHILD line=CANARY')) 'the line is not logged unsuppressed as a CHILD line'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $truncState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Truncating-before-recognition must not let a long line dodge the event
+# grammar check: if the sensitive field only appears past the 2048-char
+# cutoff, the line must still be recognised against its full text and
+# suppressed, not accepted as a well-formed TARGET event with a canary room=.
+$gateScript = @'
+[Console]::Error.WriteLine('TARGET room=CANARY ' + (('id=1 ' * 406).Trim()) + ' credential=hidden')
+exit 0
+'@
+$gateState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $gateState
+  $result = Invoke-Q2DzHub -InitialTargets $plan -Q2Path 'Q2PRO-X.exe' -CoordinatorPath 'q2dz-session.exe' `
+    -CoordinatorArguments @() -StartCoordinator {
+      param($path,$args)
+      Start-Q2DzCoordinator -Path $pwshExe -Arguments @('-NoProfile','-Command',$gateScript)
+    } -Refresh { return $plan } -PollIntervalSeconds 0
+  Assert ($result -eq 0) 'gate-truncation run keeps the child exit code'
+  $gateLog = Get-Content -LiteralPath (Join-Path $gateState 'logs\q2dz.log') -Raw
+  Assert ($gateLog -match '(?m)CHILD suppressed=1') 'gate truncation bypass line is suppressed'
+  Assert (-not $gateLog.Contains('CANARY')) 'the canary room id never reaches the log'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $gateState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# A real GATEWAY stop record (all actual fields the Windows gateway emits,
+# windows/gateway/src/main.cpp) must be parsed as a structured record and
+# must not degrade to the generic CHILD line= fallback, including the
+# invalid_cadence_drops field.
+$realGatewayStop = 'GATEWAY stop udp_to_web=1 web_to_udp=2 targets=3 max_udp_to_transport_datagram=4 ' +
+  'max_transport_to_udp_datagram=5 oversized_udp_drops=6 oversized_transport_drops=7 ' +
+  'unknown_peer_drops=8 second_source_drops=9 transport_not_ready_drops=10 invalid_cadence_drops=11'
+$gatewayStopResult = ConvertTo-Q2DzChildEvent $realGatewayStop
+Assert ($gatewayStopResult -eq $realGatewayStop) 'a real GATEWAY stop record (including invalid_cadence_drops) passes through unchanged, not degraded to CHILD line='
+Assert (-not $gatewayStopResult.StartsWith('LAUNCHER CHILD line=')) 'GATEWAY stop record is not degraded to CHILD line='
+
 $launcherText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\q2dz-launch.ps1') -Raw
 Assert ($launcherText.Contains('RedirectStandardInput')) 'launcher redirects coordinator stdin'
+Assert ($launcherText.Contains('RedirectStandardError')) 'launcher redirects coordinator stderr'
+Assert ($launcherText.Contains('StandardError.ReadLine')) 'launcher reads coordinator stderr asynchronously'
+Assert ($launcherText.Contains('ConcurrentQueue')) 'stderr readers only enqueue'
 Assert ($launcherText.Contains('StandardInput.BaseStream')) 'launcher writes coordinator stdin bytes'
 Assert ($launcherText.Contains('UTF8Encoding')) 'launcher uses explicit UTF-8 without BOM'
 Assert ($launcherText.Contains('HUB_POLL_SECONDS')) 'launcher has a bounded poll interval'
@@ -180,5 +371,41 @@ Assert ($launcherText.Contains('[Array]::Clear($bytes')) 'launcher clears encode
 Assert (-not $launcherText.Contains('Q2DZ_HUB_MAX_ROOMS')) 'launcher has no fixed-capacity constants'
 $legacyTargetType = 'Hub' + [char]83 + 'lot'
 Assert (-not $launcherText.Contains($legacyTargetType)) 'launcher has no legacy room model'
+
+# Start-Q2DzLauncher must emit exactly one SESSION stop when Invoke-Q2DzHub
+# throws after SESSION start (no enclosing finally previously existed).
+$excRoot = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-exc-' + [Guid]::NewGuid().ToString('N'))
+$excAppDir = Join-Path $excRoot 'app'
+$excGatewayDir = Join-Path $excAppDir 'gateway'
+New-Item -ItemType Directory -Force $excGatewayDir | Out-Null
+New-Item -ItemType File -Path (Join-Path $excAppDir 'q2dz-session.exe') | Out-Null
+New-Item -ItemType File -Path (Join-Path $excAppDir 'q2dz-content-check.exe') | Out-Null
+New-Item -ItemType File -Path (Join-Path $excGatewayDir 'q2-doszone-webview2-gateway.exe') | Out-Null
+$excLocalAppData = Join-Path $excRoot 'local'
+$excStateDir = Join-Path $excLocalAppData 'Q2PRO-X Dos.Zone\state'
+New-Item -ItemType Directory -Force $excStateDir | Out-Null
+$excFakeQ2 = Join-Path $excRoot 'Q2PRO-X.exe'
+New-Item -ItemType File -Path $excFakeQ2 | Out-Null
+Set-Content -LiteralPath (Join-Path $excStateDir 'q2-path.txt') -Value $excFakeQ2 -Encoding UTF8
+
+$previousApp = $app
+$previousLocalAppData = $env:LOCALAPPDATA
+function Get-Q2DzLiveTargets { throw 'test: skip live targets' }
+function Invoke-Q2DzHub { throw 'test: boom after SESSION start' }
+try {
+  $app = $excAppDir
+  $env:LOCALAPPDATA = $excLocalAppData
+  $threw = $false
+  try { Start-Q2DzLauncher | Out-Null } catch { $threw = $true }
+  Assert $threw 'Start-Q2DzLauncher propagates the post-start exception'
+  $excLog = Get-Content -LiteralPath (Join-Path $excStateDir 'logs\q2dz.log') -Raw
+  Assert (([regex]::Matches($excLog, 'SESSION stop ')).Count -eq 1) 'exactly one SESSION stop is emitted after a post-start exception'
+  Assert ($excLog -match 'LAUNCHER SESSION stop reason=error rc=1') 'the guarded stop uses a safe reason code and rc'
+} finally {
+  $app = $previousApp
+  $env:LOCALAPPDATA = $previousLocalAppData
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $excRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host 'launcher stdin contract: PASS (dynamic heartbeat, UTF-8, EOF and exit codes)'

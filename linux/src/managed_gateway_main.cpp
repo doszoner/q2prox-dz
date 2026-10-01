@@ -489,7 +489,7 @@ int main(int argc, char** argv) {
         }
     }
     terminate_and_reap(*child);
-    std::cerr << "GATEWAY_STOP max_udp_to_transport_datagram=" << max_udp_to_transport_datagram
+    std::cerr << "GATEWAY stop max_udp_to_transport_datagram=" << max_udp_to_transport_datagram
               << " max_transport_to_udp_datagram=" << max_transport_to_udp_datagram
               << " oversized_udp_drops=" << oversized_udp_drops
               << " oversized_transport_drops=" << oversized_transport_drops << "\n";

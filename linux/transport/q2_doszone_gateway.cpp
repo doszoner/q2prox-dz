@@ -897,8 +897,7 @@ int main(int argc, char** argv) {
         if (options.legacy_arguments) return run_legacy_gateway(options);
         return Gateway(options).run();
     } catch (const std::exception& error) {
-        const std::string safe = q2dz::sanitize_log_line(error.what());
-        std::cerr << "GATEWAY_ERROR " << safe << '\n';
+        std::cerr << "GATEWAY_ERROR category=" << gateway_error_category(error.what()) << '\n';
         return gateway_error_exit_code(error.what());
     }
 }

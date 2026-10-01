@@ -58,6 +58,9 @@ foreach(target q2dz-session q2dz-managed-gateway q2dz-content-check)
   )
 endforeach()
 
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" Q2DZ_VERSION)
+string(STRIP "${Q2DZ_VERSION}" Q2DZ_VERSION)
+target_compile_definitions(q2dz-session PRIVATE Q2DZ_BUILD_VERSION="${Q2DZ_VERSION}")
 target_sources(q2dz-session PRIVATE src/session_main.cpp)
 target_sources(q2dz-managed-gateway PRIVATE src/managed_gateway_main.cpp)
 target_sources(q2dz-content-check PRIVATE src/content_check_main.cpp)
@@ -164,6 +167,8 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify-legacy-contract.py
               --gateway $<TARGET_FILE:q2dz-webrtc-gateway>
               --adapter ${CMAKE_CURRENT_SOURCE_DIR}/config/legacy-gateway.json)
+    set_tests_properties(launcher PROPERTIES
+      ENVIRONMENT "Q2DZ_GATEWAY_BINARY=$<TARGET_FILE:q2dz-webrtc-gateway>")
     add_test(NAME direct-gateway-hub
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_direct_gateway.py
               $<TARGET_FILE:q2dz-webrtc-gateway>)

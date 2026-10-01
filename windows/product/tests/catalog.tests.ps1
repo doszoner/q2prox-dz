@@ -230,7 +230,11 @@ $cases = @(Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json)
 if ($cases.Count -eq 1 -and $cases[0] -is [array]) { $cases = @($cases[0]) }
 
 $scenarioNames = [System.Collections.Generic.List[string]]::new()
+$refreshFailures = [System.Collections.Generic.List[string]]::new()
 foreach ($case in $cases) {
+  if ($case.kind -eq 'refresh-scenario') {
+    continue
+  }
   if ($case.kind -eq 'heartbeat-scenario') {
     [void]$scenarioNames.Add([string]$case.name)
     $actual = Invoke-HeartbeatScenario $case
@@ -259,6 +263,9 @@ foreach ($case in $cases) {
   Assert-Equal ([bool]$case.valid) ([bool]$actual) "shared case $($case.name)"
 }
 Assert-Equal 11 $scenarioNames.Count 'Task 6 shared heartbeat cases are registered and executed'
+if ($refreshFailures.Count -gt 0) {
+  throw ("{0} refresh-scenario case(s) failed:`n{1}" -f $refreshFailures.Count, ($refreshFailures -join "`n"))
+}
 
 $mixedRows = New-TestRows 20 20
 $mixedLookup = New-TestLookup $mixedRows
@@ -484,12 +491,13 @@ foreach ($logCase in $logCases) {
     }
   } -RunContentCheck { param($path,$map,$root) return $true }
   Assert-Equal 1 $captured.Items.Count 'refresh diagnostics do not add success-pipeline items'
-  Assert-True ($captured.Log -match ('(?m)^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}\.\d+Z CATALOG_REFRESH result=ok stage=plan elapsed_ms=\d+ {0}\r?$' -f $logCase.Counts)) 'successful refresh logs stage and counts'
+  Assert-True ($captured.Log -match ('(?m)^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}\.\d+Z LAUNCHER CATALOG_REFRESH result=ok stage=plan error=none http=0 elapsed_ms=\d+ {0} puts=\d+\r?$' -f $logCase.Counts)) 'successful refresh logs stage and counts'
 }
 
 $logCurrent = New-Q2DzTargetMap
 $logCurrent['room.q2.old.1'] = New-Q2DzTarget 'room.q2.old.1' '{"roomId":"room.q2.old.1"}' 0 'q2dm1'
 foreach ($failure in @('lookup','checker')) {
+  $failureKind = 'other'
   $writer = [IO.StringWriter]::new()
   $previousError = [Console]::Error
   $caught = $false
@@ -521,7 +529,107 @@ foreach ($failure in @('lookup','checker')) {
   Assert-True (-not $failureLog.Contains('secret-marker')) "$failure diagnostics exclude exception text"
   $stage = if ($failure -eq 'lookup') { 'lookup' } else { 'plan' }
   $registered = if ($failure -eq 'lookup') { 0 } else { 2 }
-  Assert-True ($failureLog -match (('(?m)^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}\.\d+Z CATALOG_REFRESH result=error stage={0} elapsed_ms=\d+ previous=1 ready=2 registered={1} targets=1 drops=0\r?$' -f $stage,$registered))) "$failure failure logs safe stage and counts"
+  Assert-True ($failureLog -match (('(?m)^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}\.\d+Z LAUNCHER CATALOG_REFRESH result=error stage={0} error={1} http=0 elapsed_ms=\d+ previous=1 ready=2 registered={2} targets=1 drops=0 puts=0\r?$' -f $stage,$failureKind,$registered))) "$failure failure logs safe stage and counts"
+}
+
+# A non-success HTTP status is classified instead of being dropped silently.
+$httpWriter = [IO.StringWriter]::new()
+$previousError = [Console]::Error
+$httpCaught = $false
+try {
+  [Console]::SetError($httpWriter)
+  Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+    -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+      param($endpoint)
+      $statusError = [Exception]::new('Dos.Zone endpoint returned a non-success status')
+      $statusError.Data['q2dz.http'] = 503
+      throw $statusError
+    } -RunContentCheck { param($path,$map,$root) return $true } | Out-Null
+} catch {
+  $httpCaught = $true
+} finally {
+  [Console]::SetError($previousError)
+  $httpLog = $httpWriter.ToString()
+  $httpWriter.Dispose()
+}
+Assert-True $httpCaught 'HTTP failure still propagates'
+Assert-True ($httpLog -match '(?m)LAUNCHER CATALOG_REFRESH result=error stage=catalog error=http http=503 ') 'HTTP 503 is logged with its status'
+
+# A catalog whose rooms field is not an array is a schema failure.
+$shapeWriter = [IO.StringWriter]::new()
+$previousError = [Console]::Error
+$shapeCaught = $false
+try {
+  [Console]::SetError($shapeWriter)
+  Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+    -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+      param($endpoint) return [pscustomobject]@{ rooms = 'oops' }
+    } -RunContentCheck { param($path,$map,$root) return $true } | Out-Null
+} catch {
+  $shapeCaught = $true
+} finally {
+  [Console]::SetError($previousError)
+  $shapeLog = $shapeWriter.ToString()
+  $shapeWriter.Dispose()
+}
+Assert-True $shapeCaught 'non-array rooms still fails the refresh'
+Assert-True ($shapeLog -match '(?m)LAUNCHER CATALOG_REFRESH result=error stage=catalog error=schema ') 'rooms-not-array is a schema failure'
+
+# The launcher-owned session log rotates at the size bound on the live file.
+$logState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  Initialize-Q2DzSessionLog -StateDirectory $logState
+  $logPath = Join-Path $logState 'logs\q2dz.log'
+  Assert-True (Test-Path -LiteralPath $logPath) 'session log file is created'
+  $previousMax = $Q2DZ_LOG_MAX_BYTES
+  try {
+    $Q2DZ_LOG_MAX_BYTES = 1024
+    foreach ($number in 1..60) {
+      Write-Q2DzCatalogEvent ('HEARTBEAT generation={0} puts=1 drops=0' -f $number)
+    }
+  } finally {
+    $Q2DZ_LOG_MAX_BYTES = $previousMax
+  }
+  $rotatedPath = Join-Path $logState 'logs\q2dz.1.log'
+  Assert-True (Test-Path -LiteralPath $rotatedPath) 'session log rotates at the size bound'
+  Assert-True ((Get-Item -LiteralPath $logPath).Length -gt 0) 'live log keeps writing after rotation'
+  Assert-True ((Get-Content -LiteralPath $logPath -Raw) -match 'LAUNCHER HEARTBEAT generation=60') 'newest event lands in the live log'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $logState 'logs\q2dz.2.log'))) 'rotation keeps exactly two files'
+  Assert-True (-not ((Get-Content -LiteralPath $rotatedPath -Raw).Contains('CANARY'))) 'rotated log holds no secret material'
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $logState -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# An unwritable log directory falls back to stderr and never aborts refresh.
+$blockedState = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-log-' + [Guid]::NewGuid().ToString('N'))
+try {
+  New-Item -ItemType Directory -Force -Path $blockedState | Out-Null
+  New-Item -ItemType File -Path (Join-Path $blockedState 'logs') | Out-Null
+  Initialize-Q2DzSessionLog -StateDirectory $blockedState
+  $fallbackWriter = [IO.StringWriter]::new()
+  $previousError = [Console]::Error
+  try {
+    [Console]::SetError($fallbackWriter)
+    $fallbackPlan = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'C:\Games\Q2PRO-X.exe' `
+      -ContentCheckPath 'q2dz-content-check.exe' -FetchJson {
+        param($endpoint)
+        switch ($endpoint) {
+          $Q2DZ_ROOM_ENDPOINT { return [pscustomobject]@{ rooms = $logRows } }
+          $Q2DZ_LOOKUP_ENDPOINT { return (New-TestLookup $logRows) }
+          $Q2DZ_RTC_ENDPOINT { return (New-TestRtc) }
+          default { throw "unexpected endpoint $endpoint" }
+        }
+      } -RunContentCheck { param($path,$map,$root) return $true }
+    Assert-Equal 2 $fallbackPlan.Targets.Count 'refresh still completes when the log is unwritable'
+    Assert-True ($fallbackWriter.ToString() -match 'LAUNCHER CATALOG_REFRESH result=ok') 'events fall back to stderr on log failure'
+  } finally {
+    [Console]::SetError($previousError)
+    $fallbackWriter.Dispose()
+  }
+} finally {
+  Close-Q2DzSessionLog
+  Remove-Item -LiteralPath $blockedState -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $launcherText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\q2dz-launch.ps1') -Raw

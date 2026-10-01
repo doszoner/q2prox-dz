@@ -46,6 +46,66 @@ constexpr int kCleanupFailure = 14;
 constexpr int kQ2Failure = 74;
 constexpr std::size_t kHubCommandsPerCycle = 32;
 
+#ifndef Q2DZ_BUILD_VERSION
+#define Q2DZ_BUILD_VERSION "dev"
+#endif
+
+// Sole stderr sink: allow-listed SESSION/TARGET/GATEWAY events (tagged COORDINATOR by the launcher)
+// and other diagnostics (landing as CHILD lines) share this one writer.
+void emit_event(std::string_view line) {
+    std::cerr << line << '\n';
+}
+
+// Generic allow-listed values are bounded to 64 chars (D11 grammar); room= is
+// the correlation key and the validator already bounds it to 255, so a
+// room-id call site passes max_len=255 explicitly instead of truncating
+// further here (B2).
+std::string log_value(std::string_view value, std::size_t max_len = 64) {
+    std::string out;
+    out.reserve(std::min<std::size_t>(value.size(), max_len));
+    for (const char c : value) {
+        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                          c == ':' || c == '-';
+        out.push_back(safe ? c : '_');
+        if (out.size() >= max_len) break;
+    }
+    return out.empty() ? std::string("none") : out;
+}
+
+// Reason codes crossing from the gateway's transport/WebRTC layer
+// (windows/gateway/assets/transport.html's `stableError`) carry tokens such
+// as "ice" that the launcher's secret filter also matches on non-grammar
+// lines; map the known codes to safe equivalents before they reach stderr so
+// the event never depends on the launcher recognising its own grammar.
+std::string safe_gateway_reason(std::string_view reason) {
+    static const std::unordered_map<std::string_view, std::string_view> kKnownCodes = {
+        {"ice_configuration_failed", "transport_config_failed"},
+        {"ice_configuration_too_large", "transport_config_oversized"},
+        {"ice_required_before_put", "transport_config_missing"},
+        {"invalid_ice_generation", "transport_config_invalid"},
+        {"invalid_ice_server", "transport_config_invalid"},
+        {"invalid_ice_servers", "transport_config_invalid"},
+        {"transport_configure_ice_failed", "transport_startup_failed"},
+        {"startup_configure_ice_failed", "transport_startup_failed"},
+    };
+    const auto found = kKnownCodes.find(reason);
+    if (found != kKnownCodes.end()) return std::string(found->second);
+    std::string lowered(reason);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static constexpr std::array<std::string_view, 17> kFilteredTokens = {
+        "credential", "password", "secret", "token", "authorization", "ice",
+        "candidate", "sdp", "turn:", "turns:", "username", "fingerprint",
+        "peer", "local-description", "remote-description", "session-description",
+        "aliaserror",
+    };
+    for (const auto token : kFilteredTokens) {
+        if (lowered.find(token) != std::string::npos) return "transport_reason_redacted";
+    }
+    return std::string(reason);
+}
+
 Handle g_stop_event;
 
 BOOL WINAPI ctrl_handler(DWORD type) {
@@ -263,7 +323,7 @@ private:
         for (auto lines = framer_.drain(); !lines.empty(); lines.pop_front()) {
             auto parsed = parser_.parse(lines.front().view());
             if (!parsed.command) {
-                std::cerr << "q2dz-session: control protocol error: " << parsed.error << '\n';
+                emit_event("q2dz-session: control protocol error: " + parsed.error);
                 protocol_error_ = true;
                 clear_commands();
                 return;
@@ -871,6 +931,7 @@ struct LiveTarget {
     TargetState state = TargetState::pending;
     std::optional<q2dz::LoopbackEndpoint> endpoint;
     unsigned recovery_count = 0;
+    std::string terminal_reason;
     bool closed = false;
     bool retryable_failure = false;
     ULONGLONG ready_deadline = 0;
@@ -878,6 +939,41 @@ struct LiveTarget {
 
 using LiveTargets = std::unordered_map<std::string, LiveTarget>;
 using TargetRoutes = std::unordered_map<std::uint64_t, std::string>;
+
+std::size_t published_count(const LiveTargets& targets) {
+    std::size_t count = 0;
+    for (const auto& [room_id, target] : targets) {
+        (void)room_id;
+        if (target.state == TargetState::ready && target.endpoint) ++count;
+    }
+    return count;
+}
+
+std::string_view retry_decision(const LiveTarget& target) {
+    const bool dedicated = is_dedicated_room(target.room_id);
+    if ((target.closed && !dedicated) || !target.retryable_failure ||
+        target.recovery_count >= target_recovery_limit(target.room_id)) {
+        return "none";
+    }
+    return "immediate";
+}
+
+void emit_target(const LiveTarget& target, std::string_view state,
+                 std::string_view reason, std::string_view retry,
+                 std::size_t published_ready) {
+    emit_event("TARGET room=" + log_value(target.room_id, 255) +
+               " id=" + std::to_string(target.target_id) +
+               " state=" + std::string(state) + " reason=" + log_value(reason) +
+               " recovery=" + std::to_string(target.recovery_count) +
+               " retry=" + std::string(retry) +
+               " published_ready=" + std::to_string(published_ready));
+}
+
+void emit_gateway(std::string_view event, std::string_view reason, unsigned restarts) {
+    emit_event("GATEWAY event=" + std::string(event) +
+               " reason=" + log_value(reason) +
+               " restarts=" + std::to_string(restarts));
+}
 
 bool send_gateway_command(HubGateway& gateway, const q2dz::HubCommand& command) {
     std::string line = q2dz::format_hub_command(command);
@@ -929,17 +1025,31 @@ std::unique_ptr<HubGateway> start_shared_gateway(HANDLE root_job,
         auto event_pipe = q2dz::win::make_pipe(false, true);
         gateway->owner = q2dz::win::make_pipe(true, false);
         auto nullerr = q2dz::win::open_null(true);
+        // The gateway inherits the coordinator's stderr so its diagnostics
+        // reach the launcher's session log through the same drain.  The handle
+        // is duplicated as inheritable so UpdateProcThreadAttribute accepts it;
+        // when the coordinator itself has no stderr, fall back to NUL.
+        Handle shared_err;
+        const HANDLE current_err = GetStdHandle(STD_ERROR_HANDLE);
+        if (current_err != nullptr && current_err != INVALID_HANDLE_VALUE) {
+            HANDLE dup = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), current_err, GetCurrentProcess(),
+                                &dup, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+                shared_err.reset(dup);
+            }
+        }
+        const HANDLE err_handle = shared_err ? shared_err.get() : nullerr.get();
         const std::vector<std::wstring> arguments = {
             L"--managed-session", L"--udp-port", L"0", L"--owner-handle",
             std::to_wstring(reinterpret_cast<std::uintptr_t>(gateway->owner.read.get())),
             L"--user-data-dir", (gateway->directory / L"webview2").wstring()
         };
         const std::vector<HANDLE> inherited = {
-            input_pipe.read.get(), event_pipe.write.get(), gateway->owner.read.get(), nullerr.get()
+            input_pipe.read.get(), event_pipe.write.get(), gateway->owner.read.get(), err_handle
         };
         gateway->process = q2dz::win::launch_suspended(
             gateway_path, arguments, gateway_path.parent_path(), input_pipe.read.get(),
-            event_pipe.write.get(), nullerr.get(), inherited, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            event_pipe.write.get(), err_handle, inherited, CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         assign_job(root_job, gateway->process, L"gateway");
         assign_job(gateway->job.get(), gateway->process, L"gateway-shared");
         input_pipe.read.reset();
@@ -968,7 +1078,7 @@ void erase_target(LiveTargets& targets, TargetRoutes& routes, LiveTargets::itera
 }
 
 void terminal_target(LiveTarget& target, bool closed, CustomSource& source,
-                     const LiveTargets& targets) {
+                     const LiveTargets& targets, std::string_view reason) {
     const bool was_ready = target.state == TargetState::ready;
     target.state = TargetState::terminal;
     target.endpoint.reset();
@@ -977,7 +1087,10 @@ void terminal_target(LiveTarget& target, bool closed, CustomSource& source,
     if (target.retryable_failure && target.recovery_count < target_recovery_limit(target.room_id)) {
         ++target.recovery_count;
     }
+    target.terminal_reason = log_value(reason);
     publish_source(source, targets);
+    emit_target(target, "terminal", target.terminal_reason,
+                retry_decision(target), published_count(targets));
 }
 
 bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTargets& targets,
@@ -986,7 +1099,8 @@ bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTarge
         const auto parsed = gateway.event_parser.parse(line);
         secure_clear_string(line);
         if (!parsed.event) {
-            std::cerr << "q2dz-session: gateway event protocol error: " << parsed.error << '\n';
+            emit_gateway("fatal", "event_protocol", 0);
+            emit_event("q2dz-session: gateway event protocol error: " + parsed.error);
             return false;
         }
         const auto& event = *parsed.event;
@@ -994,8 +1108,9 @@ bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTarge
             const auto stage = event.fields.find("stage");
             const auto code = event.fields.find("code");
             if (stage == event.fields.end() || code == event.fields.end()) return false;
-            std::cerr << "q2dz-session: gateway fatal stage=" << stage->second
-                      << " code=" << code->second << '\n';
+            emit_gateway("fatal", safe_gateway_reason(code->second), 0);
+            emit_event("q2dz-session: gateway fatal stage=" + stage->second +
+                      " code=" + code->second);
             return false;
         }
         if (event.type == q2dz::ChildEventType::heartbeat) continue;
@@ -1019,14 +1134,25 @@ bool consume_gateway_events(HubGateway& gateway, CustomSource& source, LiveTarge
             target->second.endpoint = parsed_endpoint;
             target->second.state = TargetState::ready;
             publish_source(source, targets);
+            emit_target(target->second, "ready", "none", "none", published_count(targets));
         } else if (event.type == q2dz::ChildEventType::room_closed ||
                    event.type == q2dz::ChildEventType::target_failed) {
             if (target->second.state != TargetState::terminal) {
                 routes.erase(route);
+                const auto field = event.fields.find(
+                    event.type == q2dz::ChildEventType::room_closed ? "reason" : "code");
+                const std::string raw_reason =
+                    field != event.fields.end()
+                        ? field->second
+                        : (event.type == q2dz::ChildEventType::room_closed
+                               ? "room_closed"
+                               : "target_failed");
                 terminal_target(target->second,
-                                event.type == q2dz::ChildEventType::room_closed, source, targets);
+                                event.type == q2dz::ChildEventType::room_closed,
+                                source, targets, safe_gateway_reason(raw_reason));
             }
         } else {
+            emit_gateway("fatal", "event_unsupported", 0);
             return false;
         }
     }
@@ -1095,6 +1221,10 @@ bool process_room_command(q2dz::HubCommand& command, HubGateway* gateway, bool d
         if ((existing->second.closed && !is_dedicated_room(command.room_id)) ||
             !existing->second.retryable_failure ||
             existing->second.recovery_count >= target_recovery_limit(command.room_id)) {
+            // A PUT against an exhausted tombstone stays ignored; log it so a
+            // stuck room is attributable in the session log.
+            emit_target(existing->second, "terminal", existing->second.terminal_reason,
+                        "none", published_count(targets));
             command.clear();
             return true;
         }
@@ -1121,6 +1251,9 @@ bool process_room_command(q2dz::HubCommand& command, HubGateway* gateway, bool d
         const auto inserted = targets.find(room_id);
         if (inserted != targets.end()) erase_target(targets, routes, inserted);
         publish_source(source, targets);
+    } else if (const auto inserted = targets.find(room_id); inserted != targets.end()) {
+        emit_target(inserted->second, "pending", "none",
+                    recovery_count > 0 ? "immediate" : "none", published_count(targets));
     }
     return sent;
 }
@@ -1144,7 +1277,7 @@ bool process_target_timeouts(HubGateway* gateway, CustomSource& source, LiveTarg
         drop.id_or_generation = id;
         if (!send_gateway_command(*gateway, drop)) return false;
         routes.erase(route);
-        terminal_target(target->second, false, source, targets);
+        terminal_target(target->second, false, source, targets, "ready_timeout");
     }
     return true;
 }
@@ -1152,24 +1285,28 @@ bool process_target_timeouts(HubGateway* gateway, CustomSource& source, LiveTarg
 void recover_gateway(std::unique_ptr<HubGateway>& gateway, unsigned& restart_count,
                      bool& transport_disabled, HANDLE root_job, const Options& options,
                      const fs::path& session, ControlQueue& control, CustomSource& source,
-                     LiveTargets& targets, TargetRoutes& routes) {
+                     LiveTargets& targets, TargetRoutes& routes, std::string_view reason) {
     source.publish({});
     targets.clear();
     routes.clear();
     control.discard_pending();
     if (gateway) {
         stop_hub_gateway(*gateway, options.graceful_ms);
+        emit_gateway("stop", reason, restart_count);
         gateway.reset();
     }
     if (restart_count != 0) {
         transport_disabled = true;
+        emit_gateway("fatal", "transport_disabled", restart_count);
         return;
     }
     ++restart_count;
     try {
         gateway = start_shared_gateway(root_job, options.gateway, session, options.graceful_ms);
+        emit_gateway("restart", "none", restart_count);
     } catch (...) {
         transport_disabled = true;
+        emit_gateway("fatal", "restart_failed", restart_count);
     }
 }
 
@@ -1189,6 +1326,7 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
     bool transport_disabled = false;
     CustomSource source;
     int result = kInternalFailure;
+    std::string closing_reason = "hub-stopped";
 
     auto cleanup = [&]() noexcept {
         source.publish({});
@@ -1197,6 +1335,7 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
         routes.clear();
         if (gateway) {
             stop_hub_gateway(*gateway, options.graceful_ms);
+            try { emit_gateway("stop", "shutdown", restart_count); } catch (...) {}
             gateway.reset();
         }
         if (q2_process && q2_process->process) {
@@ -1238,11 +1377,17 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
 
         if (!source.start(session.filename().string())) throw std::runtime_error("custom source failed to start");
         source.publish({});
+        emit_event("SESSION start build=" + std::string(Q2DZ_BUILD_VERSION) +
+                   " session=" + log_value(session.filename().string()) +
+                   " instance=" + std::to_string(GetCurrentProcessId()) +
+                   " gateway_restarts=0");
         try {
             gateway = start_shared_gateway(job.get(), options.gateway, session, options.graceful_ms);
+            emit_gateway("start", "none", 0);
         } catch (...) {
             transport_disabled = true;
-            std::cerr << "q2dz-session: shared transport unavailable\n";
+            emit_gateway("fatal", "start_failed", 0);
+            emit_event("q2dz-session: shared transport unavailable");
         }
         auto q2_stdin = q2dz::win::open_null(false);
         const std::vector<std::wstring> q2_args = {
@@ -1269,20 +1414,24 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
         while (!done) {
             if (source.failed()) {
                 result = kInternalFailure;
+                closing_reason = "source-failed";
                 break;
             }
             if (WaitForSingleObject(g_stop_event.get(), 0) == WAIT_OBJECT_0) {
                 result = kSuccess;
+                closing_reason = "owner-stop";
                 break;
             }
             if (WaitForSingleObject(q2_process->process.get(), 0) == WAIT_OBJECT_0) {
                 DWORD code = 1;
                 result = GetExitCodeProcess(q2_process->process.get(), &code) && code == 0
                     ? kSuccess : kQ2Failure;
+                closing_reason = result == kSuccess ? "q2-normal-exit" : "q2-failed";
                 break;
             }
             if (source.failed()) {
                 result = kInternalFailure;
+                closing_reason = "source-failed";
                 break;
             }
             bool clean_eof = false;
@@ -1294,18 +1443,21 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
                 if (protocol_error) {
                     for (auto& command : commands) command.clear();
                     result = kProtocolFailure;
+                    closing_reason = "hub-protocol-failed";
                     break;
                 }
                 for (auto& command : commands) {
                     if (!process_room_command(command, gateway.get(), transport_disabled, options.ready_ms,
                                               source, targets, routes, next_target_id)) {
                         recover_gateway(gateway, restart_count, transport_disabled, job.get(), options,
-                                        session, control, source, targets, routes);
+                                        session, control, source, targets, routes,
+                                        "gateway-command-failed");
                         break;
                     }
                 }
                 if (clean_eof && !commands_pending) {
                     result = kSuccess;
+                    closing_reason = "control-eof";
                     break;
                 }
             }
@@ -1314,12 +1466,13 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
                  (gateway->process.process && WaitForSingleObject(gateway->process.process.get(), 0) == WAIT_OBJECT_0))) {
                 if (!process_gateway(*gateway, options, source, targets, routes)) {
                     recover_gateway(gateway, restart_count, transport_disabled, job.get(), options,
-                                    session, control, source, targets, routes);
+                                    session, control, source, targets, routes, "gateway-failed");
                 }
             }
             if (gateway && !transport_disabled && !process_target_timeouts(gateway.get(), source, targets, routes)) {
                 recover_gateway(gateway, restart_count, transport_disabled, job.get(), options,
-                                session, control, source, targets, routes);
+                                session, control, source, targets, routes,
+                                "target-timeout-control-failed");
             }
             (void)WaitForSingleObject(control.event(), 25);
         }
@@ -1327,14 +1480,24 @@ int run_hub(const Options& options, const fs::path& q2, const fs::path& self) {
         (void)CancelSynchronousIo(native_thread_handle(input_reader));
         if (input_reader.joinable()) input_reader.join();
         cleanup();
+        try {
+            emit_event("SESSION stop reason=" + log_value(closing_reason) +
+                       " rc=" + std::to_string(result));
+        } catch (...) {}
         return result;
-    } catch (const std::exception& error) {
-        std::cerr << "q2dz-session: " << error.what() << "\n";
+    } catch (const std::exception&) {
+        emit_event("q2dz-session: failure category=internal-error");
         cleanup();
+        try {
+            emit_event("SESSION stop reason=internal-error rc=" + std::to_string(result));
+        } catch (...) {}
         return result;
     } catch (...) {
-        std::cerr << "q2dz-session: unknown failure\n";
+        emit_event("q2dz-session: unknown failure");
         cleanup();
+        try {
+            emit_event("SESSION stop reason=unknown-error rc=" + std::to_string(result));
+        } catch (...) {}
         return result;
     }
 }
@@ -1376,11 +1539,11 @@ int wmain(int argc, wchar_t** argv) {
         if (!q2) throw std::runtime_error("Q2PRO-X.exe not found; pass --q2 or set Q2PROX_EXE");
         if (!fs::is_regular_file(options.gateway)) throw std::runtime_error("gateway executable not found");
         return run_hub(options, *q2, self);
-    } catch (const std::exception& error) {
-        std::cerr << "q2dz-session: " << error.what() << "\n";
+    } catch (const std::exception&) {
+        emit_event("q2dz-session: failure category=internal-error");
         return kInternalFailure;
     } catch (...) {
-        std::cerr << "q2dz-session: unknown failure\n";
+        emit_event("q2dz-session: unknown failure");
         return kInternalFailure;
     }
 }

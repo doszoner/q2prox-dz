@@ -19,9 +19,68 @@ $Q2DZ_MAX_TARGETS = 256
 $Q2DZ_MAX_ICE_SNAPSHOT_BYTES = 65536
 $Q2DZ_SIGNALING_URL = 'wss://net.js-dos.com:444'
 
+$Q2DZ_LOG_MAX_BYTES = 5MB
+$script:Q2DzSessionLog = $null
+
+function Initialize-Q2DzSessionLog {
+  param([Parameter(Mandatory = $true)][string]$StateDirectory)
+  $log = [pscustomobject]@{ Directory = $null; Path = $null; Writer = $null; Failed = $false }
+  try {
+    $directory = Join-Path $StateDirectory 'logs'
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $path = Join-Path $directory 'q2dz.log'
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, $share)
+    $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+    $writer.NewLine = "`n"
+    $writer.AutoFlush = $true
+    $log.Directory = $directory
+    $log.Path = $path
+    $log.Writer = $writer
+  } catch {
+    $log.Failed = $true
+  }
+  $script:Q2DzSessionLog = $log
+}
+
+function Close-Q2DzSessionLog {
+  $log = $script:Q2DzSessionLog
+  if ($null -ne $log -and $null -ne $log.Writer) {
+    try { $log.Writer.Dispose() } catch {}
+  }
+  $script:Q2DzSessionLog = $null
+}
+
+function Write-Q2DzSessionLogLine {
+  param([Parameter(Mandatory = $true)][string]$Text)
+  $line = '{0} {1}' -f [DateTime]::UtcNow.ToString('o'), $Text
+  [Console]::Error.WriteLine($line)
+  $log = $script:Q2DzSessionLog
+  if ($null -eq $log -or $log.Failed -or $null -eq $log.Writer) { return }
+  try {
+    if ($log.Writer.BaseStream.Position -ge $Q2DZ_LOG_MAX_BYTES) {
+      $log.Writer.Dispose()
+      $rotated = Join-Path $log.Directory 'q2dz.1.log'
+      if (Test-Path -LiteralPath $rotated) { Remove-Item -LiteralPath $rotated -Force }
+      [System.IO.File]::Move($log.Path, $rotated)
+      $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+      $stream = New-Object System.IO.FileStream($log.Path, [System.IO.FileMode]::Create,
+        [System.IO.FileAccess]::Write, $share)
+      $log.Writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+      $log.Writer.NewLine = "`n"
+      $log.Writer.AutoFlush = $true
+    }
+    $log.Writer.WriteLine($line)
+  } catch {
+    try { $log.Writer.Dispose() } catch {}
+    $log.Writer = $null
+    $log.Failed = $true
+  }
+}
+
 function Write-Q2DzCatalogEvent {
   param([Parameter(Mandatory = $true)][string]$Message)
-  [Console]::Error.WriteLine(('{0} {1}' -f [DateTime]::UtcNow.ToString('o'), $Message))
+  Write-Q2DzSessionLogLine ('LAUNCHER ' + $Message)
 }
 
 function Test-Q2DzEndpoint {
@@ -67,7 +126,9 @@ function Read-Q2DzJson {
       $cancellation.Token
     ).GetAwaiter().GetResult()
     if (-not $response.IsSuccessStatusCode) {
-      throw 'Dos.Zone endpoint returned a non-success status'
+      $statusError = [Exception]::new('Dos.Zone endpoint returned a non-success status')
+      $statusError.Data['q2dz.http'] = [int]$response.StatusCode
+      throw $statusError
     }
     $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
     $encodingCount = 0
@@ -156,15 +217,27 @@ function Test-Q2DzText {
   return $Value -notmatch '[\r\n\t]'
 }
 
-function Test-Q2DzInteger {
-  param($Value, [long]$Minimum, [long]$Maximum)
+function Test-Q2DzIntegerKind {
+  # Type-only check (no bounds): mirrors Linux's _is_int (isinstance(value,
+  # int), true for a Python int of any magnitude), so a value of the right
+  # kind but out of range is a 'range' fault, not folded into 'type'. Round-4
+  # fix: [bigint] (ConvertFrom-Json's representation for an integer outside
+  # signed 64-bit) is an integer kind too, not a 'type' fault — Test-Q2DzInteger
+  # below still rejects it on range via the [decimal] cast/bounds check.
+  param($Value)
   if ($Value -is [bool]) { return $false }
+  if ($Value -is [bigint]) { return $true }
   $kind = [Convert]::GetTypeCode($Value)
   $integerKinds = @(
     [TypeCode]::Byte, [TypeCode]::SByte, [TypeCode]::Int16, [TypeCode]::UInt16,
     [TypeCode]::Int32, [TypeCode]::UInt32, [TypeCode]::Int64, [TypeCode]::UInt64
   )
-  if ($integerKinds -notcontains $kind) { return $false }
+  return $integerKinds -contains $kind
+}
+
+function Test-Q2DzInteger {
+  param($Value, [long]$Minimum, [long]$Maximum)
+  if (-not (Test-Q2DzIntegerKind $Value)) { return $false }
   try { $number = [decimal]$Value } catch { return $false }
   return $number -ge $Minimum -and $number -le $Maximum
 }
@@ -567,6 +640,196 @@ function Test-Q2DzRoomPayload {
     }
   }
   return $supportedCount -gt 0
+}
+
+function Get-Q2DzRoomRowFault {
+  param($Row)
+  # Returns the first schema violation of a supported row as {Field, Reason},
+  # in the same check order as Test-Q2DzRoomRow; $null when the row is valid.
+  $fault = { param($field, $reason) return [pscustomobject]@{ Field = $field; Reason = $reason } }
+  $settings = $Row.createSettings
+  # A present-but-non-string prefix is a supported-row shape defect: a
+  # [string] cast would coerce a one-element array into a supported kind.
+  if ($settings.prefix -isnot [string]) { return (& $fault 'createSettings.prefix' 'type') }
+  $kind = $settings.prefix
+  foreach ($name in @('game','profile')) {
+    if ($settings.PSObject.Properties.Name -contains $name) {
+      if ($settings.$name -isnot [string]) {
+        return (& $fault ('createSettings.' + $name) 'type')
+      }
+      if ($settings.$name -cne $Q2DZ_GAME) {
+        return (& $fault ('createSettings.' + $name) 'range')
+      }
+    }
+  }
+  if ($settings.PSObject.Properties.Name -contains 'ordered') {
+    if ($settings.ordered -isnot [bool]) { return (& $fault 'createSettings.ordered' 'type') }
+    if ($settings.ordered -ne $Q2DZ_ORDERED) { return (& $fault 'createSettings.ordered' 'range') }
+  }
+  if ($Row.PSObject.Properties.Name -notcontains 'room') { return (& $fault 'room' 'missing') }
+  if ($Row.room -isnot [string]) { return (& $fault 'room' 'type') }
+  if (-not (Test-Q2DzSafeToken $Row.room)) { return (& $fault 'room' 'identity') }
+  if ($kind -ceq 'q2') {
+    # A required field whose value is JSON null counts as missing (the
+    # producer had no value): the observed live defect is owner:null.
+    if ($Row.PSObject.Properties.Name -notcontains 'owner' -or $null -eq $Row.owner) {
+      return (& $fault 'owner' 'missing')
+    }
+    if ($Row.owner -is [bool] -or ($Row.owner -isnot [string] -and
+        -not (Test-Q2DzIntegerKind $Row.owner))) {
+      return (& $fault 'owner' 'type')
+    }
+    if ((Test-Q2DzIntegerKind $Row.owner) -and
+        -not (Test-Q2DzInteger $Row.owner 0 $Q2DZ_MAX_JSON_SAFE_INTEGER)) {
+      return (& $fault 'owner' 'range')
+    }
+    if ($Row.owner -is [string] -and -not (Test-Q2DzSafeToken $Row.owner 250)) {
+      return (& $fault 'owner' 'format')
+    }
+    if ($Row.PSObject.Properties.Name -notcontains 'roomReady' -or $null -eq $Row.roomReady) {
+      return (& $fault 'roomReady' 'missing')
+    }
+    if ($Row.roomReady -isnot [bool]) { return (& $fault 'roomReady' 'type') }
+    if ($Row.PSObject.Properties.Name -notcontains 'rtcServer' -or $null -eq $Row.rtcServer) {
+      return (& $fault 'rtcServer' 'missing')
+    }
+    if ($Row.rtcServer -isnot [string]) { return (& $fault 'rtcServer' 'type') }
+    if (-not (Test-Q2DzHostname $Row.rtcServer)) { return (& $fault 'rtcServer' 'format') }
+  } elseif (-not ([string]$Row.room).StartsWith('room.q2ded.', [StringComparison]::Ordinal) -or
+            ([string]$Row.room).Length -le ('room.q2ded.').Length) {
+    return (& $fault 'room' 'format')
+  }
+  if ($settings.PSObject.Properties.Name -notcontains 'name' -or $null -eq $settings.name) {
+    return (& $fault 'createSettings.name' 'missing')
+  }
+  if (-not (Test-Q2DzText $settings.name)) { return (& $fault 'createSettings.name' 'format') }
+  if ($settings.PSObject.Properties.Name -notcontains 'map' -or $null -eq $settings.map) {
+    return (& $fault 'createSettings.map' 'missing')
+  }
+  if ($settings.map -isnot [string]) { return (& $fault 'createSettings.map' 'type') }
+  if ($settings.map.Length -lt 1 -or $settings.map.Length -gt $Q2DZ_MAX_MAP -or
+      $settings.map -notmatch '^[A-Za-z0-9._-]+\z') {
+    return (& $fault 'createSettings.map' 'format')
+  }
+  if ($settings.PSObject.Properties.Name -notcontains 'maxPlayers' -or $null -eq $settings.maxPlayers) {
+    return (& $fault 'createSettings.maxPlayers' 'missing')
+  }
+  if (-not (Test-Q2DzIntegerKind $settings.maxPlayers)) {
+    return (& $fault 'createSettings.maxPlayers' 'type')
+  }
+  if (-not (Test-Q2DzInteger $settings.maxPlayers 1 $Q2DZ_MAX_PLAYERS)) {
+    return (& $fault 'createSettings.maxPlayers' 'range')
+  }
+  if ($Row.PSObject.Properties.Name -notcontains 'players' -or $null -eq $Row.players) {
+    return (& $fault 'players' 'missing')
+  }
+  if (-not (Test-Q2DzIntegerKind $Row.players)) {
+    return (& $fault 'players' 'type')
+  }
+  if (-not (Test-Q2DzInteger $Row.players 0 ([long]$settings.maxPlayers))) {
+    return (& $fault 'players' 'range')
+  }
+  return $null
+}
+
+function Get-Q2DzCatalogRowRejections {
+  param($Catalog)
+  # Classifies every rejected supported row of a room/get payload. Identities
+  # are resolved first; every member of a duplicate group gets reason=duplicate.
+  $rejections = [System.Collections.Generic.List[object]]::new()
+  if ($null -eq $Catalog -or $null -eq $Catalog.PSObject -or
+      $Catalog.PSObject.Properties.Name -notcontains 'rooms' -or $Catalog.rooms -isnot [array]) {
+    return @($rejections)
+  }
+  $identifiable = [System.Collections.Generic.List[object]]::new()
+  $index = -1
+  foreach ($row in @($Catalog.rooms)) {
+    $index++
+    if (-not (Test-Q2DzCatalogRowClassifiable $row)) { continue }
+    if ($row.PSObject.Properties.Name -notcontains 'room' -or $row.room -isnot [string] -or
+        -not (Test-Q2DzSafeToken $row.room)) {
+      [void]$rejections.Add([pscustomobject]@{ Index = $index; Room = $null; Field = 'room'; Reason = 'identity' })
+      continue
+    }
+    [void]$identifiable.Add([pscustomobject]@{ Index = $index; Row = $row })
+    $fault = Get-Q2DzRoomRowFault $row
+    if ($null -ne $fault) {
+      [void]$rejections.Add([pscustomobject]@{
+        Index = $index; Room = [string]$row.room; Field = $fault.Field; Reason = $fault.Reason })
+    }
+  }
+  # Duplicate groups are found among all identifiable rows, including ones
+  # already rejected on a field fault (D5): the alias is derived safely so
+  # a faulty row cannot crash or produce a phantom 'q2.' alias.
+  $firstRoom = New-Q2DzTargetMap
+  $firstAlias = New-Q2DzTargetMap
+  foreach ($item in $identifiable) {
+    $row = $item.Row
+    $roomId = [string]$row.room
+    if ($firstRoom.ContainsKey($roomId)) {
+      foreach ($member in @($firstRoom[$roomId], [pscustomobject]@{ Index = $item.Index; Room = $roomId })) {
+        [void]$rejections.Add([pscustomobject]@{ Index = [int]$member.Index; Room = [string]$member.Room; Field = 'room'; Reason = 'duplicate' })
+      }
+    } else {
+      $firstRoom[$roomId] = [pscustomobject]@{ Index = $item.Index; Room = $roomId }
+    }
+    $alias = Get-Q2DzClassifiedRoomAlias $row
+    if ($null -ne $alias) {
+      if ($firstAlias.ContainsKey($alias)) {
+        foreach ($member in @($firstAlias[$alias], [pscustomobject]@{ Index = $item.Index; Room = $roomId })) {
+          [void]$rejections.Add([pscustomobject]@{ Index = [int]$member.Index; Room = [string]$member.Room; Field = 'alias'; Reason = 'duplicate' })
+        }
+      } else {
+        $firstAlias[$alias] = [pscustomobject]@{ Index = $item.Index; Room = $roomId }
+      }
+    }
+  }
+  $merged = @{}
+  foreach ($rejection in $rejections) {
+    if ($null -eq $merged[$rejection.Index] -or $rejection.Reason -eq 'duplicate') {
+      $merged[$rejection.Index] = $rejection
+    }
+  }
+  return @($merged.Values | Sort-Object Index)
+}
+
+function Test-Q2DzCatalogRowClassifiable {
+  param($Row)
+  # Rows the tolerant gate inspects: supported rows plus rows whose
+  # createSettings.prefix is present but not a string — a supported-row
+  # shape defect the classifier reports with reason=type. A foreign game
+  # carries a string prefix and stays skipped.
+  if ($null -eq $Row -or $null -eq $Row.PSObject -or
+      $Row.PSObject.Properties.Name -notcontains 'createSettings' -or
+      $null -eq $Row.createSettings -or $null -eq $Row.createSettings.PSObject -or
+      $Row.createSettings.PSObject.Properties.Name -notcontains 'prefix') { return $false }
+  $prefix = $Row.createSettings.prefix
+  if ($prefix -isnot [string]) { return $true }
+  return @('q2','q2ded') -ccontains $prefix
+}
+
+function Get-Q2DzClassifiedRoomAlias {
+  param($Row)
+  # Alias derivation for classification on rows that may be invalid; $null
+  # when no alias can be derived (keeps identity conflicts out of reach of
+  # a missing/typed owner or a non-string prefix).
+  if ($Row.createSettings.prefix -isnot [string]) { return $null }
+  if ((Get-Q2DzRoomKind $Row) -ceq 'q2ded') { return [string]$Row.room }
+  if ($Row.PSObject.Properties.Name -notcontains 'owner') { return $null }
+  $owner = $Row.owner
+  if ($null -eq $owner -or $owner -is [bool]) { return $null }
+  if ($owner -isnot [string] -and -not (Test-Q2DzIntegerKind $owner)) { return $null }
+  return ('q2.{0}' -f [string]$owner)
+}
+
+function Write-Q2DzCatalogRowRejections {
+  param([AllowEmptyCollection()]$Rejections)
+  foreach ($rejection in @($Rejections)) {
+    $roomField = ''
+    if ($null -ne $rejection.Room) { $roomField = ' room=' + $rejection.Room }
+    Write-Q2DzCatalogEvent ('CATALOG_ROW result=rejected kind=room{0} index={1} field={2} reason={3}' -f `
+      $roomField,$rejection.Index,$rejection.Field,$rejection.Reason)
+  }
 }
 
 function Test-Q2DzEmptyRoomCatalog {

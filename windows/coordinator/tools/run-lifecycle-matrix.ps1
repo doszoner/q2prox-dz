@@ -124,10 +124,8 @@ function Case-Diagnostics([object]$case) {
   }
   $stderr = ''
   $stdout = ''
-  if ($case.Process.HasExited) {
-    try { $stderr = $case.Process.StandardError.ReadToEnd().Trim() } catch { }
-    try { $stdout = $case.Process.StandardOutput.ReadToEnd().Trim() } catch { }
-  }
+  try { $stderr = $case.StderrBuf.ToString().Trim() } catch { }
+  try { $stdout = $case.StdoutBuf.ToString().Trim() } catch { }
   return "case=$($case.Name) coordinator=$exit markers=[$($markers -join '; ')] stderr=[$stderr] stdout=[$stdout]"
 }
 
@@ -247,10 +245,33 @@ function Start-Case([string]$name, [string]$gatewayA = 'normal', [string]$gatewa
   $psi.Arguments = (($arguments | ForEach-Object { Quote-Argument $_ }) -join ' ')
   $process = New-Object System.Diagnostics.Process
   $process.StartInfo = $psi
+  $stdoutBuf = New-Object System.Text.StringBuilder
+  $stderrBuf = New-Object System.Text.StringBuilder
   if (-not $process.Start()) { throw "could not start coordinator for $name" }
-  $case = [pscustomobject]@{ Name = $name; Dir = $dir; Process = $process }
+  # Drain stdout/stderr asynchronously from the moment the process starts: a
+  # case that writes more than the pipe buffer (e.g. 256 TARGET lines) would
+  # otherwise deadlock Stop-Case's post-exit ReadToEnd against a full pipe.
+  $outSub = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $stdoutBuf -Action {
+    if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+  }
+  $errSub = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $stderrBuf -Action {
+    if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+  }
+  $process.BeginOutputReadLine()
+  $process.BeginErrorReadLine()
+  $case = [pscustomobject]@{
+    Name = $name; Dir = $dir; Process = $process
+    StdoutBuf = $stdoutBuf; StderrBuf = $stderrBuf
+    OutSub = $outSub; ErrSub = $errSub
+  }
   $script:activeCase = $case
   return $case
+}
+
+function Stop-CaseSubscriptions($case) {
+  foreach ($sub in @($case.OutSub, $case.ErrSub)) {
+    if ($sub) { Unregister-Event -SourceIdentifier $sub.Name -ErrorAction SilentlyContinue }
+  }
 }
 
 function Assert-NoOrphans([string]$dir) {
@@ -276,10 +297,21 @@ function Stop-Case($case, [int]$expected = 0, [string]$stderrPattern = '') {
     Stop-Process -Id $case.Process.Id -Force -ErrorAction SilentlyContinue
     $case.Process.WaitForExit(5000)
   }
-  $stdout = $case.Process.StandardOutput.ReadToEnd()
-  $stderr = $case.Process.StandardError.ReadToEnd()
+  # The process has already exited; the parameterless WaitForExit() overload
+  # also waits for the async stdout/stderr readers to finish, so the buffers
+  # are complete before we unregister their handlers.
+  $case.Process.WaitForExit()
+  Stop-CaseSubscriptions $case
+  $stdout = $case.StdoutBuf.ToString()
+  $stderr = $case.StderrBuf.ToString()
   if ($case.Process.ExitCode -ne $expected) {
     throw "$($case.Name) returned $($case.Process.ExitCode), expected $expected`n$stdout`n$stderr"
+  }
+  if ($stderr -notmatch '(?m)^SESSION start build=[A-Za-z0-9._-]+ session=\S+ instance=[0-9]+ gateway_restarts=0\r?$') {
+    throw "$($case.Name) stderr is missing the SESSION start event`n$stderr"
+  }
+  if ($stderr -notmatch '(?m)^SESSION stop reason=[A-Za-z0-9._-]+ rc=[0-9]+\r?$') {
+    throw "$($case.Name) stderr is missing the SESSION stop event`n$stderr"
   }
   if ($stderrPattern -and $stderr -notmatch $stderrPattern) {
     throw "$($case.Name) stderr did not contain expected diagnostic: $stderrPattern`n$stderr"
@@ -364,7 +396,7 @@ try {
   Assert-ProcessAlive $q2Pid 'Q2 after room A drop'
   Send-Drop $case.Process 'room-b'
   if (-not (Wait-SourceCount $source 0)) { throw 'DROP room B did not empty source' }
-  Stop-Case $case
+  Stop-Case $case -stderrPattern '(?s)TARGET room=room-a id=1 state=pending.*TARGET room=room-a id=1 state=ready'
 
   $case = Start-Case 'session-change'
   Wait-Q2Initial $case.Dir | Out-Null
@@ -518,7 +550,7 @@ try {
     $gatewayPid = Wait-GatewayPid $case.Dir
     Assert-ProcessAlive $gatewayPid "shared gateway after $failureMode"
     Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) "Q2 after $failureMode"
-    Stop-Case $case
+    Stop-Case $case -stderrPattern 'TARGET room=room-a id=1 state=terminal reason=immediate_test'
   }
 
   # A global FATAL has no target id: preserve its diagnostic and restart the
@@ -533,7 +565,7 @@ try {
   if (-not (Wait-SourceCount $source 0)) { throw 'global FATAL did not clear the shared source' }
   Assert-ProcessAlive $secondGateway 'shared gateway after global FATAL'
   Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'Q2 after global FATAL'
-  Stop-Case $case -stderrPattern 'q2dz-session: gateway fatal stage=gateway code=invalid_web_message'
+  Stop-Case $case -stderrPattern '(?s)GATEWAY event=fatal reason=invalid_web_message restarts=0.*q2dz-session: gateway fatal stage=gateway code=invalid_web_message.*GATEWAY event=restart reason=none restarts=1'
 
   # Old events after DROP+PUT cannot affect the replacement target.
   $case = Start-Case 'stale-target' 'stale-after-drop' 'normal'
@@ -585,7 +617,7 @@ try {
   }
   if (-not (Wait-SourceCount $source 1)) { throw 'timed-out room A was retained with room B' }
   Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'Q2 after target timeout'
-  Stop-Case $case
+  Stop-Case $case -stderrPattern 'TARGET room=room-a id=1 state=terminal reason=ready_timeout .*retry=none'
 
   # Preserve the former bounded q2/q2ded recovery policy across new target ids.
   $case = Start-Case 'bounded-recovery' 'failed-after-ready' 'normal' 'long-running' 'fatal-immediate'
@@ -606,7 +638,7 @@ try {
   Send-Put $case.Process 'room.q2ded.server'
   Start-Sleep -Milliseconds 250
   if (-not (Wait-MarkerValue $case.Dir 'gateway-put-count' '5')) { throw 'q2ded recovery was unbounded' }
-  Stop-Case $case
+  Stop-Case $case -stderrPattern '(?s)TARGET room=room-a id=1 state=terminal reason=post_ready_test recovery=1 retry=immediate.*TARGET room=room-a id=2 state=terminal reason=post_ready_test recovery=2 retry=none'
 
   # q2 CLOSED is terminal; q2ded CLOSED gets the same two bounded retries as FAILED.
   $case = Start-Case 'bounded-recovery-closed' 'room-close-immediate' 'normal' 'long-running' 'room-close-immediate'
@@ -708,7 +740,7 @@ try {
   Start-Sleep -Milliseconds 250
   if ((Wait-GatewayPid $case.Dir) -ne $secondGateway) { throw 'second crash started a third gateway' }
   Assert-ProcessAlive ([int](Get-Content (Marker $case.Dir 'q2.pid'))) 'Q2 after global crashes'
-  Stop-Case $case
+  Stop-Case $case -stderrPattern '(?s)GATEWAY event=stop reason=gateway-failed restarts=0.*GATEWAY event=restart reason=none restarts=1.*GATEWAY event=stop reason=gateway-failed restarts=1.*GATEWAY event=fatal reason=transport_disabled restarts=1'
 
   # Q2 exit and owner hard-kill both clean the single gateway tree.
   $case = Start-Case 'q2-exit' 'normal' 'normal' 'exit-normal'
@@ -758,7 +790,7 @@ try {
       $activeCase.Process.WaitForExit(3000)
     }
   }
-  if ($activeCase) { Stop-MarkedProcesses $activeCase.Dir }
+  if ($activeCase) { Stop-CaseSubscriptions $activeCase; Stop-MarkedProcesses $activeCase.Dir }
   Clear-Environment
   if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
 }

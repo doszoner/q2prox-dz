@@ -351,7 +351,7 @@ test("native gateway keeps WebView2 foreground without production browser flags"
   const protocol = readFileSync(
     new URL("../src/webview_bridge_protocol.cpp", import.meta.url), "utf8");
   assert.match(source, /parse_cadence_message\(message\)/);
-  assert.match(source, /Q2DZ_CADENCE/);
+  assert.match(source, /GATEWAY stats/);
   assert.match(source, /std::ostringstream/);
   assert.match(source, /std::cerr << line\.str\(\)/);
   assert.match(source, /std::exchange\(native_cadence_, NativeCadence\{\}\)/);

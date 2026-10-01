@@ -54,6 +54,38 @@ constexpr char page_ready[] =
     "{\"type\":\"state\",\"value\":\"page-ready\",\"reason\":\"\"}";
 std::atomic<HWND> gateway_window{nullptr};
 
+// Reason codes sourced from the WebRTC transport page (transport.html's
+// `stableError`) carry tokens such as "ice" that the launcher's secret
+// filter also matches on non-grammar lines; map the known codes to safe
+// equivalents before they reach stderr/stdout so the event never depends on
+// the launcher recognising its own grammar.
+std::string safe_gateway_reason(std::string_view reason) {
+    static const std::unordered_map<std::string_view, std::string_view> kKnownCodes = {
+        {"ice_configuration_failed", "transport_config_failed"},
+        {"ice_configuration_too_large", "transport_config_oversized"},
+        {"ice_required_before_put", "transport_config_missing"},
+        {"invalid_ice_generation", "transport_config_invalid"},
+        {"invalid_ice_server", "transport_config_invalid"},
+        {"invalid_ice_servers", "transport_config_invalid"},
+        {"transport_configure_ice_failed", "transport_startup_failed"},
+        {"startup_configure_ice_failed", "transport_startup_failed"},
+    };
+    const auto found = kKnownCodes.find(reason);
+    if (found != kKnownCodes.end()) return std::string(found->second);
+    std::string lowered(reason);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static constexpr std::array<std::string_view, 13> kFilteredTokens = {
+        "credential", "password", "secret", "token", "authorization", "ice",
+        "candidate", "sdp", "turn:", "turns:", "username", "fingerprint",
+        "peer",
+    };
+    for (const auto token : kFilteredTokens) {
+        if (lowered.find(token) != std::string::npos) return "transport_reason_redacted";
+    }
+    return std::string(reason);
+}
+
 std::string_view transport_failure_stage(std::string_view reason) noexcept {
     if (reason == "peer_bind_failed" || reason == "alias_timeout" ||
         reason == "duplicate_remote_peer") return "resolve";
@@ -1082,7 +1114,7 @@ private:
     void log_cadence(const CadenceSnapshot &js) {
         const auto native = std::exchange(native_cadence_, NativeCadence{});
         std::ostringstream line;
-        line << "Q2DZ_CADENCE"
+        line << "GATEWAY stats"
              << " timerTicks=" << js.timer_ticks << " timerMaxGapMs=" << js.timer_max_gap_ms
              << " waitCalls=" << js.wait_calls << " aliasPollIterations=" << js.alias_poll_iterations
              << " probeSendCount=" << js.probe_send_count << " probeAckCount=" << js.probe_ack_count
@@ -1139,7 +1171,7 @@ private:
                 close_target(id);
             }
         }
-        std::cerr << "GATEWAY_ERROR reason=" << reason << "\n";
+        std::cerr << "GATEWAY error reason=" << safe_gateway_reason(reason) << "\n";
         if (window_) PostMessageW(window_, WM_CLOSE, 0, 0);
     }
 
@@ -1196,7 +1228,7 @@ private:
                 if (std::filesystem::exists(user_data_)) Sleep(50);
             }
         }
-        std::cerr << "GATEWAY_STOP udp_to_web=" << udp_to_web_
+        std::cerr << "GATEWAY stop udp_to_web=" << udp_to_web_
                   << " web_to_udp=" << web_to_udp_
                   << " targets=" << active_targets
                   << " max_udp_to_transport_datagram=" << max_udp_to_transport_datagram_
@@ -1287,7 +1319,7 @@ int wmain(int argc, wchar_t **argv) {
     } catch (const std::exception &error) {
         static_cast<void>(error);
         std::cout << "Q2DZ/1 FATAL stage=startup code=startup_failed" << std::endl;
-        std::cerr << "GATEWAY_ERROR reason=startup_failed\n";
+        std::cerr << "GATEWAY error reason=startup_failed\n";
         CoUninitialize();
         return 2;
     }

@@ -41,17 +41,38 @@ function Start-Q2DzCoordinator {
   $startInfo.UseShellExecute = $false
   $startInfo.CreateNoWindow = $true
   $startInfo.RedirectStandardInput = $true
+  $startInfo.RedirectStandardError = $true
   $process = New-Object System.Diagnostics.Process
   $process.StartInfo = $startInfo
   $started = $false
+  $stderrReader = $null
   try {
     if (-not $process.Start()) { throw 'Could not start q2dz-session.exe.' }
     $started = $true
+    $stderrQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    # The reader only enqueues lines; the launcher main loop drains and writes.
+    $stderrReader = [PowerShell]::Create()
+    [void]$stderrReader.AddScript({
+      param($ChildProcess, $Queue)
+      try {
+        while (($line = $ChildProcess.StandardError.ReadLine()) -ne $null) {
+          $Queue.Enqueue($line)
+        }
+      } catch {}
+    }).AddArgument($process).AddArgument($stderrQueue)
+    $stderrHandle = $stderrReader.BeginInvoke()
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $writer = New-Object System.IO.StreamWriter($process.StandardInput.BaseStream, $encoding)
     $writer.NewLine = "`n"
-    return [pscustomobject]@{ Process = $process; Writer = $writer }
+    return [pscustomobject]@{
+      Process = $process; Writer = $writer; Queue = $stderrQueue
+      StderrReader = $stderrReader; StderrHandle = $stderrHandle
+    }
   } catch {
+    if ($null -ne $stderrReader) {
+      try { $stderrReader.Stop() } catch {}
+      try { $stderrReader.Dispose() } catch {}
+    }
     if ($started -and -not $process.HasExited) { $process.Kill() }
     $process.Dispose()
     throw
@@ -134,6 +155,8 @@ function Write-Q2DzHeartbeat {
     }
     foreach ($line in $lines) { Write-Q2DzUtf8 -Writer $Writer -Text $line }
     $Writer.BaseStream.Flush()
+    Write-Q2DzCatalogEvent ('HEARTBEAT generation={0} puts={1} drops={2}' -f `
+      $Generation,$Plan.Targets.Count,@($Plan.Drops).Count)
     if ($Process.HasExited) { return [int]$Process.ExitCode }
     return $null
   } catch {
@@ -153,6 +176,118 @@ function Write-Q2DzHeartbeat {
 
 function Get-Q2DzMonotonicSeconds {
   return [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency
+}
+
+# The child-stderr allow-list filter mirrors contains_sensitive_key +
+# sanitize_log_line in linux/src/common.cpp; keep both lists identical.
+$Q2DZ_SENSITIVE_SUBSTRINGS = @(
+  'credential', 'password', 'secret', 'token', 'authorization', 'ice',
+  'candidate', 'sdp', 'turn:', 'turns:', 'username', 'fingerprint',
+  'local-description', 'remote-description', 'session-description',
+  'peer id', 'peer_id', 'peerid', 'alias=', 'alias "', 'alias lookup',
+  'aliaserror'
+)
+$Q2DZ_SDP_FIELD_LETTERS = 'vosiuepcbtrzkam'
+$Q2DZ_EVENT_FIELD_PATTERN = '^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._:-]{1,64}$'
+$Q2DZ_ROOM_FIELD_PATTERN = '^room=[A-Za-z0-9._-]{1,255}$'
+
+function Test-Q2DzSensitiveChildLine {
+  param([AllowEmptyString()][string]$Line)
+  $lower = $Line.ToLowerInvariant()
+  foreach ($key in $Q2DZ_SENSITIVE_SUBSTRINGS) {
+    if ($lower.Contains($key)) { return $true }
+  }
+  return ($Line.Length -ge 2 -and $Line[1] -eq '=' -and
+          $Q2DZ_SDP_FIELD_LETTERS.IndexOf([char]::ToLowerInvariant($Line[0])) -ge 0)
+}
+
+$Q2DZ_EVENT_KEYS = @{
+  'TARGET' = @('room','id','state','reason','recovery','retry','published_ready')
+  'SESSION start' = @('build','session','instance','gateway_restarts')
+  'SESSION stop' = @('reason','rc')
+  'GATEWAY event' = @('event','reason','restarts')
+  'GATEWAY stats' = @(
+    'timerTicks','timerMaxGapMs','waitCalls','aliasPollIterations','probeSendCount',
+    'probeAckCount','dcToNativeDatagrams','dcToNativeBytes','dcToNativeMaxGapMs',
+    'nativeToDcDatagrams','nativeToDcBytes','nativeToDcMaxGapMs','udpFromQ2Datagrams',
+    'udpFromQ2Bytes','udpToQ2Datagrams','udpToQ2Bytes','postToWebDatagrams',
+    'webToNativeDatagrams','udpToQ2MaxGapMs','postToWebMaxGapMs'
+  )
+  'GATEWAY error' = @('reason')
+  'GATEWAY stop' = @(
+    'udp_to_web','web_to_udp','targets','max_udp_to_transport_datagram',
+    'max_transport_to_udp_datagram','oversized_udp_drops','oversized_transport_drops',
+    'unknown_peer_drops','second_source_drops','transport_not_ready_drops',
+    'invalid_cadence_drops'
+  )
+}
+
+function Test-Q2DzEventFieldValid {
+  param([Parameter(Mandatory = $true)][string]$Field, [Parameter(Mandatory = $true)][string[]]$AllowedKeys)
+  $eq = $Field.IndexOf('=')
+  if ($eq -lt 0) { return $false }
+  $key = $Field.Substring(0, $eq)
+  if ($AllowedKeys -cnotcontains $key) { return $false }
+  if ($key -ceq 'room') { return [bool]($Field -cmatch $Q2DZ_ROOM_FIELD_PATTERN) }
+  if (-not ($Field -cmatch $Q2DZ_EVENT_FIELD_PATTERN)) { return $false }
+  return -not (Test-Q2DzSensitiveChildLine $Field)
+}
+
+function ConvertTo-Q2DzChildEvent {
+  param([AllowEmptyString()][string]$Line)
+  # Returns the log line for one raw child-stderr line: a pass-through for
+  # allow-listed coordinator/gateway events, else an escaped CHILD event. A
+  # line that fully matches the event grammar passes through untouched, even
+  # if it contains a filter substring (e.g. room=room.q2ded.nice) — the
+  # substring filter only applies to lines outside the grammar.
+  $fullLine = $Line
+  $tokens = $fullLine -split ' '
+  $fields = @()
+  $component = $null
+  $spec = $null
+  if ($tokens[0] -ceq 'TARGET') {
+    $component = 'COORDINATOR'; $fields = @($tokens | Select-Object -Skip 1); $spec = 'TARGET'
+  } elseif ($tokens[0] -ceq 'SESSION' -and $tokens.Count -ge 2 -and
+            @('start','stop') -ccontains $tokens[1]) {
+    $component = 'COORDINATOR'; $fields = @($tokens | Select-Object -Skip 2); $spec = "SESSION $($tokens[1])"
+  } elseif ($tokens[0] -ceq 'GATEWAY' -and $tokens.Count -ge 2 -and
+            $tokens[1] -cmatch '^event=') {
+    $component = 'COORDINATOR'; $fields = @($tokens | Select-Object -Skip 1); $spec = 'GATEWAY event'
+  } elseif ($tokens[0] -ceq 'GATEWAY' -and $tokens.Count -ge 2 -and
+            @('stats','error','stop') -ccontains $tokens[1]) {
+    $component = ''; $fields = @($tokens | Select-Object -Skip 2); $spec = "GATEWAY $($tokens[1])"
+  }
+  if ($null -ne $component -and $Q2DZ_EVENT_KEYS.ContainsKey($spec)) {
+    $allowedKeys = $Q2DZ_EVENT_KEYS[$spec]
+    $wellFormed = $true
+    foreach ($field in $fields) {
+      if (-not (Test-Q2DzEventFieldValid $field $allowedKeys)) { $wellFormed = $false; break }
+    }
+    if ($wellFormed) {
+      if ($component -eq '') { return $fullLine }
+      return ($component + ' ' + $fullLine)
+    }
+  }
+  if (Test-Q2DzSensitiveChildLine $fullLine) { return 'LAUNCHER CHILD suppressed=1' }
+  if ($Line.Length -gt 2048) { $Line = $Line.Substring(0, 2048) }
+  $chars = $Line.ToCharArray()
+  for ($i = 0; $i -lt $chars.Length; $i++) {
+    $code = [int][char]$chars[$i]
+    if (($code -lt 0x20 -and $chars[$i] -ne "`t") -or $code -eq 0x7F) { $chars[$i] = ' ' }
+  }
+  $escaped = -join $chars
+  if ($escaped.Length -gt 512) { $escaped = $escaped.Substring(0, 512) }
+  return ('LAUNCHER CHILD line=' + $escaped)
+}
+
+function Read-Q2DzChildQueue {
+  param($Queue)
+  if ($null -eq $Queue) { return }
+  $line = $null
+  while ($Queue.TryDequeue([ref]$line)) {
+    if ($null -ne $line) { Write-Q2DzSessionLogLine (ConvertTo-Q2DzChildEvent $line) }
+    $line = $null
+  }
 }
 
 function New-Q2DzRoomConfig {
@@ -192,6 +327,24 @@ function New-Q2DzRoomConfig {
   return $json
 }
 
+function Get-Q2DzRefreshErrorKind {
+  param([Parameter(Mandatory = $true)]$Exception)
+  # Maps a refresh failure to the spec's error= category without its message.
+  if ($null -ne $Exception.Data -and $Exception.Data.Contains('q2dz.http')) { return 'http' }
+  $message = [string]$Exception.Message
+  if ($Exception -is [System.TimeoutException] -or
+      $Exception -is [System.Threading.Tasks.TaskCanceledException] -or
+      $message -match 'timed out|timeout') { return 'timeout' }
+  if ($message -match 'catalog_capacity_exceeded') { return 'capacity' }
+  if ($message -match 'content checker') { return 'content_check' }
+  if ($message -match 'RTC|ICE') { return 'rtc' }
+  if ($message -match 'non-success status') { return 'http' }
+  if ($message -match 'invalid schema|duplicate') { return 'schema' }
+  if ($message -match 'invalid JSON|invalid gzip|too large|encoding|empty JSON|valid UTF-8') { return 'json' }
+  if ($message -match 'configuration|one line|one string') { return 'config' }
+  return 'other'
+}
+
 function Get-Q2DzLiveTargets {
   param(
     [Parameter(Mandatory = $true)]$Targets,
@@ -203,13 +356,20 @@ function Get-Q2DzLiveTargets {
   $timer = [Diagnostics.Stopwatch]::StartNew()
   $result = 'error'
   $stage = 'catalog'
+  $errorKind = 'none'
+  $httpStatus = 0
   $previousCount = $Targets.Count
   $readyCount = 0
   $registeredCount = 0
   $targetCount = $previousCount
   $dropCount = 0
+  $putCount = 0
   try {
     $catalog = & $FetchJson $Q2DZ_ROOM_ENDPOINT
+    # Diagnostics only (B): classify and log every rejected row/alias so
+    # tester logs name the culprit, but the gate below is still strict —
+    # one invalid row still fails the whole refresh, as in rc17.
+    Write-Q2DzCatalogRowRejections @(Get-Q2DzCatalogRowRejections $catalog)
     if (-not (Test-Q2DzRoomPayload $catalog) -and
         -not (Test-Q2DzEmptyRoomCatalog $catalog)) {
       try { Get-Q2DzReadyRooms $catalog | Out-Null } catch { throw }
@@ -221,7 +381,7 @@ function Get-Q2DzLiveTargets {
     $lookup = & $FetchJson $Q2DZ_LOOKUP_ENDPOINT
     $registeredReady = @(Select-Q2DzRegisteredRooms -Rows $readyRows -LookupPayload $lookup)
     $registeredCount = $registeredReady.Count
-    $stage = 'rtc'
+    $stage = 'servers'
     $rtcRows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
     $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows)
     $check = if ($RunContentCheck) { $RunContentCheck } else {
@@ -252,13 +412,25 @@ function Get-Q2DzLiveTargets {
     $updated.IceServers = @($iceServers)
     $targetCount = $updated.Targets.Count
     $dropCount = $updated.Drops.Count
+    $putCount = $updated.Targets.Count
     $result = 'ok'
     return $updated
   }
+  catch {
+    $failureException = $_.Exception
+    if ($null -ne $failureException.Data -and $failureException.Data.Contains('q2dz.http')) {
+      $errorKind = 'http'
+      $httpStatus = [int]$failureException.Data['q2dz.http']
+    } else {
+      $errorKind = Get-Q2DzRefreshErrorKind -Exception $failureException
+      $httpStatus = 0
+    }
+    throw
+  }
   finally {
     $timer.Stop()
-    Write-Q2DzCatalogEvent ('CATALOG_REFRESH result={0} stage={1} elapsed_ms={2} previous={3} ready={4} registered={5} targets={6} drops={7}' -f `
-      $result,$stage,$timer.ElapsedMilliseconds,$previousCount,$readyCount,$registeredCount,$targetCount,$dropCount)
+    Write-Q2DzCatalogEvent ('CATALOG_REFRESH result={0} stage={1} error={2} http={3} elapsed_ms={4} previous={5} ready={6} registered={7} targets={8} drops={9} puts={10}' -f `
+      $result,$stage,$errorKind,$httpStatus,$timer.ElapsedMilliseconds,$previousCount,$readyCount,$registeredCount,$targetCount,$dropCount,$putCount)
   }
 }
 
@@ -290,6 +462,10 @@ function Invoke-Q2DzHub {
   }
   $process = $owner.Process
   $writer = $owner.Writer
+  # Property values are fetched in statement position: emitting a
+  # ConcurrentQueue from an if-branch would enumerate it into nothing.
+  $childQueue = $null
+  if ($null -ne $owner.PSObject.Properties['Queue']) { $childQueue = $owner.Queue }
   $exitCode = $null
   try {
     if (@($initialIce).Count -gt 0) {
@@ -302,6 +478,7 @@ function Invoke-Q2DzHub {
     $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
     while ($true) {
       while ($true) {
+        Read-Q2DzChildQueue $childQueue
         if ($process.HasExited) { $exitCode = [int]$process.ExitCode; return $exitCode }
         if ($process.WaitForExit(1000)) { $exitCode = [int]$process.ExitCode; return $exitCode }
         if ((Get-Q2DzMonotonicSeconds) -ge $deadline) { break }
@@ -312,12 +489,14 @@ function Invoke-Q2DzHub {
           throw 'hub refresh returned an incomplete heartbeat'
         }
       } catch {
+        Read-Q2DzChildQueue $childQueue
         $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
         continue
       }
       $targets = Copy-Q2DzTargetMap $updated.Targets
       $generation++
       $code = Write-Q2DzHeartbeat -Process $process -Writer $writer -Plan $updated -Generation $generation
+      Read-Q2DzChildQueue $childQueue
       if ($null -ne $code) { $exitCode = $code; return $code }
       $deadline = (Get-Q2DzMonotonicSeconds) + [Math]::Max($PollIntervalSeconds, 0.001)
     }
@@ -355,6 +534,24 @@ function Invoke-Q2DzHub {
       try { $exitCode = Wait-Q2DzCoordinator -Process $process -TimeoutMilliseconds 5000 }
       catch { if ($null -eq $disposeError) { $disposeError = $_.Exception } }
     }
+    # The stderr reader ends when the pipe hits EOF; join it so lines written
+    # right before exit are enqueued. A lingering grandchild can hold the
+    # inherited handle open, so the wait is bounded and the stream is closed
+    # to unblock the reader before the process is disposed.
+    if ($null -ne $owner.PSObject.Properties['StderrReader'] -and $null -ne $owner.StderrReader) {
+      $readerDone = $false
+      try { $readerDone = $owner.StderrHandle.AsyncWaitHandle.WaitOne(3000) } catch {}
+      if (-not $readerDone -and $process -is [System.Diagnostics.Process]) {
+        try { $process.StandardError.Dispose() } catch {}
+        try { $readerDone = $owner.StderrHandle.AsyncWaitHandle.WaitOne(2000) } catch {}
+      }
+      if ($readerDone) {
+        try { $owner.StderrReader.EndInvoke($owner.StderrHandle) }
+        catch { if ($null -eq $disposeError) { $disposeError = $_.Exception } }
+        try { $owner.StderrReader.Dispose() } catch {}
+      }
+    }
+    Read-Q2DzChildQueue $childQueue
     if ($process.PSObject.Methods.Name -contains 'Dispose') {
       try { $process.Dispose() }
       catch { if ($null -eq $disposeError) { $disposeError = $_.Exception } }
@@ -364,48 +561,81 @@ function Invoke-Q2DzHub {
 }
 
 function Start-Q2DzLauncher {
+  # Every exit after SESSION start — including an installation-check throw,
+  # or an exception from the coordinator call — must emit exactly one
+  # SESSION stop. $stopReason/$stopCode hold the outcome for the single
+  # emission in this function's finally block.
   # The launcher has no room picker: Q2PRO-X's Custom browser is the only room list.
   $state = Join-Path $env:LOCALAPPDATA 'Q2PRO-X Dos.Zone\state'
-  $q2PathFile = Join-Path $state 'q2-path.txt'
-  $coordinator = Join-Path $app 'q2dz-session.exe'
-  $contentCheck = Join-Path $app 'q2dz-content-check.exe'
-  $gateway = Join-Path $app 'gateway\q2-doszone-webview2-gateway.exe'
-  foreach ($path in $coordinator,$contentCheck,$gateway) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Installation is incomplete: $path" }
+  Initialize-Q2DzSessionLog -StateDirectory $state
+  $build = 'unknown'
+  $versionFile = Join-Path $app 'VERSION'
+  if (Test-Path -LiteralPath $versionFile) {
+    $build = ((Get-Content -LiteralPath $versionFile -Raw) -replace '[^A-Za-z0-9._-]', '').Trim()
+    if (-not $build) { $build = 'unknown' }
   }
-  if (Get-Process 'Q2PRO-X' -ErrorAction SilentlyContinue) {
-    [Windows.Forms.MessageBox]::Show('Close the running Q2PRO-X before joining a Dos.Zone room.','Q2PRO-X - Dos.Zone') | Out-Null
-    return 4
-  }
-  $q2 = if (Test-Path $q2PathFile) { (Get-Content $q2PathFile -Raw).Trim() } else { '' }
-  if (-not $q2 -or -not (Test-Path -LiteralPath $q2 -PathType Leaf)) {
-    $picker = New-Object Windows.Forms.OpenFileDialog
-    $picker.Title = 'Select your installed Q2PRO-X.exe'
-    $picker.Filter = 'Q2PRO-X|Q2PRO-X.exe'
-    if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return 1 }
-    $q2 = $picker.FileName
-    New-Item -ItemType Directory -Force $state | Out-Null
-    Set-Content -LiteralPath $q2PathFile -Value $q2 -Encoding UTF8
-  }
-
-  $targets = New-Q2DzTargetMap
-  $initial = $null
+  $rc = 'none'
+  if ($build -match 'rc(\d+)') { $rc = $Matches[1] }
+  Write-Q2DzCatalogEvent ('SESSION start build={0} rc={1} os=windows' -f $build,$rc)
+  $stopReason = 'error'
+  $stopCode = 1
   try {
-    $initial = Get-Q2DzLiveTargets -Targets $targets -Q2Path $q2 -ContentCheckPath $contentCheck
-    $targets = $initial.Targets
-  } catch {
+    $q2PathFile = Join-Path $state 'q2-path.txt'
+    $coordinator = Join-Path $app 'q2dz-session.exe'
+    $contentCheck = Join-Path $app 'q2dz-content-check.exe'
+    $gateway = Join-Path $app 'gateway\q2-doszone-webview2-gateway.exe'
+    foreach ($path in $coordinator,$contentCheck,$gateway) {
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $stopReason = 'installation_incomplete'
+        $stopCode = 1
+        throw "Installation is incomplete: $path"
+      }
+    }
+    if (Get-Process 'Q2PRO-X' -ErrorAction SilentlyContinue) {
+      [Windows.Forms.MessageBox]::Show('Close the running Q2PRO-X before joining a Dos.Zone room.','Q2PRO-X - Dos.Zone') | Out-Null
+      $stopReason = 'already_running'
+      $stopCode = 4
+      return $stopCode
+    }
+    $q2 = if (Test-Path $q2PathFile) { (Get-Content $q2PathFile -Raw).Trim() } else { '' }
+    if (-not $q2 -or -not (Test-Path -LiteralPath $q2 -PathType Leaf)) {
+      $picker = New-Object Windows.Forms.OpenFileDialog
+      $picker.Title = 'Select your installed Q2PRO-X.exe'
+      $picker.Filter = 'Q2PRO-X|Q2PRO-X.exe'
+      if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) {
+        $stopReason = 'picker_cancelled'
+        $stopCode = 1
+        return $stopCode
+      }
+      $q2 = $picker.FileName
+      New-Item -ItemType Directory -Force $state | Out-Null
+      Set-Content -LiteralPath $q2PathFile -Value $q2 -Encoding UTF8
+    }
+
+    $targets = New-Q2DzTargetMap
     $initial = $null
+    try {
+      $initial = Get-Q2DzLiveTargets -Targets $targets -Q2Path $q2 -ContentCheckPath $contentCheck
+      $targets = $initial.Targets
+    } catch {
+      $initial = $null
+    }
+    $refresh = {
+      param($currentTargets)
+      Get-Q2DzLiveTargets -Targets $currentTargets -Q2Path $q2 -ContentCheckPath $contentCheck
+    }
+    $initialValue = if ($initial) { $initial } else { $targets }
+    $result = Invoke-Q2DzHub -InitialTargets $initialValue -Q2Path $q2 -CoordinatorPath $coordinator -CoordinatorArguments @(
+      '--gateway', $gateway,
+      '--q2', $q2,
+      '--session-root', (Join-Path $state 'sessions')
+    ) -Refresh $refresh
+    $stopReason = 'coordinator_exit'
+    $stopCode = [int]$result
+    return $result
+  } finally {
+    Write-Q2DzCatalogEvent ('SESSION stop reason={0} rc={1}' -f $stopReason,$stopCode)
   }
-  $refresh = {
-    param($currentTargets)
-    Get-Q2DzLiveTargets -Targets $currentTargets -Q2Path $q2 -ContentCheckPath $contentCheck
-  }
-  $initialValue = if ($initial) { $initial } else { $targets }
-  return (Invoke-Q2DzHub -InitialTargets $initialValue -Q2Path $q2 -CoordinatorPath $coordinator -CoordinatorArguments @(
-    '--gateway', $gateway,
-    '--q2', $q2,
-    '--session-root', (Join-Path $state 'sessions')
-  ) -Refresh $refresh)
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

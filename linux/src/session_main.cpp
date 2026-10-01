@@ -47,6 +47,72 @@ constexpr int kInternal = 70;
 constexpr int kQ2Failure = 74;
 constexpr int kCleanupFailure = 75;
 
+#ifndef Q2DZ_BUILD_VERSION
+#define Q2DZ_BUILD_VERSION "dev"
+#endif
+
+// Sole stderr sink: allow-listed SESSION/TARGET/GATEWAY events (tagged COORDINATOR by the launcher)
+// and other diagnostics (landing as CHILD lines) share this one writer.
+void emit_event(std::string_view line) {
+    std::cerr << line << '\n';
+}
+
+// Maps a gateway-supplied stage/code/reason string onto a safe vocabulary
+// before it reaches TARGET/GATEWAY logging. The gateway's own diagnostic
+// vocabulary (managed_gateway_main.cpp's emit_fatal stage/code, and the
+// shared gateway's TargetFailed/RoomClosed code/reason fields) is not
+// controlled by this coordinator and can contain a sensitivity-filter
+// substring (e.g. "ice") that would otherwise get the whole log line
+// suppressed by the launcher's filter. Mirrors
+// windows/coordinator/src/windows/main.cpp's safe_gateway_reason; kept as a
+// separate copy per coordinator rather than a shared header (D-group
+// decision: duplication accepted here).
+std::string safe_gateway_reason(std::string_view reason) {
+    static const std::unordered_map<std::string_view, std::string_view> kKnownCodes = {
+        {"ice_configuration_failed", "transport_config_failed"},
+        {"ice_configuration_too_large", "transport_config_oversized"},
+        {"ice_required_before_put", "transport_config_missing"},
+        {"invalid_ice_generation", "transport_config_invalid"},
+        {"invalid_ice_server", "transport_config_invalid"},
+        {"invalid_ice_servers", "transport_config_invalid"},
+        {"transport_configure_ice_failed", "transport_startup_failed"},
+        {"startup_configure_ice_failed", "transport_startup_failed"},
+        {"memfd-failed", "transport_startup_failed"},
+    };
+    const auto found = kKnownCodes.find(reason);
+    if (found != kKnownCodes.end()) return std::string(found->second);
+    std::string lowered(reason);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static constexpr std::array<std::string_view, 17> kFilteredTokens = {
+        "credential", "password", "secret", "token", "authorization", "ice",
+        "candidate", "sdp", "turn:", "turns:", "username", "fingerprint",
+        "peer", "local-description", "remote-description", "session-description",
+        "aliaserror",
+    };
+    for (const auto token : kFilteredTokens) {
+        if (lowered.find(token) != std::string::npos) return "transport_reason_redacted";
+    }
+    return std::string(reason);
+}
+
+// Generic allow-listed values are bounded to 64 chars (D11 grammar); room= is
+// the correlation key and the validator already bounds it to 255, so a
+// room-id call site passes max_len=255 explicitly instead of truncating
+// further here (B2).
+std::string log_value(std::string_view value, std::size_t max_len = 64) {
+    std::string out;
+    out.reserve(std::min<std::size_t>(value.size(), max_len));
+    for (const char c : value) {
+        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                          c == ':' || c == '-';
+        out.push_back(safe ? c : '_');
+        if (out.size() >= max_len) break;
+    }
+    return out.empty() ? std::string("none") : out;
+}
+
 std::atomic<int> signal_seen{0};
 int signal_pipe_write = -1;
 void signal_handler(int signal_number) {
@@ -852,7 +918,7 @@ void drain_diagnostics(int fd, std::string& buffer) {
     while (true) {
         const auto newline = buffer.find('\n');
         if (newline == std::string::npos) break;
-        std::cerr << q2dz::sanitize_log_line(std::string_view(buffer).substr(0, newline)) << "\n";
+        emit_event(q2dz::sanitize_log_line(std::string_view(buffer).substr(0, newline)));
         buffer.erase(0, newline + 1);
     }
     if (buffer.size() > 64U * 1024U) buffer.erase(0, buffer.size() - 4096U);
@@ -933,6 +999,7 @@ struct LiveTarget {
     std::optional<q2dz::Endpoint> endpoint;
     std::uint64_t ready_deadline = 0;
     unsigned recovery_count = 0;
+    std::string terminal_reason;
     bool ready = false;
     bool tombstone = false;
     bool closed = false;
@@ -945,11 +1012,37 @@ bool is_dedicated_room(std::string_view room_id) {
     return room_id.starts_with("room.q2ded.");
 }
 
+void emit_target(const LiveTarget& target, std::string_view state,
+                 std::string_view reason, std::string_view retry,
+                 std::size_t published_ready) {
+    emit_event("TARGET room=" + log_value(target.room_id, 255) +
+               " id=" + std::to_string(target.target_id) +
+               " state=" + std::string(state) + " reason=" + log_value(reason) +
+               " recovery=" + std::to_string(target.recovery_count) +
+               " retry=" + std::string(retry) +
+               " published_ready=" + std::to_string(published_ready));
+}
+
 unsigned target_recovery_limit(const LiveTarget& target) {
     // Keep the former per-slot policy: q2 may be recreated once after a
     // post-ready failure, while q2ded has two bounded recovery starts.  The
     // count is carried by room_id across target-id replacement.
     return is_dedicated_room(target.room_id) ? 2U : 1U;
+}
+
+std::string_view retry_decision(const LiveTarget& target) {
+    const bool dedicated = is_dedicated_room(target.room_id);
+    if ((!dedicated && (target.closed || !target.retryable_failure)) ||
+        target.recovery_count >= target_recovery_limit(target)) {
+        return "none";
+    }
+    return "immediate";
+}
+
+void emit_gateway(std::string_view event, std::string_view reason, unsigned restarts) {
+    emit_event("GATEWAY event=" + std::string(event) +
+               " reason=" + log_value(reason) +
+               " restarts=" + std::to_string(restarts));
 }
 
 LiveTarget* find_target(LiveTargets& targets, std::uint64_t target_id) {
@@ -996,7 +1089,7 @@ void stop_live_gateway(LiveGateway& gateway,
     gateway.child.control.reset();
     gateway.child.diagnostics.reset();
     gateway.child.input.reset();
-    std::cerr << "HUB_GATEWAY_STOP reason=" << reason << "\n";
+    emit_event("HUB_GATEWAY_STOP reason=" + std::string(reason));
 }
 
 std::vector<SourceTarget> live_endpoints(const LiveTargets& targets) {
@@ -1111,6 +1204,10 @@ q2dz::Result<void> process_rooms_command(q2dz::HubCommand& command,
         const bool dedicated = is_dedicated_room(current->second.room_id);
         if ((!dedicated && (current->second.closed || !current->second.retryable_failure)) ||
             current->second.recovery_count >= target_recovery_limit(current->second)) {
+            // A PUT against an exhausted tombstone stays ignored; log it so a
+            // stuck room is attributable in the session log.
+            emit_target(current->second, "terminal", current->second.terminal_reason,
+                        "none", live_endpoints(targets).size());
             command.clear();
             return q2dz::Result<void>::ok();
         }
@@ -1140,13 +1237,19 @@ q2dz::Result<void> process_rooms_command(q2dz::HubCommand& command,
         publish_live_source(source, targets);
         return result;
     }
+    if (const auto inserted = targets.find(requested_room); inserted != targets.end()) {
+        emit_target(inserted->second, "pending", "none",
+                    recovery_count > 0 ? "immediate" : "none",
+                    live_endpoints(targets).size());
+    }
     return q2dz::Result<void>::ok();
 }
 
-void mark_target_terminal(LiveTarget& target, bool closed) {
+void mark_target_terminal(LiveTarget& target, bool closed, std::string_view reason) {
     const bool was_ready = target.ready;
     target.endpoint.reset();
     target.ready = false;
+    target.terminal_reason = log_value(reason);
     target.tombstone = true;
     target.closed = closed;
     target.retryable_failure = !closed && (was_ready || is_dedicated_room(target.room_id));
@@ -1170,7 +1273,10 @@ q2dz::Result<void> process_shared_gateway(std::optional<LiveGateway>& gateway,
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         auto event = runtime.event_parser.parse(line);
         q2dz::secure_clear(line);
-        if (!event) return q2dz::Result<void>::fail("invalid-gateway-event: " + event.error().message);
+        if (!event) {
+            emit_gateway("fatal", "event_protocol", 0);
+            return q2dz::Result<void>::fail("invalid-gateway-event: " + event.error().message);
+        }
         const auto id_it = event.value().fields.find("id");
         std::uint64_t target_id = 0;
         if (id_it != event.value().fields.end()) {
@@ -1189,15 +1295,32 @@ q2dz::Result<void> process_shared_gateway(std::optional<LiveGateway>& gateway,
             target->endpoint = endpoint.value();
             target->ready = true;
             publish_live_source(source, targets);
+            emit_target(*target, "ready", "none", "none", live_endpoints(targets).size());
         } else if (event.value().type == q2dz::GatewayEventType::RoomClosed) {
             if (target == nullptr) continue;
-            mark_target_terminal(*target, true);
+            const auto reason_field = event.value().fields.find("reason");
+            mark_target_terminal(*target, true,
+                                 safe_gateway_reason(reason_field != event.value().fields.end()
+                                                         ? reason_field->second : "room_closed"));
             publish_live_source(source, targets);
+            emit_target(*target, "terminal", target->terminal_reason,
+                        retry_decision(*target), live_endpoints(targets).size());
         } else if (event.value().type == q2dz::GatewayEventType::TargetFailed) {
             if (target == nullptr) continue;
-            mark_target_terminal(*target, false);
+            const auto code_field = event.value().fields.find("code");
+            mark_target_terminal(*target, false,
+                                 safe_gateway_reason(code_field != event.value().fields.end()
+                                                         ? code_field->second : "target_failed"));
             publish_live_source(source, targets);
+            emit_target(*target, "terminal", target->terminal_reason,
+                        retry_decision(*target), live_endpoints(targets).size());
+        } else if (event.value().type == q2dz::GatewayEventType::Fatal) {
+            const auto code_field = event.value().fields.find("code");
+            const std::string code = code_field != event.value().fields.end() ? code_field->second : "fatal";
+            emit_gateway("fatal", safe_gateway_reason(code), 0);
+            return q2dz::Result<void>::fail("gateway-fatal: " + safe_gateway_reason(code));
         } else {
+            emit_gateway("fatal", "event_unsupported", 0);
             return q2dz::Result<void>::fail("unsupported-gateway-event");
         }
     }
@@ -1229,7 +1352,9 @@ q2dz::Result<void> process_target_timeouts(LiveTargets& targets,
         if (!target) continue;
         auto dropped = send_hub_drop(*gateway, target_id);
         if (!dropped) return dropped;
-        mark_target_terminal(*target, false);
+        mark_target_terminal(*target, false, "ready_timeout");
+        emit_target(*target, "terminal", target->terminal_reason,
+                    retry_decision(*target), live_endpoints(targets).size());
     }
     if (!expired.empty()) publish_live_source(source, targets);
     return q2dz::Result<void>::ok();
@@ -1252,18 +1377,23 @@ q2dz::Result<void> recover_shared_gateway(std::optional<LiveGateway>& gateway,
     targets.clear();
     if (gateway) {
         stop_live_gateway(*gateway, options, guardian, reason);
+        emit_gateway("stop", reason, restart_count);
         gateway.reset();
     }
     if (restart_count != 0) {
         transport_disabled = true;
-        std::cerr << "HUB_TRANSPORT_DISABLED reason=" << reason << "\n";
+        emit_gateway("fatal", "transport_disabled", restart_count);
+        emit_event("HUB_TRANSPORT_DISABLED reason=" + std::string(reason));
         return q2dz::Result<void>::ok();
     }
     ++restart_count;
     auto restarted = start_shared_gateway(gateway, gateway_path, session_dir, session_id, options, guardian);
     if (!restarted) {
         transport_disabled = true;
-        std::cerr << "HUB_TRANSPORT_DISABLED reason=restart-failed\n";
+        emit_gateway("fatal", "restart_failed", restart_count);
+        emit_event("HUB_TRANSPORT_DISABLED reason=restart-failed");
+    } else {
+        emit_gateway("restart", "none", restart_count);
     }
     return q2dz::Result<void>::ok();
 }
@@ -1276,12 +1406,14 @@ int finish_live_hub(const Options& options,
                     pid_t& q2_pid,
                     Guardian& guardian,
                     CustomSource& source,
+                    unsigned restart_count,
                     std::string_view reason,
                     int result_code) {
     targets.clear();
     source.publish({});
     if (gateway) {
         stop_live_gateway(*gateway, options, guardian, reason);
+        emit_gateway("stop", reason, restart_count);
         gateway.reset();
     }
     source.stop();
@@ -1295,10 +1427,14 @@ int finish_live_hub(const Options& options,
     int guardian_status = 0;
     if (::waitpid(guardian.pid, &guardian_status, 0) != guardian.pid ||
         !WIFEXITED(guardian_status) || WEXITSTATUS(guardian_status) != 0 || !disarm) {
-        std::cerr << "guardian cleanup failed\n";
+        emit_event("guardian cleanup failed");
+        emit_event("SESSION stop reason=" + log_value(reason) +
+                   " rc=" + std::to_string(kCleanupFailure));
         return kCleanupFailure;
     }
-    std::cerr << "SESSION_CLOSED reason=" << reason << "\n";
+    emit_event("SESSION stop reason=" + log_value(reason) +
+               " rc=" + std::to_string(result_code));
+    emit_event("SESSION_CLOSED reason=" + std::string(reason));
     return result_code;
 }
 
@@ -1319,30 +1455,39 @@ int run_live_hub(const Options& options,
     std::optional<LiveGateway> gateway;
     unsigned restart_count = 0;
     bool transport_disabled = false;
+    emit_event("SESSION start build=" + std::string(Q2DZ_BUILD_VERSION) +
+               " session=" + log_value(session_id) +
+               " instance=" + std::to_string(static_cast<long long>(::getpid())) +
+               " gateway_restarts=0");
     if (auto started = source.start(session_id); !started) {
         pid_t no_q2 = -1;
         return finish_live_hub(options, targets, gateway, no_q2, guardian, source,
-                               "source-start-failed", kInternal);
+                               restart_count, "source-start-failed", kInternal);
     }
     source.publish({});
     // A transport child is shared by all targets. Failure to start transport
     // is isolated: Q2 still starts with an empty custom source.
     if (auto started = start_shared_gateway(gateway, gateway_path, session_dir, session_id, options, guardian); !started) {
         transport_disabled = true;
-        std::cerr << "HUB_TRANSPORT_DISABLED reason=start-failed\n";
+        emit_gateway("fatal", "start_failed", restart_count);
+        emit_event("HUB_TRANSPORT_DISABLED reason=start-failed");
+    } else {
+        emit_gateway("start", "none", restart_count);
     }
     auto q2_result = spawn_q2_live(wine, q2, source.url(), options, session_id);
     if (!q2_result) {
         pid_t no_q2 = -1;
-        return finish_live_hub(options, targets, gateway, no_q2, guardian, source, "q2-spawn-failed", kQ2Failure);
+        return finish_live_hub(options, targets, gateway, no_q2, guardian, source,
+                               restart_count, "q2-spawn-failed", kQ2Failure);
     }
     pid_t q2_pid = q2_result.value();
     if (auto registered = q2dz::write_all(guardian.control.get(), "PGID " + std::to_string(q2_pid) + "\n"); !registered) {
         return finish_live_hub(options, targets, gateway, q2_pid, guardian, source,
-                               "guardian-control-failed", kInternal);
+                               restart_count, "guardian-control-failed", kInternal);
     }
     if (auto nonblocking = q2dz::set_nonblocking(STDIN_FILENO); !nonblocking) {
-        return finish_live_hub(options, targets, gateway, q2_pid, guardian, source, "hub-input-failed", kInternal);
+        return finish_live_hub(options, targets, gateway, q2_pid, guardian, source,
+                               restart_count, "hub-input-failed", kInternal);
     }
 
     RoomsCommandReader reader;
@@ -1366,7 +1511,7 @@ int run_live_hub(const Options& options,
         if ((fds[1].revents & (POLLIN | POLLHUP)) != 0 || reader.needs_service()) {
             auto commands = reader.read(STDIN_FILENO, input_eof);
             if (!commands) {
-                std::cerr << "HUB_PROTOCOL_ERROR " << commands.error().message << "\n";
+                emit_event("HUB_PROTOCOL_ERROR " + commands.error().message);
                 result_code = kConfig;
                 closing_reason = "hub-protocol-failed";
                 break;
@@ -1421,7 +1566,8 @@ int run_live_hub(const Options& options,
         closing_reason = "owner-stop";
     }
     if (closing_reason.empty()) closing_reason = "hub-stopped";
-    return finish_live_hub(options, targets, gateway, q2_pid, guardian, source, closing_reason, result_code);
+    return finish_live_hub(options, targets, gateway, q2_pid, guardian, source,
+                           restart_count, closing_reason, result_code);
 }
 
 int child_exit_code(int status) {
@@ -1566,42 +1712,42 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::string_view(argv[1]) == "__guardian") return guardian_main(argc, argv);
     ::umask(0077);
     if (auto hardened = q2dz::disable_core_dumps_and_ptrace(); !hardened) {
-        std::cerr << "hardening failed: " << hardened.error().message << "\n";
+        emit_event("hardening failed: " + hardened.error().message);
         return kInternal;
     }
     auto options = parse_options(argc, argv);
-    if (!options) { std::cerr << options.error().message << "\n"; usage(std::cerr); return kUsage; }
+    if (!options) { emit_event(options.error().message); usage(std::cerr); return kUsage; }
 
     auto gateway = resolve_program(options.value().gateway, {});
     auto legacy = resolve_program(options.value().legacy_gateway, {});
     auto wine = resolve_program(options.value().wine, {"wine64", "wine"});
     auto q2 = discover_q2(options.value());
     if (!gateway || !legacy || !wine || !q2) {
-        if (!gateway) std::cerr << gateway.error().message << "\n";
-        if (!legacy) std::cerr << legacy.error().message << "\n";
-        if (!wine) std::cerr << wine.error().message << "\n";
-        if (!q2) std::cerr << q2.error().message << "\n";
+        if (!gateway) emit_event(gateway.error().message);
+        if (!legacy) emit_event(legacy.error().message);
+        if (!wine) emit_event(wine.error().message);
+        if (!q2) emit_event(q2.error().message);
         return kUnavailable;
     }
     if (!fs::is_regular_file(options.value().adapter)) {
-        std::cerr << "adapter config not found: " << options.value().adapter << "\n";
+        emit_event("adapter config not found: " + options.value().adapter);
         return kUnavailable;
     }
 
     auto runtime_base = prepare_runtime_base(options.value().runtime_base);
-    if (!runtime_base) { std::cerr << runtime_base.error().message << "\n"; return kInternal; }
+    if (!runtime_base) { emit_event(runtime_base.error().message); return kInternal; }
     auto lock = acquire_global_lock(runtime_base.value());
-    if (!lock) { std::cerr << lock.error().message << "\n"; return kUnavailable; }
+    if (!lock) { emit_event(lock.error().message); return kUnavailable; }
     cleanup_stale_sessions(runtime_base.value());
 
     const std::string session_id = q2dz::random_hex(16);
     auto session_dir = create_session_dir(runtime_base.value(), session_id);
-    if (!session_dir) { std::cerr << session_dir.error().message << "\n"; return kInternal; }
+    if (!session_dir) { emit_event(session_dir.error().message); return kInternal; }
     fs::path self = fs::canonical("/proc/self/exe");
     auto guardian = start_guardian(self, runtime_base.value(), session_dir.value(), session_id, options.value().shutdown_grace_ms);
     if (!guardian) {
         (void)q2dz::remove_session_dir_safely(runtime_base.value(), session_dir.value(), session_id);
-        std::cerr << guardian.error().message << "\n";
+        emit_event(guardian.error().message);
         return kInternal;
     }
 

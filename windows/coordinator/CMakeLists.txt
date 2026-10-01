@@ -26,13 +26,16 @@ else()
 endif()
 
 if(WIN32)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION" Q2DZ_VERSION)
+  string(STRIP "${Q2DZ_VERSION}" Q2DZ_VERSION)
   add_executable(q2dz-session
       src/windows/main.cpp
       src/windows/win32_support.cpp
   )
   target_include_directories(q2dz-session PRIVATE include src/windows)
   target_link_libraries(q2dz-session PRIVATE q2dz_core ole32 shell32 ws2_32)
-  target_compile_definitions(q2dz-session PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_definitions(q2dz-session PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+      Q2DZ_BUILD_VERSION="${Q2DZ_VERSION}")
   if(MSVC)
     target_compile_options(q2dz-session PRIVATE /W4 /WX /permissive- /sdl /GS /utf-8 /Brepro)
     target_link_options(q2dz-session PRIVATE /Brepro /INCREMENTAL:NO /OPT:REF /OPT:ICF /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /CETCOMPAT /guard:cf)

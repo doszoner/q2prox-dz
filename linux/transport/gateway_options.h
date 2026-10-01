@@ -15,4 +15,5 @@ struct GatewayOptions {
 
 GatewayOptions parse_gateway_options(int argc, char **argv);
 int gateway_error_exit_code(std::string_view message) noexcept;
+std::string_view gateway_error_category(std::string_view message) noexcept;
 int gateway_receive_exit_code(int length, std::uint32_t from_peer) noexcept;

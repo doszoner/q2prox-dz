@@ -9,6 +9,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -362,6 +363,8 @@ class LauncherTests(unittest.TestCase):
         scenario_names = set()
         for case in CONTRACT_CASES:
             with self.subTest(case=case["name"]):
+                if case["kind"] == "refresh-scenario":
+                    continue
                 if case["kind"] == "heartbeat-scenario":
                     scenario_names.add(case["name"])
                     actual = self._execute_heartbeat_scenario(case)
@@ -697,12 +700,12 @@ class LauncherTests(unittest.TestCase):
                 _plan, log = run_refresh(catalog_rows, aliases)
                 self.assertRegex(
                     log,
-                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z CATALOG_REFRESH "
-                    rf"result=ok stage=plan elapsed_ms=\d+ {counts}\n$",
+                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z LAUNCHER CATALOG_REFRESH "
+                    rf"result=ok stage=plan error=none http=0 elapsed_ms=\d+ {counts} puts=\d+\n$",
                 )
 
         current = {"room.q2.old.1": launch.HubTarget("room.q2.old.1", '{"roomId":"room.q2.old.1"}')}
-        for failure, stage in (("lookup", "lookup"), ("checker", "plan")):
+        for failure, stage, kind in (("lookup", "lookup", "other"), ("checker", "plan", "content_check")):
             with self.subTest(failure=failure):
                 output = io.StringIO()
 
@@ -729,9 +732,9 @@ class LauncherTests(unittest.TestCase):
                 self.assertNotIn("secret-marker", log)
                 self.assertRegex(
                     log,
-                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z CATALOG_REFRESH "
-                    rf"result=error stage={stage} elapsed_ms=\d+ previous=1 ready=2 "
-                    rf"registered={'0' if failure == 'lookup' else '2'} targets=1 drops=0\n$",
+                    rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z LAUNCHER CATALOG_REFRESH "
+                    rf"result=error stage={stage} error={kind} http=0 elapsed_ms=\d+ previous=1 ready=2 "
+                    rf"registered={'0' if failure == 'lookup' else '2'} targets=1 drops=0 puts=0\n$",
                 )
 
     def test_protocol_commands_are_utf8_and_keep_credentials_out_of_argv(self):
@@ -874,6 +877,24 @@ class LauncherTests(unittest.TestCase):
                     opener=lambda _request, timeout, status=status: Response(b"{}", status=status),
                 )
 
+    def test_ordered_constant_is_defined_and_matches_default(self):
+        good = room("room.q2.ordered.1", "41")
+        good["createSettings"]["ordered"] = False
+        self.assertIsNone(launch._room_row_fault(good))
+        bad = room("room.q2.ordered.2", "42")
+        bad["createSettings"]["ordered"] = True
+        self.assertEqual(launch._room_row_fault(bad), ("createSettings.ordered", "range"))
+
+    def test_fetch_json_classifies_a_real_http_error(self):
+        def raise_http_error(_request, _timeout):
+            raise urllib.error.HTTPError(
+                launch.ROOM_ENDPOINT, 503, "Service Unavailable", {}, None
+            )
+
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.fetch_json(launch.ROOM_ENDPOINT, opener=raise_http_error)
+        self.assertEqual(ctx.exception.http_status, 503)
+
     def test_help_and_select_do_not_start_discovery_or_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = subprocess.run(
@@ -911,6 +932,315 @@ class LauncherTests(unittest.TestCase):
             self.assertIsNone(launch.select_q2_path(zenity="/usr/bin/zenity", runner=fake_run))
         self.assertIn("--question", calls[0])
         opened.assert_called_once_with(launch.OFFICIAL_URL)
+
+
+class SessionLogTests(unittest.TestCase):
+    """Group B diagnostics: launcher-owned session log, drain, filter."""
+
+    def setUp(self):
+        launch._session_log.close()
+
+    def tearDown(self):
+        launch._session_log.close()
+
+    def _open_log(self, state_dir):
+        launch._session_log.open(state_dir)
+        return Path(state_dir) / "logs"
+
+    def _stderr_script(self, extra_lines):
+        return (
+            "import sys\n"
+            "for i in range(4000):\n"
+            "    sys.stderr.write('flood-%04d-' % i + 'x' * 96 + '\\n')\n"
+            + "".join(f"sys.stderr.write({line!r} + '\\n')\n" for line in extra_lines)
+            + "sys.stderr.flush()\n"
+        )
+
+    def _run_stderr_child(self, extra_lines, state_dir):
+        plan = launch.TargetPlan({}, [])
+        child = subprocess.Popen(
+            [os.sys.executable, "-c", self._stderr_script(extra_lines)],
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self._open_log(state_dir)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            result = launch.run_hub(
+                plan, "/games/Q2PRO-X.exe",
+                session=Path("session"), managed=Path("managed"),
+                legacy=Path("legacy"), adapter=Path("adapter"),
+                popen=lambda *_args, **_kwargs: child,
+                refresh=lambda *_args: plan, poll_interval=0,
+            )
+        return result, output.getvalue()
+
+    def test_log_file_is_private_and_rotates_at_the_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = self._open_log(Path(tmp) / "state")
+            path = logs / "q2dz.log"
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with mock.patch.object(launch, "_LOG_MAX_BYTES", 1024):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    for number in range(1, 61):
+                        launch.catalog_event(f"HEARTBEAT generation={number} puts=1 drops=0")
+            rotated = logs / "q2dz.1.log"
+            self.assertTrue(rotated.is_file())
+            self.assertFalse((logs / "q2dz.2.log").exists())
+            self.assertGreater(path.stat().st_size, 0)
+            self.assertIn("HEARTBEAT generation=60", path.read_text(encoding="utf-8"))
+
+    def test_unwritable_log_dir_falls_back_to_stderr_and_keeps_refreshing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "state"
+            blocker.mkdir()
+            (blocker / "logs").write_text("not a directory")
+            self._open_log(blocker)
+            self.assertIsNone(launch._session_log.stream)
+            rows = [room(), room("room.q2.other.1", "42")]
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                plan = launch.refresh_targets(
+                    {}, "/games/Q2PRO-X.exe",
+                    fetch=lambda endpoint: {
+                        launch.ROOM_ENDPOINT: catalog(rows),
+                        launch.LOOKUP_ENDPOINT: lookup_for(rows),
+                        launch.RTC_ENDPOINT: rtc_rows(),
+                    }[endpoint],
+                    content_checker="unused",
+                    runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+                )
+            self.assertEqual(len(plan.targets), 2)
+            self.assertIn("LAUNCHER CATALOG_REFRESH result=ok", output.getvalue())
+
+    def test_child_stderr_flood_never_stalls_and_last_lines_are_drained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, launcher_stderr = self._run_stderr_child(
+                [
+                    "TARGET room=room.q2ded.1 id=7 state=terminal reason=transport_failed "
+                    "recovery=3 retry=none published_ready=2",
+                    "credential=CANARY1",
+                    "a=candidate:CANARY2",
+                    "turn:CANARY3@host",
+                    "GATEWAY stats timerTicks=1 udpFromQ2Datagrams=0",
+                    "final-marker before exit",
+                ],
+                Path(tmp) / "state",
+            )
+            self.assertEqual(result, 0)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertIn(
+                "COORDINATOR TARGET room=room.q2ded.1 id=7 state=terminal "
+                "reason=transport_failed recovery=3 retry=none published_ready=2",
+                log_text,
+            )
+            self.assertIn("GATEWAY stats timerTicks=1 udpFromQ2Datagrams=0", log_text)
+            self.assertEqual(log_text.count("CHILD suppressed=1"), 3)
+            self.assertIn("CHILD line=flood-0000-", log_text)
+            self.assertIn("CHILD line=flood-3999-", log_text)
+            self.assertIn("CHILD line=final-marker before exit", log_text)
+            self.assertLess(log_text.index("flood-0000"), log_text.index("flood-3999"))
+            for surface in (
+                log_text,
+                launcher_stderr,
+                (Path(tmp) / "state" / "logs" / "q2dz.1.log").read_text(encoding="utf-8")
+                if (Path(tmp) / "state" / "logs" / "q2dz.1.log").exists() else "",
+            ):
+                self.assertNotIn("CANARY", surface)
+
+    def test_rotation_keeps_canaries_out_of_live_and_rotated_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(launch, "_LOG_MAX_BYTES", 2048):
+                result, _ = self._run_stderr_child(
+                    ["credential=CANARY1"],
+                    Path(tmp) / "state",
+                )
+            self.assertEqual(result, 0)
+            logs = Path(tmp) / "state" / "logs"
+            self.assertTrue((logs / "q2dz.1.log").is_file())
+            for name in ("q2dz.log", "q2dz.1.log"):
+                self.assertNotIn("CANARY", (logs / name).read_text(encoding="utf-8"))
+
+    def test_session_stop_is_emitted_on_the_q2_not_found_early_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(launch, "_state_dir", return_value=Path(tmp) / "state"), \
+                 mock.patch.object(launch, "discover_q2", return_value=None), \
+                 mock.patch.object(launch, "select_q2_path", return_value=None), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(launch.main([]), 3)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertIn("LAUNCHER SESSION start ", log_text)
+            self.assertIn("LAUNCHER SESSION stop reason=q2_not_found rc=3", log_text)
+
+    def test_room_id_containing_a_filter_substring_passes_the_grammar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._run_stderr_child(
+                [
+                    "TARGET room=room.q2ded.nice id=1 state=ready reason=none "
+                    "recovery=0 retry=none published_ready=1",
+                    "a=candidate:deadbeef nice",
+                ],
+                Path(tmp) / "state",
+            )
+            self.assertEqual(result, 0)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertIn(
+                "COORDINATOR TARGET room=room.q2ded.nice id=1 state=ready "
+                "reason=none recovery=0 retry=none published_ready=1",
+                log_text,
+            )
+            self.assertIn("CHILD suppressed=1", log_text)
+            self.assertNotIn("a=candidate:deadbeef nice", log_text)
+
+    def test_event_shaped_line_with_a_secret_field_is_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._run_stderr_child(
+                [
+                    "COORDINATOR TARGET credential=CANARY",
+                    "GATEWAY error password=CANARY",
+                    "TARGET room=room.q2ded.1 id=7 state=terminal reason=credentialCANARY "
+                    "recovery=3 retry=none published_ready=2",
+                ],
+                Path(tmp) / "state",
+            )
+            self.assertEqual(result, 0)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertEqual(log_text.count("CHILD suppressed=1"), 3)
+            self.assertNotIn("CANARY", log_text)
+
+    def test_build_stamp_resolves_installed_layout_prefix_bin_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp)
+            (prefix / "bin").mkdir()
+            script = prefix / "bin" / "q2dz-launch"
+            script.write_text("", encoding="utf-8")
+            (prefix / "VERSION").write_text("rc17", encoding="ascii")
+            with mock.patch.object(launch, "__file__", str(script)):
+                build, rc = launch._build_stamp()
+            self.assertEqual(build, "rc17")
+            self.assertEqual(rc, "17")
+
+    def test_build_stamp_falls_back_to_source_tree_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "linux" / "tools").mkdir(parents=True)
+            script = root / "linux" / "tools" / "q2dz-launch"
+            script.write_text("", encoding="utf-8")
+            (root / "VERSION").write_text("rc18", encoding="ascii")
+            with mock.patch.object(launch, "__file__", str(script)):
+                build, rc = launch._build_stamp()
+            self.assertEqual(build, "rc18")
+            self.assertEqual(rc, "18")
+
+    def test_real_gateway_stop_record_is_not_degraded_to_child_line(self):
+        line = (
+            "GATEWAY stop max_udp_to_transport_datagram=4 "
+            "max_transport_to_udp_datagram=5 oversized_udp_drops=6 "
+            "oversized_transport_drops=7"
+        )
+        self.assertEqual(launch._child_log_text(line), line)
+
+    def test_sensitive_marker_past_the_2048_truncation_point_is_still_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            line = "CANARY" + ("x" * 2048) + " credential=hidden"
+            result, _ = self._run_stderr_child([line], Path(tmp) / "state")
+            self.assertEqual(result, 0)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertIn("CHILD suppressed=1", log_text)
+            self.assertNotIn("credential=hidden", log_text)
+            self.assertNotIn("CHILD line=CANARY", log_text)
+
+    @unittest.skipUnless(
+        os.environ.get("Q2DZ_GATEWAY_BINARY"),
+        "native gateway binary not built (set Q2DZ_GATEWAY_BINARY)",
+    )
+    def test_native_gateway_error_category_has_no_exception_text_through_renderer(self):
+        binary = os.environ["Q2DZ_GATEWAY_BINARY"]
+        result = subprocess.run(
+            [binary, "--bogus-option-CANARY"],
+            capture_output=True, text=True, timeout=5,
+        )
+        stderr_line = result.stderr.strip().splitlines()[-1]
+        self.assertTrue(stderr_line.startswith("GATEWAY_ERROR category="))
+        rendered = launch._child_log_text(stderr_line)
+        self.assertNotIn("CANARY", rendered)
+        self.assertNotIn("bogus-option", rendered)
+        self.assertNotIn("unknown option", rendered)
+
+    def test_truncation_does_not_bypass_event_recognition_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            line = "TARGET room=CANARY " + " ".join(["id=1"] * 406) + " credential=hidden"
+            result, _ = self._run_stderr_child([line], Path(tmp) / "state")
+            self.assertEqual(result, 0)
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertIn("CHILD suppressed=1", log_text)
+            self.assertNotIn("CANARY", log_text)
+
+    def test_session_stop_is_emitted_once_on_a_post_start_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(launch, "_state_dir", return_value=Path(tmp) / "state"), \
+                 mock.patch.object(launch, "discover_q2", side_effect=RuntimeError("boom")), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    launch.main([])
+            log_text = (Path(tmp) / "state" / "logs" / "q2dz.log").read_text(encoding="utf-8")
+            self.assertEqual(log_text.count("LAUNCHER SESSION stop "), 1)
+            self.assertIn("LAUNCHER SESSION stop reason=error rc=1", log_text)
+            self.assertNotIn("boom", log_text)
+
+    def test_catalog_row_missing_owner_is_logged_and_fails_the_refresh(self):
+        # B keeps rc17 strictness: one invalid row still fails the whole
+        # refresh, but it is now named by a CATALOG_ROW diagnostic first.
+        bad = room("room.q2.bad.1")
+        del bad["owner"]
+        rows = [bad, room("room.q2.ok.2", "42")]
+        output = io.StringIO()
+        with self.assertRaises(launch.LaunchError), contextlib.redirect_stderr(output):
+            launch.refresh_targets(
+                {}, "/games/Q2PRO-X.exe",
+                fetch=lambda endpoint: {
+                    launch.ROOM_ENDPOINT: catalog(rows),
+                    launch.LOOKUP_ENDPOINT: lookup_for([rows[1]]),
+                    launch.RTC_ENDPOINT: rtc_rows(),
+                }[endpoint],
+                content_checker="checker",
+                runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+            )
+        log = output.getvalue()
+        self.assertRegex(
+            log,
+            r"CATALOG_ROW result=rejected kind=room room=room\.q2\.bad\.1 "
+            r"index=0 field=owner reason=missing",
+        )
+        self.assertIn("CATALOG_REFRESH result=error stage=catalog error=schema", log)
+
+    def test_http_status_is_classified_on_the_refresh_event(self):
+        output = io.StringIO()
+
+        def fetch(_endpoint):
+            error = launch.LaunchError("Dos.Zone endpoint returned a non-success status")
+            error.http_status = 503
+            raise error
+
+        with self.assertRaises(launch.LaunchError), contextlib.redirect_stderr(output):
+            launch.refresh_targets(
+                {}, "/games/Q2PRO-X.exe", fetch=fetch,
+                content_checker="checker",
+                runner=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+            )
+        self.assertIn(
+            "LAUNCHER CATALOG_REFRESH result=error stage=catalog error=http http=503",
+            output.getvalue(),
+        )
+
+    def test_write_heartbeat_emits_a_heartbeat_event(self):
+        process = FakeProcess()
+        plan = launch.TargetPlan({"room.q2ded.1": launch.HubTarget(
+            "room.q2ded.1", '{"roomId":"room.q2ded.1"}', map_name="q2dm1")}, [])
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.assertIsNone(launch.write_heartbeat(process, plan, generation=3))
+        self.assertIn("LAUNCHER HEARTBEAT generation=3 puts=1 drops=0", output.getvalue())
 
 
 if __name__ == "__main__":

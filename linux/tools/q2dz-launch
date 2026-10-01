@@ -6,11 +6,13 @@ import socket
 import json
 import dataclasses
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import ipaddress
 import urllib.error
@@ -50,12 +52,184 @@ HOSTNAME = re.compile(
 
 
 class LaunchError(RuntimeError):
-    pass
+    def __init__(self, message, category="other"):
+        super().__init__(message)
+        self.category = category
+
+
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+class _SessionLog:
+    """Launcher-owned session log: sole writer, size rotation, stderr fallback."""
+
+    def __init__(self):
+        self.stream = None
+        self.path = None
+
+    def open(self, state_dir):
+        try:
+            directory = Path(state_dir) / "logs"
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = directory / "q2dz.log"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.chmod(path, 0o600)
+            self.stream = os.fdopen(fd, "a", encoding="utf-8")
+            self.path = path
+        except OSError:
+            self.stream = None
+            self.path = None
+
+    def _rotate(self):
+        self.stream.close()
+        rotated = self.path.with_name("q2dz.1.log")
+        try:
+            os.replace(self.path, rotated)
+        except FileNotFoundError:
+            pass
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        self.stream = os.fdopen(fd, "w", encoding="utf-8")
+
+    def write(self, line):
+        if self.stream is None:
+            return
+        try:
+            if self.stream.tell() >= _LOG_MAX_BYTES:
+                self._rotate()
+            self.stream.write(line + "\n")
+            self.stream.flush()
+        except OSError:
+            self.close()
+
+    def close(self):
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except OSError:
+                pass
+        self.stream = None
+
+
+_session_log = _SessionLog()
+
+
+def session_log_line(text):
+    """Write one event line to stderr and to the session log when it is open."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    line = f"{stamp} {text}"
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+    _session_log.write(line)
 
 
 def catalog_event(message):
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"{stamp} {message}", file=sys.stderr, flush=True)
+    session_log_line(f"LAUNCHER {message}")
+
+
+# The child-stderr allow-list filter mirrors contains_sensitive_key +
+# sanitize_log_line in linux/src/common.cpp; keep both lists identical.
+_SENSITIVE_SUBSTRINGS = (
+    "credential", "password", "secret", "token", "authorization", "ice",
+    "candidate", "sdp", "turn:", "turns:", "username", "fingerprint",
+    "local-description", "remote-description", "session-description",
+    "peer id", "peer_id", "peerid", "alias=", 'alias "', "alias lookup",
+    "aliaserror",
+)
+_SDP_FIELD_LETTERS = frozenset("vosiuepcbtrzkam")
+_EVENT_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._:-]{1,64}\Z")
+_ROOM_FIELD = re.compile(r"room=[A-Za-z0-9._-]{1,255}\Z")
+
+
+def _line_sensitive(line):
+    lowered = line.casefold()
+    if any(key in lowered for key in _SENSITIVE_SUBSTRINGS):
+        return True
+    return len(line) >= 2 and line[1] == "=" and line[0].lower() in _SDP_FIELD_LETTERS
+
+
+_EVENT_KEYS = {
+    "TARGET": {"room", "id", "state", "reason", "recovery", "retry", "published_ready"},
+    "SESSION start": {"build", "session", "instance", "gateway_restarts"},
+    "SESSION stop": {"reason", "rc"},
+    "GATEWAY event": {"event", "reason", "restarts"},
+    "GATEWAY stop": {
+        "max_udp_to_transport_datagram", "max_transport_to_udp_datagram",
+        "oversized_udp_drops", "oversized_transport_drops",
+    },
+}
+
+
+def _event_field_valid(field, allowed_keys):
+    key, sep, _value = field.partition("=")
+    if not sep or key not in allowed_keys:
+        return False
+    if key == "room":
+        return bool(_ROOM_FIELD.fullmatch(field))
+    if not _EVENT_FIELD.fullmatch(field):
+        return False
+    return not _line_sensitive(field)
+
+
+def _child_component(tokens):
+    """Allow-listed child event → its log component; '' = already tagged, None = not an event."""
+    if tokens[0] == "TARGET":
+        component, fields, spec = "COORDINATOR", tokens[1:], "TARGET"
+    elif tokens[0] == "SESSION" and len(tokens) > 1 and tokens[1] in ("start", "stop"):
+        component, fields, spec = "COORDINATOR", tokens[2:], f"SESSION {tokens[1]}"
+    elif tokens[0] == "GATEWAY" and len(tokens) > 1 and tokens[1].startswith("event="):
+        component, fields, spec = "COORDINATOR", tokens[1:], "GATEWAY event"
+    elif tokens[0] == "GATEWAY" and len(tokens) > 1 and tokens[1] == "stop":
+        component, fields, spec = "", tokens[2:], "GATEWAY stop"
+    else:
+        return None
+    allowed_keys = _EVENT_KEYS.get(spec)
+    if allowed_keys is None:
+        return None
+    return component if all(_event_field_valid(field, allowed_keys) for field in fields) else None
+
+
+def _child_log_text(line):
+    """Map one raw child-stderr line to its log line (D11 filter + allow-list).
+
+    A line that fully matches the event grammar passes through untouched,
+    even if it contains a filter substring (e.g. room=room.q2ded.nice) — the
+    substring filter only applies to lines outside the grammar.
+    """
+    full_line = line
+    tokens = full_line.split(" ")
+    component = _child_component(tokens) if len(tokens) > 1 else None
+    if component == "":
+        return full_line
+    if component is not None:
+        return f"{component} {full_line}"
+    line = full_line[:2048]
+    if _line_sensitive(full_line):
+        return "LAUNCHER CHILD suppressed=1"
+    escaped = "".join(
+        char if char == "\t" or (0x20 <= ord(char) != 0x7F) else " " for char in line
+    )
+    return f"LAUNCHER CHILD line={escaped[:512]}"
+
+
+def _read_stderr_lines(stream, lines):
+    try:
+        for raw in iter(stream.readline, b""):
+            if not raw:
+                break
+            lines.put(raw.decode("utf-8", "replace").rstrip("\r\n"))
+    except (OSError, ValueError):
+        pass
+
+
+def _drain_stderr(lines):
+    while True:
+        try:
+            line = lines.get_nowait()
+        except queue.Empty:
+            return
+        session_log_line(_child_log_text(line))
 
 
 @dataclasses.dataclass
@@ -86,7 +260,7 @@ def _open_url(request, timeout):
 def _remaining(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise LaunchError("Dos.Zone response timed out")
+        raise LaunchError("Dos.Zone response timed out", category="timeout")
     return remaining
 
 
@@ -108,7 +282,7 @@ def _read_chunk(response, size, deadline):
     try:
         chunk = response.read(size)
     except (socket.timeout, TimeoutError) as exc:
-        raise LaunchError("Dos.Zone response timed out") from exc
+        raise LaunchError("Dos.Zone response timed out", category="timeout") from exc
     _remaining(deadline)
     return chunk
 
@@ -126,14 +300,14 @@ class _DeadlineReader:
         requested = 65536 if size is None or size < 0 else size
         remaining = self.maximum - self.bytes_read
         if remaining < 0:
-            raise LaunchError("Dos.Zone response is too large before decompression")
+            raise LaunchError("Dos.Zone response is too large before decompression", category="json")
         # Read one byte beyond the exact bound so a response ending exactly at
         # MAX_BODY can still prove EOF; reject as soon as a 2MiB+1 byte arrives.
         requested = min(requested, remaining + 1)
         chunk = _read_chunk(self.response, requested, self.deadline)
         self.bytes_read += len(chunk)
         if self.bytes_read > self.maximum:
-            raise LaunchError("Dos.Zone response is too large before decompression")
+            raise LaunchError("Dos.Zone response is too large before decompression", category="json")
         return chunk
 
 
@@ -145,7 +319,7 @@ def _read_bounded(response, deadline):
     elif encoding.casefold() == "gzip":
         is_gzip = True
     else:
-        raise LaunchError("Dos.Zone endpoint returned an unsupported content encoding")
+        raise LaunchError("Dos.Zone endpoint returned an unsupported content encoding", category="json")
     if not is_gzip:
         body = bytearray()
         while True:
@@ -154,7 +328,7 @@ def _read_bounded(response, deadline):
                 break
             body.extend(chunk)
             if len(body) > MAX_BODY:
-                raise LaunchError("Dos.Zone response is too large")
+                raise LaunchError("Dos.Zone response is too large", category="json")
         return bytes(body)
 
     body = bytearray()
@@ -167,11 +341,11 @@ def _read_bounded(response, deadline):
                     break
                 body.extend(chunk)
                 if len(body) > MAX_BODY:
-                    raise LaunchError("Dos.Zone response is too large after decompression")
+                    raise LaunchError("Dos.Zone response is too large after decompression", category="json")
     except LaunchError:
         raise
     except (OSError, EOFError) as exc:
-        raise LaunchError("Dos.Zone returned invalid gzip data") from exc
+        raise LaunchError("Dos.Zone returned invalid gzip data", category="json") from exc
     return bytes(body)
 
 
@@ -196,16 +370,22 @@ def fetch_json(url, opener=None, timeout=FETCH_TIMEOUT):
                 getcode = getattr(response, "getcode", None)
                 status = getcode() if callable(getcode) else None
             if status is not None and not 200 <= int(status) < 300:
-                raise LaunchError("Dos.Zone endpoint returned a non-success status")
+                error = LaunchError("Dos.Zone endpoint returned a non-success status")
+                error.http_status = int(status)
+                raise error
             body = _read_bounded(response, deadline)
     except LaunchError:
         raise
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+    except urllib.error.HTTPError as exc:
+        error = LaunchError(f"cannot fetch {url}: {exc}")
+        error.http_status = int(exc.code)
+        raise error from exc
+    except (OSError, urllib.error.URLError) as exc:
         raise LaunchError(f"cannot fetch {url}: {exc}") from exc
     try:
         return json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise LaunchError(f"invalid JSON from {url}") from exc
+        raise LaunchError(f"invalid JSON from {url}", category="json") from exc
 
 
 def _is_int(value):
@@ -365,14 +545,14 @@ def validate_room_payload(payload):
 
 def ready_rooms(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("rooms"), list):
-        raise LaunchError("room catalog has an invalid schema")
+        raise LaunchError("room catalog has an invalid schema", category="schema")
     strict_rows = [row for row in payload["rooms"] if _strict_room(row)]
     room_ids = [row["room"] for row in strict_rows]
     if len(room_ids) != len(set(room_ids)):
-        raise LaunchError("room catalog has duplicate room ids")
+        raise LaunchError("room catalog has duplicate room ids", category="schema")
     aliases = [_room_alias(row) for row in strict_rows]
     if len(aliases) != len(set(aliases)):
-        raise LaunchError("room catalog has duplicate Q2 aliases")
+        raise LaunchError("room catalog has duplicate Q2 aliases", category="schema")
     rows = [row for row in strict_rows if row["createSettings"]["prefix"] == "q2ded" or row["roomReady"]]
     return sorted(rows, key=lambda row: row["room"])
 
@@ -386,7 +566,7 @@ def joinable_rooms(payload):
 
 def registered_rooms(rows, lookup):
     if not validate_alias_payload(lookup):
-        raise LaunchError("alias lookup has an invalid schema")
+        raise LaunchError("alias lookup has an invalid schema", category="schema")
     registered = set(lookup["aliases"])
     return [row for row in rows if _room_alias(row) in registered]
 
@@ -399,9 +579,36 @@ def _room_alias(row):
     return row["room"] if _room_kind(row) == "q2ded" else f"q2.{row['owner']}"
 
 
+def _row_classifiable(row):
+    """Rows the tolerant gate inspects: supported rows plus rows whose
+    createSettings.prefix is present but not a string — a supported-row
+    shape defect the classifier reports with reason=type. A foreign game
+    carries a string prefix and stays skipped."""
+    if not isinstance(row, dict):
+        return False
+    settings = row.get("createSettings")
+    if not isinstance(settings, dict) or "prefix" not in settings:
+        return False
+    prefix = settings["prefix"]
+    return not isinstance(prefix, str) or prefix in ("q2", "q2ded")
+
+
+def _row_alias_safe(row):
+    """Alias derivation for classification on rows that may be invalid;
+    None when no alias can be derived safely."""
+    if not isinstance(row["createSettings"].get("prefix"), str):
+        return None
+    if _room_kind(row) == "q2ded":
+        return row["room"]
+    owner = row.get("owner")
+    if owner is None or isinstance(owner, bool) or not isinstance(owner, (str, int)):
+        return None
+    return f"q2.{owner}"
+
+
 def _ice_snapshot(rtc_rows):
     if not validate_rtc_payload(rtc_rows):
-        raise LaunchError("RTC configuration has an invalid schema")
+        raise LaunchError("RTC configuration has an invalid schema", category="rtc")
     result = []
     seen = set()
     for row in rtc_rows:
@@ -411,7 +618,7 @@ def _ice_snapshot(rtc_rows):
                 seen.add(key)
                 result.append(server)
     if not 1 <= len(result) <= MAX_ICE_SERVERS:
-        raise LaunchError("global RTC configuration exceeds the supported limit")
+        raise LaunchError("global RTC configuration exceeds the supported limit", category="rtc")
     snapshot_bytes = bytearray()
     try:
         try:
@@ -419,9 +626,9 @@ def _ice_snapshot(rtc_rows):
                 json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             )
         except (TypeError, UnicodeError, ValueError) as exc:
-            raise LaunchError("global ICE snapshot is not valid UTF-8 JSON") from exc
+            raise LaunchError("global ICE snapshot is not valid UTF-8 JSON", category="rtc") from exc
         if len(snapshot_bytes) > MAX_ICE_SNAPSHOT_BYTES:
-            raise LaunchError("global ICE snapshot exceeds 65536 bytes")
+            raise LaunchError("global ICE snapshot exceeds 65536 bytes", category="rtc")
     finally:
         snapshot_bytes[:] = b"\x00" * len(snapshot_bytes)
     return result
@@ -501,7 +708,7 @@ def _copy_targets(targets):
             raise LaunchError("hub target state key does not match room id")
         copied[room_id] = normalized
     if len(copied) > MAX_HUB_TARGETS:
-        raise LaunchError("catalog_capacity_exceeded")
+        raise LaunchError("catalog_capacity_exceeded", category="capacity")
     return copied
 
 
@@ -510,14 +717,14 @@ def _validate_rows(rows):
     seen_aliases = set()
     for row in rows:
         if not _strict_room(row):
-            raise LaunchError("room catalog has an invalid schema")
+            raise LaunchError("room catalog has an invalid schema", category="schema")
         room_id = row["room"]
         if room_id in seen_rooms:
-            raise LaunchError("room catalog has duplicate room ids")
+            raise LaunchError("room catalog has duplicate room ids", category="schema")
         seen_rooms.add(room_id)
         alias = _room_alias(row)
         if alias in seen_aliases:
-            raise LaunchError("room catalog has duplicate Q2 aliases")
+            raise LaunchError("room catalog has duplicate Q2 aliases", category="schema")
         seen_aliases.add(alias)
 
 
@@ -532,7 +739,7 @@ def reconcile_targets(targets, rows, make_config, map_available=lambda _row: Tru
         if row["players"] < row["createSettings"]["maxPlayers"]
     ]
     if len(desired_rows) > MAX_HUB_TARGETS:
-        raise LaunchError("catalog_capacity_exceeded")
+        raise LaunchError("catalog_capacity_exceeded", category="capacity")
 
     updated = {}
     drops = set()
@@ -582,7 +789,7 @@ def reconcile_targets(targets, rows, make_config, map_available=lambda _row: Tru
         updated[room_id] = target
 
     if len(updated) > MAX_HUB_TARGETS:
-        raise LaunchError("catalog_capacity_exceeded")
+        raise LaunchError("catalog_capacity_exceeded", category="capacity")
     return TargetPlan(updated, [], tuple(sorted(drops)))
 
 
@@ -614,7 +821,7 @@ def make_room_config(selected, lookup, rtc_rows, ice_servers=None):
     if not validate_alias_payload(lookup) or alias not in lookup["aliases"]:
         raise LaunchError("selected room alias is no longer registered")
     if not validate_rtc_payload(rtc_rows):
-        raise LaunchError("RTC configuration has an invalid schema")
+        raise LaunchError("RTC configuration has an invalid schema", category="rtc")
     if ice_servers is None:
         ice_servers = _ice_snapshot(rtc_rows)
     elif not isinstance(ice_servers, list) or not 1 <= len(ice_servers) <= MAX_ICE_SERVERS:
@@ -777,12 +984,12 @@ def content_ready(q2_path, map_name, content_checker=None, runner=subprocess.run
             check=False,
         )
     except OSError as exc:
-        raise LaunchError("content checker execution failed") from exc
+        raise LaunchError("content checker execution failed", category="content_check") from exc
     if result.returncode == 0:
         return True
     if result.returncode == 3:
         return False
-    raise LaunchError("content checker execution failed")
+    raise LaunchError("content checker execution failed", category="content_check")
 
 
 def wait_child(process, timeout=10.0):
@@ -819,6 +1026,9 @@ def write_heartbeat(process, plan, generation):
             if code is not None:
                 return code
         process.stdin.flush()
+        catalog_event(
+            f"HEARTBEAT generation={generation} puts={len(plan.targets)} drops={len(plan.drops)}"
+        )
         return None
     except BrokenPipeError:
         code = wait_child(process)
@@ -829,8 +1039,178 @@ def write_heartbeat(process, plan, generation):
         lines.clear()
 
 
+def _room_row_fault(row):
+    """First schema violation of a supported row as (field, reason), in the
+    same check order as _strict_room; None when the row is valid."""
+    settings = row["createSettings"]
+    # A present-but-non-string prefix is a supported-row shape defect, not
+    # a kind — report it instead of letting it pick a validity branch.
+    if not isinstance(settings["prefix"], str):
+        return ("createSettings.prefix", "type")
+    kind = settings["prefix"]
+    for name in ("game", "profile"):
+        if name in settings:
+            if not isinstance(settings[name], str):
+                return (f"createSettings.{name}", "type")
+            if settings[name] != GAME:
+                return (f"createSettings.{name}", "range")
+    if "ordered" in settings:
+        if not isinstance(settings["ordered"], bool):
+            return ("createSettings.ordered", "type")
+        if settings["ordered"] != False:
+            return ("createSettings.ordered", "range")
+    if "room" not in row:
+        return ("room", "missing")
+    if not isinstance(row["room"], str):
+        return ("room", "type")
+    if not _safe_token(row["room"]):
+        return ("room", "identity")
+    if kind == "q2":
+        # A required field whose value is JSON null counts as missing (the
+        # producer had no value): the observed live defect is owner:null.
+        if "owner" not in row or row["owner"] is None:
+            return ("owner", "missing")
+        owner = row["owner"]
+        if isinstance(owner, bool) or (
+            not isinstance(owner, str) and not _is_int(owner)
+        ):
+            return ("owner", "type")
+        if _is_int(owner) and not 0 <= owner <= MAX_JSON_SAFE_INTEGER:
+            return ("owner", "range")
+        if isinstance(owner, str) and not _safe_token(owner, MAX_OWNER):
+            return ("owner", "format")
+        if "roomReady" not in row or row["roomReady"] is None:
+            return ("roomReady", "missing")
+        if not isinstance(row["roomReady"], bool):
+            return ("roomReady", "type")
+        if "rtcServer" not in row or row["rtcServer"] is None:
+            return ("rtcServer", "missing")
+        if not isinstance(row["rtcServer"], str):
+            return ("rtcServer", "type")
+        if not _hostname(row["rtcServer"]):
+            return ("rtcServer", "format")
+    elif not row["room"].startswith("room.q2ded.") or len(row["room"]) <= len("room.q2ded."):
+        return ("room", "format")
+    if "name" not in settings or settings["name"] is None:
+        return ("createSettings.name", "missing")
+    if not _text(settings["name"], MAX_TOKEN):
+        return ("createSettings.name", "format")
+    if "map" not in settings or settings["map"] is None:
+        return ("createSettings.map", "missing")
+    if not isinstance(settings["map"], str):
+        return ("createSettings.map", "type")
+    if not 1 <= len(settings["map"]) <= MAX_MAP or not re.fullmatch(r"[A-Za-z0-9._-]+", settings["map"]):
+        return ("createSettings.map", "format")
+    if "maxPlayers" not in settings or settings["maxPlayers"] is None:
+        return ("createSettings.maxPlayers", "missing")
+    if not _is_int(settings["maxPlayers"]):
+        return ("createSettings.maxPlayers", "type")
+    if not 1 <= settings["maxPlayers"] <= MAX_PLAYERS:
+        return ("createSettings.maxPlayers", "range")
+    if "players" not in row or row["players"] is None:
+        return ("players", "missing")
+    if not _is_int(row["players"]):
+        return ("players", "type")
+    if not 0 <= row["players"] <= settings["maxPlayers"]:
+        return ("players", "range")
+    return None
+
+
+def classify_catalog_rows(catalog):
+    """Every rejected supported row of a room/get payload, identities first;
+    every member of a duplicate group reports reason=duplicate."""
+    rejections = []
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("rooms"), list):
+        return rejections
+    identifiable = []
+    for index, row in enumerate(catalog["rooms"]):
+        if not _row_classifiable(row):
+            continue
+        if not _safe_token(row.get("room")):
+            rejections.append({"index": index, "room": None, "field": "room", "reason": "identity"})
+            continue
+        identifiable.append((index, row))
+        fault = _room_row_fault(row)
+        if fault is not None:
+            rejections.append({
+                "index": index, "room": row["room"], "field": fault[0], "reason": fault[1],
+            })
+    # Duplicate groups are found among all identifiable rows, including ones
+    # already rejected on a field fault (D5): the alias is derived safely so
+    # a faulty row cannot crash or produce a phantom 'q2.' alias.
+    first_room = {}
+    first_alias = {}
+    for index, row in identifiable:
+        room_id = row["room"]
+        if room_id in first_room:
+            for member in (first_room[room_id], (index, room_id)):
+                rejections.append({"index": member[0], "room": member[1], "field": "room", "reason": "duplicate"})
+        else:
+            first_room[room_id] = (index, room_id)
+        alias = _row_alias_safe(row)
+        if alias is not None:
+            if alias in first_alias:
+                for member in (first_alias[alias], (index, room_id)):
+                    rejections.append({"index": member[0], "room": member[1], "field": "alias", "reason": "duplicate"})
+            else:
+                first_alias[alias] = (index, room_id)
+    merged = {}
+    for rejection in rejections:
+        if rejection["index"] not in merged or rejection["reason"] == "duplicate":
+            merged[rejection["index"]] = rejection
+    return [merged[index] for index in sorted(merged)]
+
+
+def emit_catalog_row_rejections(rejections):
+    for rejection in rejections:
+        room_field = f" room={rejection['room']}" if rejection["room"] is not None else ""
+        catalog_event(
+            f"CATALOG_ROW result=rejected kind=room{room_field} index={rejection['index']} "
+            f"field={rejection['field']} reason={rejection['reason']}"
+        )
+
+
 def _room_catalog_is_empty(catalog):
     return isinstance(catalog, dict) and catalog.get("rooms") == []
+
+
+def _refresh_error(exc):
+    """Map a refresh failure to the spec's error= category, without its text."""
+    status = getattr(exc, "http_status", None)
+    if status is not None:
+        return "http", int(status)
+    category = getattr(exc, "category", None)
+    if category is not None and category != "other":
+        return category, 0
+    # Fallback for exceptions without an explicit category (builtin
+    # TimeoutError/socket.timeout, or a LaunchError wrapping an arbitrary
+    # underlying exception's text): classify by message text.
+    message = str(exc)
+    lowered = message.lower()
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in lowered or "timeout" in lowered:
+        return "timeout", 0
+    if "catalog_capacity_exceeded" in message:
+        return "capacity", 0
+    if "content checker" in message:
+        return "content_check", 0
+    if "RTC" in message or "ICE" in message:
+        return "rtc", 0
+    if "non-success status" in message:
+        return "http", 0
+    if "invalid schema" in message or "duplicate" in message:
+        return "schema", 0
+    if (
+        "invalid JSON" in message
+        or "gzip" in message
+        or "too large" in message
+        or "encoding" in message
+        or "empty JSON" in message
+        or "UTF-8" in message
+    ):
+        return "json", 0
+    if "configuration" in message or "one line" in message or "one string" in message:
+        return "config", 0
+    return "other", 0
 
 
 def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runner=subprocess.run):
@@ -838,25 +1218,31 @@ def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runne
     started = time.monotonic()
     result = "error"
     stage = "catalog"
+    error_kind = "none"
+    http_status = 0
     previous_count = len(targets)
     ready_count = registered_count = 0
     target_count = previous_count
-    drop_count = 0
+    drop_count = put_count = 0
     try:
         catalog = fetch(ROOM_ENDPOINT)
+        # Diagnostics only (B): classify and log every rejected row/alias so
+        # tester logs name the culprit, but the gate below is still strict —
+        # one invalid row still fails the whole refresh, as in rc17.
+        emit_catalog_row_rejections(classify_catalog_rows(catalog))
         if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
             try:
                 ready_rooms(catalog)
             except LaunchError:
                 raise
-            raise LaunchError("room catalog has an invalid schema")
+            raise LaunchError("room catalog has an invalid schema", category="schema")
         ready = ready_rooms(catalog)
         ready_count = len(ready)
         stage = "lookup"
         lookup = fetch(LOOKUP_ENDPOINT)
         rows = registered_rooms(ready, lookup)
         registered_count = len(rows)
-        stage = "rtc"
+        stage = "servers"
         rtc_rows = fetch(RTC_ENDPOINT)
         ice_servers = _ice_snapshot(rtc_rows)
 
@@ -873,14 +1259,18 @@ def refresh_targets(targets, q2_path, *, fetch=None, content_checker=None, runne
         plan.ice_servers = ice_servers
         target_count = len(plan.targets)
         drop_count = len(plan.drops)
+        put_count = len(plan.targets)
         result = "ok"
         return plan
+    except Exception as exc:
+        error_kind, http_status = _refresh_error(exc)
+        raise
     finally:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         catalog_event(
-            f"CATALOG_REFRESH result={result} stage={stage} elapsed_ms={elapsed_ms} "
-            f"previous={previous_count} ready={ready_count} registered={registered_count} "
-            f"targets={target_count} drops={drop_count}"
+            f"CATALOG_REFRESH result={result} stage={stage} error={error_kind} http={http_status} "
+            f"elapsed_ms={elapsed_ms} previous={previous_count} ready={ready_count} "
+            f"registered={registered_count} targets={target_count} drops={drop_count} puts={put_count}"
         )
 
 
@@ -899,7 +1289,17 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
         "--game", GAME,
     ]
     starter = popen or runner or subprocess.Popen
-    process = starter(args, stdin=subprocess.PIPE)
+    process = starter(args, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    # The reader only enqueues lines; the launcher main loop drains and writes.
+    stderr_lines = None
+    stderr_reader = None
+    child_stderr = getattr(process, "stderr", None)
+    if child_stderr is not None:
+        stderr_lines = queue.Queue()
+        stderr_reader = threading.Thread(
+            target=_read_stderr_lines, args=(child_stderr, stderr_lines), daemon=True
+        )
+        stderr_reader.start()
     try:
         initial_ice = initial_plan.ice_servers if initial_plan else _targets_ice_servers(targets)
         if initial_ice:
@@ -912,6 +1312,8 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
             code = wait_child(process, timeout=poll_interval)
             if code is not None:
                 return code
+            if stderr_lines is not None:
+                _drain_stderr(stderr_lines)
             child_code = None
 
             def publish(updated):
@@ -925,6 +1327,8 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
                 lambda: refresh_fn(targets, q2_path),
                 publish,
             )
+            if stderr_lines is not None:
+                _drain_stderr(stderr_lines)
             if child_code is not None:
                 return child_code
     finally:
@@ -945,6 +1349,12 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5.0)
+        # A lingering grandchild can hold the inherited stderr handle open; the
+        # bounded join keeps the final drain from hanging on it.
+        if stderr_reader is not None:
+            stderr_reader.join(timeout=3.0)
+        if stderr_lines is not None:
+            _drain_stderr(stderr_lines)
 
 
 def _initial_targets(configs):
@@ -969,12 +1379,13 @@ def _targets_ice_servers(targets):
 
 
 def make_hub_targets(catalog, lookup, rtc_rows, q2_path, *, content_checker=None, runner=subprocess.run):
+    emit_catalog_row_rejections(classify_catalog_rows(catalog))
     if not validate_room_payload(catalog) and not _room_catalog_is_empty(catalog):
         try:
             ready_rooms(catalog)
         except LaunchError:
             raise
-        raise LaunchError("room catalog has an invalid schema")
+        raise LaunchError("room catalog has an invalid schema", category="schema")
     rows = registered_rooms(ready_rooms(catalog), lookup)
     ice_servers = _ice_snapshot(rtc_rows)
     plan = reconcile_targets(
@@ -990,6 +1401,24 @@ def make_hub_configs(catalog, lookup, rtc_rows, q2_path, *, content_checker=None
     return [json.loads(targets[room_id].config) for room_id in sorted(targets)]
 
 
+def _state_dir():
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "q2prox-dz"
+
+
+def _build_stamp():
+    script = Path(__file__).resolve()
+    version = ""
+    for parent_index in (1, 2):
+        try:
+            version = (script.parents[parent_index] / "VERSION").read_text(encoding="ascii").strip()
+            break
+        except OSError:
+            continue
+    build = version if SAFE_TOKEN.fullmatch(version or "") else "unknown"
+    marker = re.search(r"rc(\d+)", build)
+    return build, marker.group(1) if marker else "none"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--help"]:
@@ -1000,10 +1429,15 @@ def main(argv=None):
     if argv:
         print(f"unknown option: {argv[0]}", file=sys.stderr)
         return 64
+    _session_log.open(_state_dir())
+    build, rc = _build_stamp()
+    catalog_event(f"SESSION start build={build} rc={rc} os=linux")
+    stop_reason, stop_code = "error", 1
     try:
         q2_path = discover_q2() or select_q2_path()
         if not q2_path:
-            return 3
+            stop_reason, stop_code = "q2_not_found", 3
+            return stop_code
         paths = _installed_paths()
         try:
             targets = refresh_targets({}, q2_path)
@@ -1021,12 +1455,17 @@ def main(argv=None):
             notify("The Dos.Zone room was closed.", "info")
         elif result != 0:
             notify(f"Dos.Zone session ended unexpectedly (code {result}).")
-        return result
+        stop_reason, stop_code = "coordinator_exit", result
+        return stop_code
     except LaunchError as exc:
         notify(f"Dos.Zone join unavailable: {exc}")
-        return 2
+        stop_reason, stop_code = "error", 2
+        return stop_code
     except KeyboardInterrupt:
-        return 130
+        stop_reason, stop_code = "interrupted", 130
+        return stop_code
+    finally:
+        catalog_event(f"SESSION stop reason={stop_reason} rc={stop_code}")
 
 
 if __name__ == "__main__":

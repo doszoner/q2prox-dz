@@ -53,46 +53,63 @@ def main() -> int:
         if absent:
             raise SystemExit(f"legacy gateway contract is not proven; missing options: {absent}")
 
-    try:
-        ice_fd = os.memfd_create(
-            "q2dz-legacy-contract", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
-        )
-        if os.write(ice_fd, b"[{}]") != 4:
-            raise OSError("short ICE memfd write")
-        os.lseek(ice_fd, 0, os.SEEK_SET)
-        required_seals = (
-            fcntl.F_SEAL_SEAL
-            | fcntl.F_SEAL_SHRINK
-            | fcntl.F_SEAL_GROW
-            | fcntl.F_SEAL_WRITE
-        )
-        fcntl.fcntl(ice_fd, fcntl.F_ADD_SEALS, required_seals)
-        arguments = [
-            str(gateway), "--bind", "127.0.0.1:27999",
-            "--signal", "wss://net.js-dos.com:444",
-            "--ice-file", f"/proc/self/fd/{ice_fd}",
-            "--alias", "q2.contract-test", "--max-datagram", "1400",
-        ]
+    def run_gateway(extra_args: list[str]) -> subprocess.CompletedProcess:
         try:
-            cp = subprocess.run(
-                arguments, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=5, check=False,
-                env={"PATH": "/usr/bin:/bin"}, pass_fds=(ice_fd,),
+            ice_fd = os.memfd_create(
+                "q2dz-legacy-contract", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SystemExit(f"unable to execute legacy gateway contract: {exc}")
-    except OSError as exc:
-        raise SystemExit(f"unable to create sealed ICE memfd: {exc}")
-    finally:
-        if "ice_fd" in locals():
-            os.close(ice_fd)
+            if os.write(ice_fd, b"[{}]") != 4:
+                raise OSError("short ICE memfd write")
+            os.lseek(ice_fd, 0, os.SEEK_SET)
+            required_seals = (
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+            )
+            fcntl.fcntl(ice_fd, fcntl.F_ADD_SEALS, required_seals)
+            arguments = [
+                str(gateway), *extra_args, "--bind", "127.0.0.1:27999",
+                "--signal", "wss://net.js-dos.com:444",
+                "--ice-file", f"/proc/self/fd/{ice_fd}",
+                "--alias", "q2.contract-test", "--max-datagram", "1400",
+            ]
+            try:
+                return subprocess.run(
+                    arguments, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=5, check=False,
+                    env={"PATH": "/usr/bin:/bin"}, pass_fds=(ice_fd,),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise SystemExit(f"unable to execute legacy gateway contract: {exc}")
+        except OSError as exc:
+            raise SystemExit(f"unable to create sealed ICE memfd: {exc}")
+        finally:
+            if "ice_fd" in locals():
+                os.close(ice_fd)
 
-    expected_output = "GATEWAY_ERROR legacy transport initialization failed"
+    cp = run_gateway([])
+    # The intended bounded failure is the sealed-memfd ICE/transport-configure
+    # step inside run_legacy_gateway, which gets its own fixed category
+    # (transport_init_failed) distinct from the generic "startup_failed"
+    # default and from any CLI-argument error (round-4 defect: all three
+    # used to collapse onto "startup_failed").
+    expected_output = "GATEWAY_ERROR category=transport_init_failed"
     if cp.returncode != 2 or cp.stdout.strip() != expected_output:
         raise SystemExit(
             "legacy gateway execution did not reach the expected bounded validation "
             f"path: returncode={cp.returncode}, output={cp.stdout!r}"
+        )
+
+    # Negative control (round-4 defect): an unknown option must NOT satisfy
+    # the same success predicate as the intended bounded init failure above
+    # — it has to land in its own category, not transport_init_failed's.
+    canary = run_gateway(["--bogus-option-CANARY123"])
+    if canary.returncode == 2 and canary.stdout.strip() == expected_output:
+        raise SystemExit(
+            "legacy gateway contract is not discriminating: an unknown option "
+            f"satisfied the transport_init_failed predicate: output={canary.stdout!r}"
         )
 
     print(json.dumps({

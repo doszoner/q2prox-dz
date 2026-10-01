@@ -16,7 +16,12 @@ std::string require_value(int argc, char **argv, int &index) {
 
 int parse_number(const std::string &value) {
     std::size_t consumed = 0;
-    const unsigned long number = std::stoul(value, &consumed);
+    unsigned long number = 0;
+    try {
+        number = std::stoul(value, &consumed);
+    } catch (const std::exception &) {
+        throw std::invalid_argument("invalid number");
+    }
     if (consumed != value.size() || number > std::numeric_limits<int>::max()) {
         throw std::invalid_argument("invalid number");
     }
@@ -70,6 +75,27 @@ GatewayOptions parse_gateway_options(int argc, char **argv) {
 
 int gateway_error_exit_code(std::string_view message) noexcept {
     return message == "Connection to peer was closed" ? 20 : 2;
+}
+
+std::string_view gateway_error_category(std::string_view message) noexcept {
+    // Distinguishes the intended bounded init failure (the sealed-memfd
+    // ICE/transport-configure path the legacy-contract verifier actually
+    // exercises) from CLI argument errors, which otherwise shared the same
+    // default "startup_failed" category (round-4 defect: an unknown or
+    // invalid option impersonated the intended failure in the verifier).
+    // Matched on our own fixed throw messages — never on raw attacker
+    // text — and only the category, never the message, is logged. Any
+    // other runtime failure keeps the generic "startup_failed" default.
+    if (message == "Connection to peer was closed") return "peer_closed";
+    if (message.rfind("unknown option: ", 0) == 0) return "unknown_option";
+    if (message == "missing option value" || message == "invalid number" ||
+        message == "invalid port" || message == "bind must be loopback IPv4" ||
+        message == "invalid or incomplete gateway options" ||
+        message == "invalid or incomplete legacy gateway options") {
+        return "invalid_option";
+    }
+    if (message == "legacy transport initialization failed") return "transport_init_failed";
+    return "startup_failed";
 }
 
 int gateway_receive_exit_code(int length, std::uint32_t from_peer) noexcept {
