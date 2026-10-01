@@ -35,6 +35,7 @@ MAX_ICE_SNAPSHOT_BYTES = 65536
 MAX_HUB_COMMAND_BYTES = 256 * 1024
 MAX_GATEWAY_CONFIG_BYTES = 65535
 HUB_POLL_SECONDS = 15.0
+_DRAIN_SLICE_SECONDS = 1.0
 _AUTO = object()
 MAX_TOKEN = 255
 MAX_OWNER = 250
@@ -154,6 +155,7 @@ _EVENT_KEYS = {
     "SESSION start": {"build", "session", "instance", "gateway_restarts"},
     "SESSION stop": {"reason", "rc"},
     "GATEWAY event": {"event", "reason", "restarts"},
+    "GATEWAY error": {"reason"},
     "GATEWAY stop": {
         "max_udp_to_transport_datagram", "max_transport_to_udp_datagram",
         "oversized_udp_drops", "oversized_transport_drops",
@@ -180,8 +182,8 @@ def _child_component(tokens):
         component, fields, spec = "COORDINATOR", tokens[2:], f"SESSION {tokens[1]}"
     elif tokens[0] == "GATEWAY" and len(tokens) > 1 and tokens[1].startswith("event="):
         component, fields, spec = "COORDINATOR", tokens[1:], "GATEWAY event"
-    elif tokens[0] == "GATEWAY" and len(tokens) > 1 and tokens[1] == "stop":
-        component, fields, spec = "", tokens[2:], "GATEWAY stop"
+    elif tokens[0] == "GATEWAY" and len(tokens) > 1 and tokens[1] in ("error", "stop"):
+        component, fields, spec = "", tokens[2:], f"GATEWAY {tokens[1]}"
     else:
         return None
     allowed_keys = _EVENT_KEYS.get(spec)
@@ -1353,11 +1355,17 @@ def run_hub(configs, q2_path, *, session, managed, legacy, adapter,
         refresh_fn = refresh or refresh_targets
         generation = 1
         while True:
-            code = wait_child(process, timeout=poll_interval)
-            if code is not None:
-                return code
-            if stderr_lines is not None:
-                _drain_stderr(stderr_lines)
+            deadline = time.monotonic() + poll_interval
+            while True:
+                remaining = deadline - time.monotonic()
+                step = max(0.0, min(_DRAIN_SLICE_SECONDS, remaining))
+                code = wait_child(process, timeout=step)
+                if stderr_lines is not None:
+                    _drain_stderr(stderr_lines)
+                if code is not None:
+                    return code
+                if remaining <= 0:
+                    break
             child_code = None
 
             def publish(updated):

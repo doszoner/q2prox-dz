@@ -1171,7 +1171,9 @@ private:
                 close_target(id);
             }
         }
-        std::cerr << "GATEWAY error reason=" << safe_gateway_reason(reason) << "\n";
+        std::ostringstream error_line;
+        error_line << "GATEWAY error reason=" << safe_gateway_reason(reason) << "\n";
+        std::cerr << error_line.str();
         if (window_) PostMessageW(window_, WM_CLOSE, 0, 0);
     }
 
@@ -1228,7 +1230,8 @@ private:
                 if (std::filesystem::exists(user_data_)) Sleep(50);
             }
         }
-        std::cerr << "GATEWAY stop udp_to_web=" << udp_to_web_
+        std::ostringstream stop_line;
+        stop_line << "GATEWAY stop udp_to_web=" << udp_to_web_
                   << " web_to_udp=" << web_to_udp_
                   << " targets=" << active_targets
                   << " max_udp_to_transport_datagram=" << max_udp_to_transport_datagram_
@@ -1239,6 +1242,7 @@ private:
                   << " second_source_drops=" << second_source_drops_
                   << " transport_not_ready_drops=" << transport_not_ready_drops_
                   << " invalid_cadence_drops=" << invalid_cadence_drops_ << "\n";
+        std::cerr << stop_line.str();
     }
 
     static LRESULT CALLBACK window_proc(HWND window, UINT message,

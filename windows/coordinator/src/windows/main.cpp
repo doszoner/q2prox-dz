@@ -53,7 +53,9 @@ constexpr std::size_t kHubCommandsPerCycle = 32;
 // Sole stderr sink: allow-listed SESSION/TARGET/GATEWAY events (tagged COORDINATOR by the launcher)
 // and other diagnostics (landing as CHILD lines) share this one writer.
 void emit_event(std::string_view line) {
-    std::cerr << line << '\n';
+    std::string out(line);
+    out.push_back('\n');
+    std::cerr << out;
 }
 
 // Generic allow-listed values are bounded to 64 chars (D11 grammar); room= is

@@ -58,7 +58,7 @@ Allow-list. Новое событие без строки в этой табли
 | COORDINATOR | `SESSION stop` | `reason= rc=` | конец координатора | чем и с каким кодом завершился координатор |
 | COORDINATOR | `TARGET` | `room= id= state=pending\|ready\|terminal reason=<код> recovery=<n> retry=none\|immediate\|cooldown\|recreate published_ready=<n>` | каждый переход цели | PUT принят (`pending`), endpoint появился (`ready`), цель завершилась (`terminal`); `retry=none` означает «повторять не будем» |
 | COORDINATOR | `GATEWAY` | `event=start\|stop\|fatal\|restart reason=<код> restarts=<n>` | жизненный цикл шлюза | общий транспорт поднялся, остановлен, упал фатально или перезапущен |
-| GATEWAY | `GATEWAY stats\|error\|stop` | числовые поля шлюза (`windows/gateway/src/main.cpp`, `linux/src/managed_gateway_main.cpp`) | каденс/ошибка/остановка шлюза | счётчики и причина остановки самого шлюза |
+| GATEWAY | `GATEWAY stats\|error\|stop` | числовые поля шлюза (`windows/gateway/src/main.cpp`, `linux/src/managed_gateway_main.cpp`, `linux/transport/q2_doszone_gateway.cpp`) | каденс/ошибка/остановка шлюза | счётчики и причина остановки самого шлюза |
 
 ## Фильтр секретов
 
@@ -111,6 +111,4 @@ SDP, тела сообщений чата, отвергнутые алиасы �
 
 ## Проверка множества событий
 
-`noncommit/q2prox-rooms-fix-plan/events-vs-table.sh` сравнивает имена
-событий, которые реально пишут лаунчеры, координаторы и шлюзы, с колонкой
-EVENT этой таблицы; множества должны совпадать.
+Правило: у каждого реально отправляемого события есть строка в таблице выше, и наоборот.

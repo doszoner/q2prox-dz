@@ -897,7 +897,9 @@ int main(int argc, char** argv) {
         if (options.legacy_arguments) return run_legacy_gateway(options);
         return Gateway(options).run();
     } catch (const std::exception& error) {
-        std::cerr << "GATEWAY_ERROR category=" << gateway_error_category(error.what()) << '\n';
+        const std::string error_line =
+            "GATEWAY error reason=" + std::string(gateway_error_category(error.what())) + "\n";
+        std::cerr << error_line;
         return gateway_error_exit_code(error.what());
     }
 }

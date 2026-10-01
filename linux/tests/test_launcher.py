@@ -8,6 +8,8 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -1308,6 +1310,54 @@ class SessionLogTests(unittest.TestCase):
             ):
                 self.assertNotIn("CANARY", surface)
 
+    def test_stderr_line_mid_poll_interval_is_drained_within_a_second(self):
+        # Proves the wait is sliced to <= _DRAIN_SLICE_SECONDS: a long
+        # poll_interval must not delay the drain until the child exits or
+        # the interval elapses. Fails on the pre-fix code, which only
+        # drains after wait_child(timeout=poll_interval) returns.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            self._open_log(state_dir)
+            marker = "drain-latency-marker-7"
+            script = (
+                "import sys, time\n"
+                f"sys.stderr.write({marker!r} + chr(10)); sys.stderr.flush()\n"
+                "time.sleep(2.5)\n"
+            )
+            child = subprocess.Popen(
+                [os.sys.executable, "-c", script],
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            plan = launch.TargetPlan({}, [])
+            refresh_calls = []
+            log_path = state_dir / "logs" / "q2dz.log"
+            seen = threading.Event()
+
+            def watch():
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if log_path.exists() and marker in log_path.read_text(encoding="utf-8"):
+                        seen.set()
+                        return
+                    time.sleep(0.05)
+
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                result = launch.run_hub(
+                    plan, "/games/Q2PRO-X.exe",
+                    session=Path("session"), managed=Path("managed"),
+                    legacy=Path("legacy"), adapter=Path("adapter"),
+                    popen=lambda *_args, **_kwargs: child,
+                    refresh=lambda *_args: refresh_calls.append(1) or plan,
+                    poll_interval=30,
+                )
+            watcher.join(timeout=3.0)
+            self.assertEqual(result, 0)
+            self.assertTrue(seen.is_set(), "marker was not drained to the log within ~1s")
+            self.assertEqual(refresh_calls, [])
+
     def test_rotation_keeps_canaries_out_of_live_and_rotated_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(launch, "_LOG_MAX_BYTES", 2048):
@@ -1400,6 +1450,10 @@ class SessionLogTests(unittest.TestCase):
         )
         self.assertEqual(launch._child_log_text(line), line)
 
+    def test_real_gateway_error_record_is_not_degraded_to_child_line(self):
+        line = "GATEWAY error reason=transport_init_failed"
+        self.assertEqual(launch._child_log_text(line), line)
+
     def test_sensitive_marker_past_the_2048_truncation_point_is_still_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             line = "CANARY" + ("x" * 2048) + " credential=hidden"
@@ -1421,8 +1475,9 @@ class SessionLogTests(unittest.TestCase):
             capture_output=True, text=True, timeout=5,
         )
         stderr_line = result.stderr.strip().splitlines()[-1]
-        self.assertTrue(stderr_line.startswith("GATEWAY_ERROR category="))
+        self.assertTrue(stderr_line.startswith("GATEWAY error reason="))
         rendered = launch._child_log_text(stderr_line)
+        self.assertEqual(rendered, stderr_line)
         self.assertNotIn("CANARY", rendered)
         self.assertNotIn("bogus-option", rendered)
         self.assertNotIn("unknown option", rendered)

@@ -95,7 +95,7 @@ def main() -> int:
     # (transport_init_failed) distinct from the generic "startup_failed"
     # default and from any CLI-argument error (round-4 defect: all three
     # used to collapse onto "startup_failed").
-    expected_output = "GATEWAY_ERROR category=transport_init_failed"
+    expected_output = "GATEWAY error reason=transport_init_failed"
     if cp.returncode != 2 or cp.stdout.strip() != expected_output:
         raise SystemExit(
             "legacy gateway execution did not reach the expected bounded validation "

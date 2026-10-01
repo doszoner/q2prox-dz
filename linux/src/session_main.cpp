@@ -54,7 +54,9 @@ constexpr int kCleanupFailure = 75;
 // Sole stderr sink: allow-listed SESSION/TARGET/GATEWAY events (tagged COORDINATOR by the launcher)
 // and other diagnostics (landing as CHILD lines) share this one writer.
 void emit_event(std::string_view line) {
-    std::cerr << line << '\n';
+    std::string out(line);
+    out.push_back('\n');
+    std::cerr << out;
 }
 
 // Maps a gateway-supplied stage/code/reason string onto a safe vocabulary
