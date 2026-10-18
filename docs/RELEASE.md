@@ -5,10 +5,12 @@
 [`1.0.0-rc6`](verification/1.0.0-rc6.md) и
 [`1.0.0-rc7`](verification/1.0.0-rc7.md) сохраняют исторические результаты и
 последующие field findings. `1.0.0-rc8` сохраняет предыдущий проверенный
-rollback. Кандидат Linux/Windows `1.0.0-rc17` получает PASS только из
-[`1.0.0-rc17`](verification/1.0.0-rc17.md), где должны быть зафиксированы
-точные результаты компонентных, live и package gates.
-Предыдущие архивы Linux rc15 и Windows rc16 сохраняются отдельно.
+rollback. Текущий Linux candidate `1.0.0-rc18` и ожидаемые Windows
+portable/setup отслеживаются в [ведомости rc18](verification/1.0.0-rc18.md).
+Все три поставки должны использовать один release source commit и VERSION;
+Windows продолжает человек по [handoff](verification/2026-10-18-nearest-turn-windows-handoff.md).
+Исторические результаты [rc17](verification/1.0.0-rc17.md) не подтверждают rc18.
+Общий alpha rc18 собирается только после готовности Windows.
 
 Пользователю следует публиковать только canonical архивы и соседние
 `.sha256`:
@@ -47,7 +49,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\product\build-
   -WebView2Package C:\deps\Microsoft.Web.WebView2.1.0.4129.50.nupkg `
   -WebRtcNetSourceDir C:\deps\WebRTC-NET `
   -WebRtcNetReleaseDir C:\deps\webrtc-release `
-  -OutputDir .\dist\windows-1.0.0-rc17
+  -OutputDir .\dist\windows-1.0.0-rc18
 ```
 
 Команда проверяет `deps.lock.json`, извлекает SDK из locked NuGet, собирает
@@ -66,12 +68,14 @@ prerequisites и локальная component-сборка описаны в
 ```bash
 export Q2DZ_WEBRTC_NET_RELEASE_DIR=/path/to/pinned/webrtc-release
 export Q2DZ_WEBRTC_NET_SOURCE_DIR=/path/to/WebRTC-NET
-tools/build-release.sh
 tools/run-sanitizers.sh
 tools/check-reproducible.sh
-tools/build-package.sh
 tests/package_smoke.sh
 ```
+
+`tests/package_smoke.sh` вызывает `build-package.sh`, который выполняет полный
+`build-release.sh`; отдельные повторы этих сборок не требуются. Установить
+`TMPDIR` на каталог evidence вне checkout; smoke сохраняет там готовый архив.
 
 `Q2DZ_WEBRTC_NET_RELEASE_DIR` supplies the matching headers and shared
 libraries. `Q2DZ_WEBRTC_NET_SOURCE_DIR` supplies only the upstream license and

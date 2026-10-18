@@ -1,10 +1,53 @@
-# Nearest TURN: передача проверки на Windows
+# Передача Windows release 1.0.0-rc18 и проверки nearest TURN
 
-Состояние на 2026-10-18. Следующему исполнителю нужно проверить Windows-часть
-`q2prox-nearest-turn`: задачи **1.3, 2.4 и 3.4** пока открыты. Реализация находится
-в коммите `2cf4173`, результаты Linux отражены в `4b67b6e`; ветка —
-`feat/q2prox-nearest-turn`. Для продолжения нужен checkout с этими коммитами
-и этим документом. Локальные файлы предыдущего исполнителя не требуются.
+## Начать здесь: Windows из того же release source
+
+Linux `1.0.0-rc18` собирается отдельно в текущей задаче. Человек завершает
+только Windows portable/setup и общую комплектацию выпуска. Windows VM на
+этой машине отсутствует; Windows здесь не собираем и не проверяем.
+
+1. В существующем GitHub Draft rc18 взять **полный source SHA из release notes
+   и соответствующего release tag**. Получить чистый checkout именно этого SHA;
+   проверить `git rev-parse HEAD` и VERSION `1.0.0-rc18`. Если tag/notes ещё нет
+   или SHA расходятся, получить их у владельца draft до сборки. Новый номер
+   не выбирать, VERSION не менять, Linux не пересобирать. Итоги и SHA Linux — в
+   [ведомости rc18](1.0.0-rc18.md). Фактический SHA будет записан после metadata commit.
+2. Подготовить Windows dependencies строго по [deps.lock.json](../../deps.lock.json):
+   WebView2 NuGet `1.0.4129.50` и WebRTC-NET commit
+   `62fe52cd20bae55baf03339afee60c895f1aee90` с locked submodules и release files.
+   Выполнить canonical `windows/product/build-payload.ps1` из
+   [RELEASE.md](../RELEASE.md#Windows), включая встроенные dependency, CTest/Node,
+   `/Brepro` и fresh-extract real-PE smoke gates. Локальные пути и `/tmp`
+   предыдущего исполнителя не нужны; зависимости подготовить на своей машине.
+3. Выполнить Windows PowerShell **5.1** suites и live задачи **1.3, 2.4, 3.4**
+   по checklist ниже. Проверить именно новые portable/setup после распаковки;
+   source launcher проверяется дополнительно. Записать Windows/PowerShell/toolchain,
+   source SHA, exit codes и фактические результаты; незакрытые задачи оставить открытыми.
+4. Получить `q2prox-dz-1.0.0-rc18-windows-x64-portable.zip` и
+   `q2prox-dz-1.0.0-rc18-windows-x64-setup.zip` с соседними `.sha256`.
+   Проверить VERSION, внутренние SHA256SUMS, licenses/allowlists и fresh-extract
+   smoke, записать реальные SHA-256 в ведомость и notes. Старые rc17 не подмешивать.
+5. Загрузить Windows ZIP и sidecars в **существующий Draft rc18**, сохранив
+   Linux tar.gz и его SHA-256. Только после готовности обеих Windows поставок
+   собрать `q2prox-dz-alpha-1.0.0-rc18-<YYYYMMDD>.zip` из всех трёх поставок
+   **этого source commit**, sidecars, инструкций и changelog; добавить SHA-256
+   общего архива и обновить draft notes/ведомость. Linux-only alpha не создавать.
+
+Unsigned Windows candidates допустимы только в закрытой alpha-группе с явным
+предупреждением. До широкого публичного выпуска нужен Authenticode gate и
+повторная проверка exact release archives. Публикация/latest здесь не разрешены;
+критерии выпуска определяет [RELEASE.md](../RELEASE.md).
+
+Linux nearest TURN ранее проверен из исходников; это **не gameplay-приёмка
+нового Linux архива**. Windows PowerShell 5.1/live ожидаются. Серверные TURN
+allocations не измерены, защита общей квоты не реализована.
+
+## Продолжение: Windows checklist nearest TURN
+
+Состояние на 2026-10-18: задачи **1.3, 2.4 и 3.4** пока открыты. Реализация
+находится в коммите `2cf4173`, результаты Linux отражены в `4b67b6e`;
+они входят в release source commit rc18. Для продолжения нужен checkout
+именно этого commit с этим документом. Локальные файлы предыдущего исполнителя не требуются.
 
 Контекст: [proposal](../../openspec/changes/q2prox-nearest-turn/proposal.md),
 [design](../../openspec/changes/q2prox-nearest-turn/design.md),
@@ -139,6 +182,6 @@ exit codes, результаты шагов живого сценария и о�
 credentials, cookies и полные join URL. Сырые evidence держать вне Git.
 
 После проверки обновить статусы в OpenSpec и краткую сводку в документации.
-Не архивировать change до закрытия Windows-пунктов. Повторять завершённые
-Linux-проверки без изменения кода не требуется. Push, выпуск архива и публикация
-не входят в эту передачу; до публикации коммитов другой машине нужен их перенос.
+Не архивировать change до закрытия Windows-пунктов. Повторять завершённые Linux-проверки исходников и пересобирать Linux не требуется.
+Windows release archives проходят собственные gates по RELEASE.md. Загрузить их
+в существующий Draft rc18; публикация — после выполнения критериев RELEASE.md.

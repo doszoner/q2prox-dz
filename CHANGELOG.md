@@ -11,6 +11,11 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc18] - 2026-10-18
+
+Linux release candidate; Windows portable/setup ожидаются из того же source commit.
+Результаты и ограничения: `docs/verification/1.0.0-rc18.md`.
+
 ### Added
 
 - Журнал сессии на диске с ротацией, безопасными событиями каталога,
@@ -281,6 +286,7 @@ Linux-пакет и общий архив перепакованы 2026-09-06 с
   PAK-файлы пользователя.
 
 [Unreleased]: https://github.com/doszoner/q2prox-dz/compare/e8c465b...HEAD
+[1.0.0-rc18]: docs/verification/1.0.0-rc18.md
 [1.0.0-rc17]: docs/verification/1.0.0-rc17.md
 [1.0.0-rc16]: docs/verification/1.0.0-rc16.md
 [1.0.0-rc15]: https://github.com/doszoner/q2prox-dz/compare/v1.0.0-rc14...v1.0.0-rc15
