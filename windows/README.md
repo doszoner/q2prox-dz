@@ -40,7 +40,12 @@ coordinator и удаляет его session directory даже при жёст�
 
 Единственная release-chain инструкция находится в
 [`docs/RELEASE.md`](../docs/RELEASE.md). Для локальной component-сборки нужны
-MSVC, CMake, Python 3, Node.js, WebView2 SDK и locked WebRTC-NET JS/WASM release:
+Visual Studio 2022 / Build Tools 2022 с MSVC v143 x64/x86 и Windows SDK,
+CMake ≥ 3.24, Python 3, Node.js, WebView2 SDK и locked WebRTC-NET JS/WASM release.
+Release-скрипт явно выбирает генератор `Visual Studio 17 2022`.
+Подготовка новой Windows-машины, получение зависимостей и команда выпуска rc18 —
+в [Windows handoff](../docs/verification/2026-10-18-nearest-turn-windows-handoff.md#подготовка-новой-windows-машины).
+Пример отдельной component-сборки:
 
 ```powershell
 cmake -S .\windows\gateway -B .\windows\gateway\build -A x64 `

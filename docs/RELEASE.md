@@ -42,6 +42,12 @@ raw VM evidence, логи, build directories и credentials. Tracked public tree
 
 ## Windows
 
+Для rc18 сначала пройти [подготовку новой Windows-машины](verification/2026-10-18-nearest-turn-windows-handoff.md#подготовка-новой-windows-машины).
+Там указаны компоненты Visual Studio 2022, получение точных JS/WASM-файлов
+из Draft и проверка зависимостей. Один clone WebRTC-NET не даёт готовых JS/WASM.
+Архив `windows-build-inputs.zip` — вспомогательные зависимости сборки,
+он не заменяет portable/setup и не входит в общий пользовательский alpha.
+
 Из корня checkout:
 
 ```powershell
@@ -60,6 +66,11 @@ fresh-extract real-PE smoke для portable и setup. В output остаются
 `package-windows.ps1` не является пользовательским release API. Windows
 prerequisites и локальная component-сборка описаны в
 [windows/README.md](../windows/README.md).
+
+Выходной каталог должен отсутствовать или быть пустым. После неудачной сборки
+использовать новый каталог; временный каталог диагностики сохраняет сам скрипт.
+Команды загрузки Windows-файлов и комплектации общего архива приведены
+[в конце handoff](verification/2026-10-18-nearest-turn-windows-handoff.md#комплектация-и-загрузка-в-draft).
 
 ## Linux
 
