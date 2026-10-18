@@ -32,7 +32,7 @@ Browser UI send/read подтверждены, но собственная пр�
   внутреннего heartbeat не выполнялись.
 
 Прежнее «мы умеем отправлять» верно для браузерного участника, не для
-независимого нативного отправителя. Разрешение данного опыта уже получено.
+независимого нативного отправителя. Разрешение этого опыта уже получено.
 Оно не создаёт интерфейс Q2PRO-X и не доказывает отправку без браузера.
 
 ## Supplemental: sibling-кандидаты direct browser iframe
@@ -121,7 +121,7 @@ SHA-256 `4c62141c878f4d8623a5232f032fe95787cb1721adea99423e4fc0c942bfe4fd`,
 
 Это не история и не гарантированная доставка. Snapshot содержал 35 room rows,
 из них 3 `q2ded`; в них были `players`/`onlineUsers`, но не было
-`connected_peers`. Это наблюдение данного snapshot, а не доказательство, что
+`connected_peers`. Это наблюдение этого snapshot, а не доказательство, что
 `players` означает chat participants. Target также трактует `players` как
 browser lobby count, а не полный native count: `docs/ARCHITECTURE.md:53-75`.
 
@@ -133,7 +133,7 @@ fromName, peerId}`. В heartbeat `updatePeer(room)` он отправляет т
 `mySecret` через `POST https://cloud.dos.zone/room/update`.
 
 Это наблюдение сделано по статическому текущему bundle; сам POST не вызывался.
-Вызов является внутренним browser participant heartbeat, а не опубликованным
+Вызов служит внутренним browser participant heartbeat, а не опубликованным
 native send endpoint. Client-side ограничения, видимые в bundle (`minInterval`
 около 2 s, длина до 120, burst/cooldown и повтор сообщения), нельзя считать
 server-side moderation или authorization contract.
@@ -284,7 +284,7 @@ upstream release; `q2prox-dz` не должен подменять устано�
 изолированный companion proposal: polling public `/room/get`, exact room
 matching, ограниченная память сообщений и явное «отправка недоступна». Это не
 означает, что текущий hub уже выдаёт active-room mapping. Никаких replay или
-probe `/room/update` в рамках этой работы не выполнялось.
+probe `/room/update` в этой работе не выполнялось.
 
 ## Итоговые границы решения
 

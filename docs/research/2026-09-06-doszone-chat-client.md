@@ -649,7 +649,7 @@ The shipped `/en` path is narrowly `input → HTTP translation provider →
 current-prompt replacement → explicit user Enter through the ordinary
 game-chat recipient`. Its documented workflow provides no room/connection-
 epoch binding, HUD/render callback, or separate Dos.Zone recipient. Manual
-Enter is not itself a defect—the intended UX is explicit—but this path does
+Enter is not itself a defect (the intended UX is explicit), but this path does
 not establish client-owned delivery.
 
 The inspected contract also does not define an opaque typed-data result

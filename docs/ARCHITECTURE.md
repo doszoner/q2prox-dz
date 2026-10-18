@@ -1,7 +1,7 @@
 # Архитектура
 
-`q2prox-dz` — один репозиторий с общим контрактом сессии и двумя платформенными
-поставками.
+`q2prox-dz` объединяет в одном репозитории общий контракт сессии и две платформенные
+поставки.
 
 ## Supported Product Contract (нормативный)
 
@@ -17,7 +17,7 @@
 
 Текущий catalog может не содержать отдельных полей `game`/`profile`/`ordered`;
 их отсутствие допустимо. Если поле присутствует, `game` и `profile` должны быть
-`3zb2`, а `ordered` — строго `false`; конфликтующая строка отбрасывается до
+`3zb2`, а `ordered` должно быть строго `false`; конфликтующая строка отбрасывается до
 получения RTC/ICE credentials. Это не контракт совместимости с произвольными
 Quake II forks или другими играми Dos.Zone.
 
@@ -28,7 +28,7 @@ bytes принимаются, `1401` и больше отбрасываются,
 `1400`. В shutdown-диагностике gateway есть только четыре size/drop поля:
 `max_udp_to_transport_datagram`, `max_transport_to_udp_datagram`,
 `oversized_udp_drops` и `oversized_transport_drops`. Maxima учитывают только
-принятые datagram, drop counters — только наблюдаемый исходный размер выше
+принятые datagram, drop counters учитывают только наблюдаемый исходный размер выше
 предела. Payload, room JSON, alias, ICE/TURN credentials, SDP/candidates и
 tokens в эту диагностику не попадают.
 
@@ -86,9 +86,9 @@ Quake II status. Подробный контракт: [ADR 0004](adr/0004-q2pro-
 
 ## Windows
 
-- `windows/product/` — пользовательский launcher и portable/setup packaging;
-- `windows/coordinator/` — lifecycle, content check и managed protocol;
-- `windows/gateway/` — WebView2 gateway source и web assets.
+- `windows/product/`: пользовательский launcher и portable/setup packaging;
+- `windows/coordinator/`: lifecycle, content check и managed protocol;
+- `windows/gateway/`: WebView2 gateway source и web assets.
 
 Coordinator использует Windows Job Object с `KILL_ON_JOB_CLOSE`. WebView2
 нужен только как поддерживаемый WebRTC runtime; portal automation не
@@ -96,8 +96,8 @@ Coordinator использует Windows Job Object с `KILL_ON_JOB_CLOSE`. WebV
 
 ## Linux
 
-- `linux/` — launcher, coordinator, guardian, installer и tests;
-- `linux/transport/` — используемый WebRTC-NET transport adapter.
+- `linux/`: launcher, coordinator, guardian, installer и tests;
+- `linux/transport/`: используемый WebRTC-NET transport adapter.
 
 Q2PRO-X запускается через Wine. У каждого gateway и Q2 отдельная process group;
 guardian очищает весь набор по session marker и удаляет session directory при

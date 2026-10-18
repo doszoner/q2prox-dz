@@ -78,8 +78,8 @@ players      0..maxPlayers
 maxPlayers   1..64
 ```
 
-В coordinator уходит прежний compact room JSON. Для `q2ded` `roomId` является
-и coordinator-facing identity: он уникален, начинается с `room.q2ded.` и
+В coordinator уходит прежний compact room JSON. Для `q2ded` `roomId` также служит
+coordinator-facing identity: он уникален, начинается с `room.q2ded.` и
 укладывается в существующий предел 255 байт. Хеши и generation tokens не нужны.
 
 ### Legacy `q2`

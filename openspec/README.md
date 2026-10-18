@@ -6,10 +6,10 @@
 workspace: команды выполнять из корня `q2prox-dz`, а не `DosZone`.
 Они не входят в пользовательские бинарные архивы.
 
-| Change | Состояние по `36e0663` | Что остаётся |
+| Change | Состояние на 2026-10-18 | Что остаётся |
 | --- | --- | --- |
 | [fix-q2prox-rooms-vanish](changes/fix-q2prox-rooms-vanish/proposal.md) | Logging и tolerant rows реализованы в исходниках после rc17 | Recovery группы D условный и не реализован; старые отметки проверок не являются новой приёмкой |
-| [q2prox-nearest-turn](changes/q2prox-nearest-turn/proposal.md) | Предложение, код не изменён | Выбор ICE на обеих ОС; последующее ограничение соединений отдельно |
+| [q2prox-nearest-turn](changes/q2prox-nearest-turn/proposal.md) | Реализовано в `2cf4173`; компонентные проверки и Linux-сценарий завершены | Windows PowerShell 5.1 и Windows-сценарий: [handoff](../docs/verification/2026-10-18-nearest-turn-windows-handoff.md). Ограничение соединений отдельно |
 
 Delta specs внутри `changes/` содержат также ещё не реализованные требования.
 Не переносить их целиком в базовые specs и не архивировать change как завершённый.

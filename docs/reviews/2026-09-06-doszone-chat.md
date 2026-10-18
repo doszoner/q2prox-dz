@@ -155,7 +155,7 @@ minor core test подтвердил valid heartbeat/full-byte order.
   whitespace-проверка не обнаружила ошибок. Текущий рабочий tree содержит
   параллельные Task 4 изменения; этот review их не редактировал.
 
-Ни игра/Wine, ни VM не запускались в рамках этого review. Task 4 coordinator
+Ни игра/Wine, ни VM не запускались в этом review. Task 4 coordinator
 изменения и сборочные результаты зафиксированы выше; Q2PRO-X, Quake-сервер и
 WebRTC/HumbleNet этим review не изменялись. Commit/push не выполнялись.
 
