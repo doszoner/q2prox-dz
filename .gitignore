@@ -6,3 +6,10 @@ linux/build*/
 linux/dist/
 __pycache__/
 *.secret.json
+
+# Workstation metadata and private investigations
+.idea/
+noncommit/
+output/
+docs/chat/
+docs/examples/
