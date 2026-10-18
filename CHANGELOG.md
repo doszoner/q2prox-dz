@@ -24,7 +24,9 @@
   сессионный кэш domain, свежие credentials и `Q2DZ_RTC_SERVER`. DNS и очередь
   входят в трёхсекундный бюджет; worker завершается без ожидания DNS. Это
   сокращает endpoints, но не гарантирует защиту общей TURN-квоты. Проверено
-  компонентно на Python/PowerShell Core; Windows PowerShell 5.1 и Hub ожидаются.
+  компонентно на Python/PowerShell Core. На Linux через обычный Hub проверены
+  Custom, Refresh, вход, q2dm1 → q2dm2 без перезапуска клиента и Quit.
+  Windows PowerShell 5.1 и Windows-сценарий остаются непроверенными.
 
 ### Fixed
 

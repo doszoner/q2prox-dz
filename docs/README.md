@@ -25,7 +25,7 @@
 
 | Материал | Состояние |
 | --- | --- |
-| [OpenSpec: nearest TURN](../openspec/changes/q2prox-nearest-turn/proposal.md) | Реализовано в исходниках; Python/PowerShell Core проверены, WinPS 5.1 и Hub ожидаются. Сокращение endpoints, не защита общей квоты |
+| [OpenSpec: nearest TURN](../openspec/changes/q2prox-nearest-turn/proposal.md) | Реализовано в исходниках; Python/PowerShell Core и Linux-сценарий через обычный Hub проверены; WinPS 5.1 и Windows-сценарий ожидаются. Сокращение endpoints, не защита общей квоты |
 | [OpenSpec: исчезновение комнат](../openspec/changes/fix-q2prox-rooms-vanish/proposal.md) | Logging и tolerant rows в коде; recovery группы D остаётся условным предложением |
 | [Дизайн чата](design/2026-09-06-doszone-chat.md), [план](superpowers/plans/2026-09-06-doszone-chat.md), [ревью](reviews/2026-09-06-doszone-chat.md) | Исследование/план, не поставленная функция чата; room snapshot не равен чату |
 | [Внешний VPS gateway](archive/2026-08-23-hosted-vps-gateway-proposal.md) | Архивное предложение, не принятая архитектура |

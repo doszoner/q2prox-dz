@@ -169,7 +169,9 @@ Q2DZ/ROOMS/2 DROP room=room.q2.owner.generation
   launcher→coordinator. DROP не возникает, активный gateway target не получает
   новый PUT/ID и не пересоздаётся. Это сокращение ICE endpoints, а не защита общей
   TURN-квоты. Компонентные проверки выполнены на Python/PowerShell Core;
-  Windows PowerShell 5.1 и обычный Hub ещё не проверены;
+  на Linux через обычный Hub проверены Custom, Refresh, вход, смена карты
+  без перезапуска клиента и Quit. Windows PowerShell 5.1 и Windows-сценарий
+  остаются непроверенными;
 - после каждого успешного опроса каталога launcher посылает heartbeat для
   полного текущего набора targets; исправный неизменившийся target не
   пересоздаётся;

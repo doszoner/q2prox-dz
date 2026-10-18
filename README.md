@@ -84,7 +84,9 @@ Windows использует WebView2, Linux — нативный WebRTC-NET tra
 сессии, credentials обновляются из свежего ответа. `Q2DZ_RTC_SERVER` позволяет
 выбрать domain вручную. Набор endpoints сокращается, но это не заменяет
 ограничения соединений и повторов. Компонентные проверки выполнены на Python
-и PowerShell Core; Windows PowerShell 5.1 и обычный Hub ещё не проверены. [Анализ и необходимые доработки](docs/TURN-RESOURCE-POLICY.md).
+и PowerShell Core. На Linux через обычный Hub проверены Custom, Refresh, вход,
+смена карты без перезапуска клиента и выход через Quit. Windows PowerShell 5.1
+и Windows-сценарий остаются непроверенными. [Анализ и необходимые доработки](docs/TURN-RESOURCE-POLICY.md).
 
 [Индекс документации](docs/README.md) разделяет текущие контракты, предложения
 OpenSpec, исторические планы и результаты прошлых проверок.
