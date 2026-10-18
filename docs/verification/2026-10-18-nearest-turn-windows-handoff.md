@@ -2,7 +2,8 @@
 
 ## Начать здесь: Windows из того же release source
 
-Linux `1.0.0-rc18` собирается отдельно в текущей задаче. Человек завершает
+Linux `1.0.0-rc18` собран и прошёл package/build gates; exact archive gameplay
+не запускался, статус candidate. Человек завершает
 только Windows portable/setup и общую комплектацию выпуска. Windows VM на
 этой машине отсутствует; Windows здесь не собираем и не проверяем.
 
@@ -11,12 +12,13 @@ Linux `1.0.0-rc18` собирается отдельно в текущей за�
    проверить `git rev-parse HEAD` и VERSION `1.0.0-rc18`. Если tag/notes ещё нет
    или SHA расходятся, получить их у владельца draft до сборки. Новый номер
    не выбирать, VERSION не менять, Linux не пересобирать. Итоги и SHA Linux — в
-   [ведомости rc18](1.0.0-rc18.md). Фактический SHA будет записан после metadata commit.
+   [ведомости rc18](1.0.0-rc18.md). Release source SHA:
+   `ec4a2f6e66e75090c6c379239246be54bbed995e`; tag/notes должны подтверждать его.
 2. Подготовить Windows dependencies строго по [deps.lock.json](../../deps.lock.json):
    WebView2 NuGet `1.0.4129.50` и WebRTC-NET commit
    `62fe52cd20bae55baf03339afee60c895f1aee90` с locked submodules и release files.
    Выполнить canonical `windows/product/build-payload.ps1` из
-   [RELEASE.md](../RELEASE.md#Windows), включая встроенные dependency, CTest/Node,
+   [RELEASE.md](../RELEASE.md#windows), включая встроенные dependency, CTest/Node,
    `/Brepro` и fresh-extract real-PE smoke gates. Локальные пути и `/tmp`
    предыдущего исполнителя не нужны; зависимости подготовить на своей машине.
 3. Выполнить Windows PowerShell **5.1** suites и live задачи **1.3, 2.4, 3.4**
@@ -25,7 +27,7 @@ Linux `1.0.0-rc18` собирается отдельно в текущей за�
    source SHA, exit codes и фактические результаты; незакрытые задачи оставить открытыми.
 4. Получить `q2prox-dz-1.0.0-rc18-windows-x64-portable.zip` и
    `q2prox-dz-1.0.0-rc18-windows-x64-setup.zip` с соседними `.sha256`.
-   Проверить VERSION, внутренние SHA256SUMS, licenses/allowlists и fresh-extract
+   Проверить VERSION, внутренний SHA256SUMS.txt, licenses/allowlists и fresh-extract
    smoke, записать реальные SHA-256 в ведомость и notes. Старые rc17 не подмешивать.
 5. Загрузить Windows ZIP и sidecars в **существующий Draft rc18**, сохранив
    Linux tar.gz и его SHA-256. Только после готовности обеих Windows поставок
@@ -102,6 +104,9 @@ worker; зависший DNS и полный stdin pipe не должны уде
 Нужны Windows 10/11 x64, Windows PowerShell 5.1, WebView2 Runtime,
 установленный Q2PRO-X с игровыми данными и установленное дополнение Dos.Zone.
 [Установка](../../INSTALLATION.md) и [состав поставки](../RELEASE.md).
+Сначала установить новый setup rc18 из release source SHA выше; проверить
+`VERSION` установленной копии `1.0.0-rc18`. Старые native-компоненты rc17
+для этой передачи не использовать.
 В активной версии дополнения должны быть `q2dz-session.exe`,
 `q2dz-content-check.exe`, `gateway/q2-doszone-webview2-gateway.exe` и его
 комплектные `WebView2Loader.dll`/`assets`. Их совместимость проверяется на месте.
@@ -184,4 +189,4 @@ credentials, cookies и полные join URL. Сырые evidence держат�
 После проверки обновить статусы в OpenSpec и краткую сводку в документации.
 Не архивировать change до закрытия Windows-пунктов. Повторять завершённые Linux-проверки исходников и пересобирать Linux не требуется.
 Windows release archives проходят собственные gates по RELEASE.md. Загрузить их
-в существующий Draft rc18; публикация — после выполнения критериев RELEASE.md.
+в существующий Draft rc18; публичная/latest публикация в эту передачу не входит.
