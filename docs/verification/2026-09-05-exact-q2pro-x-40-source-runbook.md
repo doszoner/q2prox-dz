@@ -42,9 +42,9 @@ python3 tests/tools/controlled-room-set.py source \
 Copy the `http_url` value from the first JSON line. In another terminal:
 
 ```bash
-Q2=/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
-ROOT=/home/ssolovey/Games/Quake2-PlayGround-2026
-EVID=/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-dz-gates/manual-q2pro-40
+Q2=~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+ROOT=~/Games/Quake2-PlayGround-2026
+EVID=/path/to/DosZone/noncommit/q2prox-dz-gates/manual-q2pro-40
 URL='http://127.0.0.1:<port>/servers'
 
 WINEDEBUG=-all wine "$Q2" \

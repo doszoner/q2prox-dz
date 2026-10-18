@@ -66,10 +66,10 @@ WINDOWS RELEASE PASS
 Скопированные на host артефакты:
 
 ```text
-/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/dist/q2prox-dz-1.0.0-rc14-windows-x64-portable.zip
+/path/to/DosZone/q2prox-dz-dedicated-compat/dist/q2prox-dz-1.0.0-rc14-windows-x64-portable.zip
 SHA-256: bcfd29076621d00e51a434e231baa1e05aa6940d4f9cbfd3320c8eb67dca7a50
 
-/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/dist/q2prox-dz-1.0.0-rc14-windows-x64-setup.zip
+/path/to/DosZone/q2prox-dz-dedicated-compat/dist/q2prox-dz-1.0.0-rc14-windows-x64-setup.zip
 SHA-256: 2263ac2bcf6f197041f095eb65f034db9e139a7fd5507f592b99498362cf3d2b
 ```
 
@@ -102,8 +102,8 @@ restore сохранить нужные логи и артефакты на host
 
 ```text
 deleted VM: Windows.11.28000.21.13.MR.Bumerino
-deleted folder: /home/ssolovey/VirtualBox VMs/Windows 11 25H2 _ LTSC (x64) 28in1 Clone
-closed stale medium: /home/ssolovey/VirtualBox VMs/Windows/Windows_1.vdi
+deleted folder: ~/VirtualBox VMs/Windows 11 25H2 _ LTSC (x64) 28in1 Clone
+closed stale medium: ~/VirtualBox VMs/Windows/Windows_1.vdi
 ```
 
 После очистки зарегистрирована только рабочая VM:
@@ -150,10 +150,10 @@ saved q2 path:
 Host-side available inputs:
 
 ```text
-/home/ssolovey/Downloads/q2pro-x-1.5.rar
-/home/ssolovey/Downloads/q2pro-x-1/
-/home/ssolovey/Games/Quake2-PlayGround-2026/
-/home/ssolovey/Downloads/Telegram Desktop/Quake2 [Sergh's Edition, 2026].rar
+~/Downloads/q2pro-x-1.5.rar
+~/Downloads/q2pro-x-1/
+~/Games/Quake2-PlayGround-2026/
+~/Downloads/Telegram Desktop/Quake2 [Sergh's Edition, 2026].rar
 ```
 
 Следствие: этот snapshot остаётся хорошей build/headless-test стартовой точкой,
@@ -190,7 +190,7 @@ C:\Users\user\AppData\Local\Q2PRO-X Dos.Zone\state\q2-path.txt
 ```
 
 Runtime ZIP был временно собран на host из
-`/home/ssolovey/Games/Quake2-PlayGround-2026/`, без `logs`, `screenshots` и
+`~/Games/Quake2-PlayGround-2026/`, без `logs`, `screenshots` и
 crash/log files, передан в VM, проверен по SHA-256 и удалён из VM и `/tmp`.
 
 Граница доказанного: это только подготовка runtime-окружения. Live gate всё ещё

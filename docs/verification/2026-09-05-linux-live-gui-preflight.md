@@ -6,7 +6,7 @@ run unattended without stealing the user's desktop.
 ## Current state
 
 ```text
-repo: /home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat
+repo: /path/to/DosZone/q2prox-dz-dedicated-compat
 branch: feat/dedicated-compat
 package: linux/dist/q2prox-dz-1.0.0-rc14-linux-x86_64.tar.gz
 package smoke: PASS
@@ -77,15 +77,15 @@ sha256 sidecar: PASS
 installer: PASS
 installed VERSION: 1.0.0-rc14
 saved Q2PRO-X path:
-  /home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+  ~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
 ```
 
 Installed entrypoints:
 
 ```text
-/home/ssolovey/.local/bin/q2dz-launch
-/home/ssolovey/.local/bin/q2dz-session
-/home/ssolovey/.local/bin/q2dz-webrtc-gateway
+~/.local/bin/q2dz-launch
+~/.local/bin/q2dz-session
+~/.local/bin/q2dz-webrtc-gateway
 ```
 
 Byte-for-byte package payload comparison:

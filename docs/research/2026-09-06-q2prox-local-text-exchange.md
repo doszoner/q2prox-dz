@@ -69,7 +69,7 @@ Q2PRO-X, ни Xwayland `:88` не работали. Причина заверш�
 ## Где сохранены материалы
 
 Каталог опыта:
-`/home/ssolovey/Projects/Q2/DosZone/noncommit/q2-chat-exchange-YqW1ka/`.
+`/path/to/DosZone/noncommit/q2-chat-exchange-YqW1ka/`.
 
 - `01-start.png` — `06-writeconfig-help.png`: снимки перечисленных проверок.
 - `game/baseq2/q2dz-exchange.cfg`: фактически использованная конфигурация,

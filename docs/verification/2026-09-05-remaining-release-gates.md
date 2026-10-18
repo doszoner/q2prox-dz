@@ -6,7 +6,7 @@ Linux capacity/liveness correction.
 ## Current verified baseline
 
 ```text
-checkout: /home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat
+checkout: /path/to/DosZone/q2prox-dz-dedicated-compat
 branch: feat/dedicated-compat
 VERSION: 1.0.0-rc15
 git identity: doszoner <doszoner@users.noreply.github.com>

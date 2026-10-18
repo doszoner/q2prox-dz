@@ -13,7 +13,7 @@ both platforms:
 SHA-256: 831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d
 ```
 
-The [Windows bootstrap manifest](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/bootstrap-files.json)
+The Windows bootstrap manifest (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/bootstrap-files.json`, не публикуется)
 records all 10 transferred binaries, including `Q2PRO-X.exe` and the nine
 direct/runtime renderer DLLs. The candidate details are also recorded in the
 [baseline verification](2026-08-29-q2pro-x-custom-source.md).
@@ -22,8 +22,8 @@ direct/runtime renderer DLLs. The candidate details are also recorded in the
 
 | Gate | Result | Retained evidence |
 |---|---|---|
-| Linux/Wine | PASS | [`result.txt`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-final/result.txt), [`events.jsonl`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-final/events.jsonl) |
-| Native Windows final21, unprivileged | PASS | [`PASS`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/PASS), [`guest-identity.json`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/guest-identity.json), [`preflight.txt`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/preflight.txt) |
+| Linux/Wine | PASS | `result.txt` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-final/result.txt`, не публикуется), `events.jsonl` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-final/events.jsonl`, не публикуется) |
+| Native Windows final21, unprivileged | PASS | `PASS` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/PASS`, не публикуется), `guest-identity.json` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/guest-identity.json`, не публикуется), `preflight.txt` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/preflight.txt`, не публикуется) |
 
 The exact source URLs were:
 
@@ -47,11 +47,11 @@ The Linux URL is recorded in `ports.txt`. Windows `events.json` records
   used peer source port `55576`, with no A request after B. The single recorded
   Q2 PID is `5140`; the gate passed with that process and did not restart it.
 - The synchronized final21 framebuffer captures show the expected states:
-  [`empty.png`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/empty.png)
+  `empty.png` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/empty.png`, не публикуется)
   has no server row,
-  [`A.png`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/A.png)
+  `A.png` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/A.png`, не публикуется)
   has only `Q2DZ-A`/Alice, and
-  [`B.png`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/B.png)
+  `B.png` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/B.png`, не публикуется)
   has only `Q2DZ-B`/Bob.
 
 The machine event traces and synchronized captures agree; both are retained
@@ -64,16 +64,16 @@ as final21 evidence.
 - The Linux isolation companion records host display `:1`, isolated display
   `:90`, `PASS: no X11 TCP listener on 6090`, an empty TCP-listener record,
   and owned-process `cleanup=complete`:
-  [`host-display.txt`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/host-display.txt),
-  [`isolated-display.txt`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/isolated-display.txt),
-  [`no-x11-tcp.txt`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/no-x11-tcp.txt),
-  [`guard.ledger`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/guard.ledger).
+  `host-display.txt` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/host-display.txt`, не публикуется),
+  `isolated-display.txt` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/isolated-display.txt`, не публикуется),
+  `no-x11-tcp.txt` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/no-x11-tcp.txt`, не публикуется),
+  `guard.ledger` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/linux-isolation-companion/guard.ledger`, не публикуется).
 - Windows final21 records a headless guard PASS, and
   `guest-identity.json` records `isAdministrator: false` for
   `WINDOWS-GGFDKO9\user`. The Q2 path is under the user's
   `C:\Users\user\AppData\Local\Temp` tree.
-- Windows guest cleanup completed ([`cleanup.done`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/cleanup.done));
-  the final VM state is [`VMState="saved"`](../../../noncommit/q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/vm-after.txt).
+- Windows guest cleanup completed (`cleanup.done` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/cleanup.done`, не публикуется));
+  the final VM state is `VMState="saved"` (локальный материал `q2prox-dz-gates/20260829-live-custom-source-safe/windows-final21/vm-after.txt`, не публикуется).
 
 ## Chronology and historical attempts
 

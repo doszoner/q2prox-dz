@@ -18,7 +18,7 @@
 
 ## Материалы и границы
 
-- Архив: `/home/ssolovey/Downloads/Telegram Desktop/q2prox-dz-review-package.zip`.
+- Архив: `~/Downloads/Telegram Desktop/q2prox-dz-review-package.zip`.
   SHA-256: `8d52702c82556c28b71c6f04008cbd36c5f6201df5cdbcad1986b6b76e41822b`.
   Прочитан полностью: 21 файл, 22041 распакованный байт. Это отчёт и выдержки,
   не полная запись одной сессии и не копия изменённой установки.

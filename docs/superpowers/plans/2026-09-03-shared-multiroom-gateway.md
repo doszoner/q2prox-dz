@@ -92,7 +92,7 @@ JSON или credential values.
 - [ ] **Step 5: подготовить exact Emscripten 5.0.2 вне репозиториев.**
 
 ```bash
-export Q2DZ_EMSDK=/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-shared/emsdk
+export Q2DZ_EMSDK=/path/to/DosZone/noncommit/q2prox-shared/emsdk
 if [[ ! -x "$Q2DZ_EMSDK/emsdk" ]]; then
   git clone https://github.com/emscripten-core/emsdk.git "$Q2DZ_EMSDK"
 fi
@@ -147,7 +147,7 @@ cmake -S ../WebRTC-NET-q2prox-shared \
   -DCMAKE_CXX_COMPILER=clang++ -DUSE_BORINGSSL=False \
   -DHUMBLENET_EXTERNAL_WEBRTC=ON
 cmake --build ../WebRTC-NET-q2prox-shared/build-native --target bin_flatc
-export Q2DZ_EMSDK=/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-shared/emsdk
+export Q2DZ_EMSDK=/path/to/DosZone/noncommit/q2prox-shared/emsdk
 source "$Q2DZ_EMSDK/emsdk_env.sh"
 emcmake cmake -S ../WebRTC-NET-q2prox-shared \
   -B ../WebRTC-NET-q2prox-shared/build-wasm -G Ninja \
@@ -206,7 +206,7 @@ cmake -S ../WebRTC-NET-q2prox-shared \
 cmake --build ../WebRTC-NET-q2prox-shared/build-native \
   --target websockets-build webrtc_shared humblenet bin_flatc
 
-export Q2DZ_EMSDK=/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-shared/emsdk
+export Q2DZ_EMSDK=/path/to/DosZone/noncommit/q2prox-shared/emsdk
 source "$Q2DZ_EMSDK/emsdk_env.sh"
 emcmake cmake -S ../WebRTC-NET-q2prox-shared \
   -B ../WebRTC-NET-q2prox-shared/build-wasm -G Ninja \

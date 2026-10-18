@@ -10,7 +10,7 @@
 
 ---
 
-Worktree: `/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-map-refresh-worktree`, ветка `fix_catalog_map_refresh`. База обоих итоговых ревью: `deee241ac0c4bc2c28646d4e387305fac94a9e72`. Spec: `docs/superpowers/specs/2026-09-14-catalog-map-refresh-design.md`. Работа и коммит уже разрешены пользователем; без установки, push и новой поставки. Issue tracker отсутствует; источником требований служит этот spec, устанавливать инструменты для issue tracker не требуется.
+Worktree: `/path/to/DosZone/noncommit/q2prox-map-refresh-worktree`, ветка `fix_catalog_map_refresh`. База обоих итоговых ревью: `deee241ac0c4bc2c28646d4e387305fac94a9e72`. Spec: `docs/superpowers/specs/2026-09-14-catalog-map-refresh-design.md`. Работа и коммит уже разрешены пользователем; без установки, push и новой поставки. Issue tracker отсутствует; источником требований служит этот spec, устанавливать инструменты для issue tracker не требуется.
 
 ## Task 1: Исправить планирование и добавить журнал refresh на обеих платформах
 
@@ -162,7 +162,7 @@ function Write-Q2DzCatalogEvent {
 ```sh
 python3 linux/tests/test_launcher.py
 pwsh -NoLogo -NoProfile -File windows/product/tests/catalog.tests.ps1
-Q2DZ_DIAGNOSTIC_REPO=/home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-map-refresh-worktree python3 /home/ssolovey/Projects/Q2/DosZone/noncommit/q2prox-disconnect-20260914/reproduce.py --assert-preserved
+Q2DZ_DIAGNOSTIC_REPO=/path/to/DosZone/noncommit/q2prox-map-refresh-worktree python3 /path/to/DosZone/noncommit/q2prox-disconnect-20260914/reproduce.py --assert-preserved
 git diff --check
 ```
 

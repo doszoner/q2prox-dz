@@ -32,7 +32,7 @@ SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d`.
 | Отправка введённого текста внешнему помощнику | Не доказано | Поле меняет cvar, но это не механизм отправки |
 
 Каталог опыта и снимков:
-`/home/ssolovey/Projects/Q2/DosZone/noncommit/q2-chat-native-UiBrmm/`.
+`/path/to/DosZone/noncommit/q2-chat-native-UiBrmm/`.
 Конфигурация: `game/baseq2/configs/q2dz-probe.cfg`; меню:
 `game/baseq2/q2pro-x/q2pro-x.menu2`; фиксированная строка:
 `game/baseq2/q2dz-unicode-probe.cfg`; журнал:
@@ -79,7 +79,7 @@ SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d`.
 - **[EXACT]** `Q2PRO-X.exe` — установленный Q2PRO-X 1.5: PE32+ x86-64,
   SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d`.
   Manifest фиксирует runtime source commit/tag, но исходников Q2PRO-X в
-  установочном дереве нет: `/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:1-14`.
+  установочном дереве нет: `~/Games/Quake2-PlayGround-2026/MANIFEST.txt:1-14`.
 - **[UPSTREAM]** `draw` рисует текущее значение зарегистрированного cvar или
   macro; это не literal-text API. Открытый исходник хранит указатель `cvar` или
   `macro` и каждый кадр рисует его текущее значение:
@@ -107,15 +107,15 @@ SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d`.
 Проверенный файл и рядом установленный game module:
 
 ```text
-/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
-/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/gamex86_64.dll
+~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+~/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/gamex86_64.dll
 ```
 
 Manifest: accepted/runtime source commit `28b0f5338d138dbf3cb70c789fad85787a9af63a`,
 tag `build/q2prox-1.5/20260825-101843-28b0f5338d13`, EXE hash above и Game DLL
 SHA-256 `64015c99f3121fe61a62bee65ca772192af406c94dd7f4babb82a27b1238d57c`
-([`MANIFEST.txt:1-14`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:1)).
-Рядом также лежит отдельный 32-bit `/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro.exe`;
+(`MANIFEST.txt:1-14` (локальный файл `MANIFEST.txt:1`, не публикуется)).
+Рядом также лежит отдельный 32-bit `~/Games/Quake2-PlayGround-2026/q2pro.exe`;
 его нельзя молча считать тем же exact client.
 
 Установочный пакет содержит DOCX и runtime binaries, но не `.c/.h/.cpp` source.
@@ -134,7 +134,7 @@ Q2PRO-X docs; private implementation details остаются unknown.
 | Q2PRO-X custom HUD | **[EXACT]** binary catalog описывает `cl_opentdm_team_hud_show_teamchat` как “last already-visible say_team”, normal `PRINT_CHAT`, без command injection/suppression (разбор строки из exact EXE). | Это подтверждает display-only boundary exact fork, но binary strings не заменяют source proof и не добавляют lobby feed. |
 
 Публичный manual формулирует draw contract прямо: `draw` добавляет “console
-variable or macro identified by name” (`/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:1424-1441`).
+variable or macro identified by name” (`~/Games/Quake2-PlayGround-2026/q2pro_manual.txt:1424-1441`).
 Примеры — только `draw cl_fps` и `draw com_time`
 (`q2pro_manual.txt:1443-1448`). В exact Q2PRO-X binary найдены `draw` и `undraw`,
 но не найдено документированного literal-text варианта. Поэтому literal draw
@@ -147,10 +147,10 @@ variable or macro identified by name” (`/home/ssolovey/Games/Quake2-PlayGround
 - `say <text>` и `say_team <text>` отправляют Quake text chat; `messagemode` и
   `messagemode2` открывают однострочный prompt. Exact command catalog в
   `Q2PRO-X.exe` содержит их описания; обычные бинды подтверждены
-  [`q2pro-x.bindings.cfg:11-26`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.bindings.cfg:11).
+  `q2pro-x.bindings.cfg:11-26` (локальный файл `baseq2/q2pro-x/q2pro-x.bindings.cfg:11`, не публикуется).
 - `con_auto_chat` лишь решает, как консольные строки без `/` или `\` вести во
   время игры: regular command/forward as chat/forward as team chat
-  ([`q2pro_manual.txt:401-406`](/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:401)).
+  (`q2pro_manual.txt:401-406` (локальный файл `q2pro_manual.txt:401`, не публикуется)).
   Это не external input API.
 - Поиск exact config, docs и binary string catalog не нашёл `con_messageMode`
   (встречаются именно `messagemode` и `messagemode2`). Нельзя строить план на
@@ -165,12 +165,12 @@ variable or macro identified by name” (`/home/ssolovey/Games/Quake2-PlayGround
 - Public Q2PRO `cl_beginmapcmd`, `cl_changemapcmd`, `cl_disconnectcmd` и
   `trigger` — события map/disconnect/non-chat server message, не периодический
   watcher. `trigger` отдельно исключает chat messages
-  ([`q2pro_manual.txt:1369-1385`](/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:1369)).
+  (`q2pro_manual.txt:1369-1385` (локальный файл `q2pro_manual.txt:1369`, не публикуется)).
 - `cl_timer` — macro “time since level load”, не внешний scheduler
-  ([`q2pro_manual.txt:1184-1208`](/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:1184)).
+  (`q2pro_manual.txt:1184-1208` (локальный файл `q2pro_manual.txt:1184`, не публикуется)).
 - `vid_restart`, `fs_restart`, `r_reload` перезапускают video/filesystem/media;
   это не reload feed и не re-read arbitrary external text
-  ([`q2pro_manual.txt:1500-1514`](/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:1500)).
+  (`q2pro_manual.txt:1500-1514` (локальный файл `q2pro_manual.txt:1500`, не публикуется)).
 - Q2PRO-X live item timers (`it_start`, `it_cancel`, `it_info`) — предметные
   respawn HUD timers, а не универсальная строка/таймерная очередь; это прямо
   ограничено официальным [Live Item Timers Guide](https://q2pro-x.com/q2pro-x/docs-preview/ru/Q2PRO-X_1.5_Live_Item_Timers_Guide_RU.html).
@@ -185,13 +185,13 @@ Exact profile has:
 set cl_serverbrowser_custom_source "http://127.0.0.1:34079/servers"
 ```
 
-([`q2pro-x.cfg:365-378`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:365)).
+(`q2pro-x.cfg:365-378` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:365`, не публикуется)).
 The project architecture documents that Q2PRO-X reads server name/map/player
 count/ping through `Custom` and ordinary `Refresh`, while the coordinator does
-not send menu-control commands ([`ARCHITECTURE.md:42-63`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/docs/ARCHITECTURE.md:42)).
+not send menu-control commands ([`ARCHITECTURE.md:42-63`](../ARCHITECTURE.md)).
 This is a catalog/status/connect path only; existing verification explicitly
 limits its claim to browser/status/connect, not live two-room gameplay
-([`2026-08-29-q2pro-x-custom-source.md:18-36`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/docs/verification/2026-08-29-q2pro-x-custom-source.md:18)).
+([`2026-08-29-q2pro-x-custom-source.md:18-36`](../verification/2026-08-29-q2pro-x-custom-source.md)).
 
 ### Client-owned HTTP/IPC features
 
@@ -229,7 +229,7 @@ second IPC channel to q2prox-dz on this evidence.
 ## UTF-8 and rendering
 
 Exact profile currently has `cl_console_utf8_ru "-1"`
-([`q2pro-x.cfg:84-86`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:84)).
+(`q2pro-x.cfg:84-86` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:84`, не публикуется)).
 Official [Controls, Mouse & Zoom Guide](https://q2pro-x.com/q2pro-x/docs-preview/ru/Q2PRO-X_1.5_Controls_Mouse_Zoom_Guide_RU.html)
 describes this as tri-state **display localization**: ASCII stays on stock
 `conchars`, while selected UTF-8 Cyrillic/CP1251 codepoints use the auxiliary
@@ -250,15 +250,15 @@ The old example is useful only as a negative control. It:
 
 - disables TLS certificate validation (`ServerCertificateValidationCallback`
   always returns true) at
-  [`doszone_chat_bridge.cs:95-110`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/doszone_chat_bridge.cs:95);
+  `doszone_chat_bridge.cs:95-110` (локальный материал `examples/doszone_chat_listener/doszone_chat_bridge.cs`, не публикуется);
 - posts `WM_KEYDOWN/WM_KEYUP` and falls back to `SendInput` to simulate F1 at
-  [`doszone_chat_bridge.cs:184-230`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/doszone_chat_bridge.cs:184);
+  `doszone_chat_bridge.cs:184-230` (локальный материал `examples/doszone_chat_listener/doszone_chat_bridge.cs`, не публикуется);
 - writes generated `set dz_msgN "..."` lines to multiple `dz_messages.cfg`
-  files at [`doszone_chat_bridge.cs:425-464`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/doszone_chat_bridge.cs:425);
+  files at `doszone_chat_bridge.cs:425-464` (локальный материал `examples/doszone_chat_listener/doszone_chat_bridge.cs`, не публикуется);
 - instructs the user to bind `F1` to `exec dz_messages.cfg`
-  ([Руководство по настройке.txt](</home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/Руководство по настройке.txt:15>)).
+  (Руководство по настройке.txt (локальный материал `examples/doszone_chat_listener/Руководство по настройке.txt`, не публикуется)).
 
-Escaping quotes/semicolons in [`doszone_chat_bridge.cs:362-367`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/doszone_chat_bridge.cs:362)
+Escaping quotes/semicolons in `doszone_chat_bridge.cs:362-367` (локальный материал `examples/doszone_chat_listener/doszone_chat_bridge.cs`, не публикуется)
 does not turn an untrusted external string into a supported config transport.
 This prototype must not be revived or used as evidence of native capability.
 
@@ -271,7 +271,7 @@ read-only `Custom` server catalog and a companion may read the already available
 Dos.Zone room snapshot, correlated by exact room ID. It may show lobby chat in
 an external panel/overlay. It must not claim that `connected_peers` proves a
 native player or active Quake room; current project docs say those counts are
-lobby-only ([`ARCHITECTURE.md:70-75`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/docs/ARCHITECTURE.md:70)).
+lobby-only ([`ARCHITECTURE.md:70-75`](../ARCHITECTURE.md)).
 
 No Q2PRO-X `set`, `draw`, `exec`, key, UDP print injection, transparent proxy,
 or voice-room write is needed for this read-only package.
@@ -313,10 +313,10 @@ replace users' existing EXE.
 
 ## Primary sources and local evidence
 
-- **Exact install:** [`MANIFEST.txt:1-14`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:1),
-  [`q2pro-x.cfg:84-86,365-378,678-712`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:84),
-  [`q2pro-x.bindings.cfg:11-26`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.bindings.cfg:11).
-- **Installed upstream manual:** [`q2pro_manual.txt:401-415,490-512,1184-1208,1369-1385,1424-1448,1500-1514`](/home/ssolovey/Games/Quake2-PlayGround-2026/q2pro_manual.txt:401).
+- **Exact install:** `MANIFEST.txt:1-14` (локальный файл `MANIFEST.txt:1`, не публикуется),
+  `q2pro-x.cfg:84-86,365-378,678-712` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:84`, не публикуется),
+  `q2pro-x.bindings.cfg:11-26` (локальный файл `baseq2/q2pro-x/q2pro-x.bindings.cfg:11`, не публикуется).
+- **Installed upstream manual:** `q2pro_manual.txt:401-415,490-512,1184-1208,1369-1385,1424-1448,1500-1514` (локальный файл `q2pro_manual.txt:401`, не публикуется).
   It is shipped beside the fork and should be treated as upstream-baseline
   documentation, not private Q2PRO-X source proof.
 - **Public upstream source/repository:** [q2pro/q2pro](https://github.com/q2pro/q2pro),
@@ -326,10 +326,10 @@ replace users' existing EXE.
   [network docs](https://q2pro-x.com/q2pro-x/docs-preview/ru/Q2PRO-X_1.5_Network_Play_Guide_RU.html),
   [voice docs](https://q2pro-x.com/q2pro-x/docs-preview/ru/Q2PRO-X_1.5_Voice_Chat_Guide_RU.html),
   [live-item-timer docs](https://q2pro-x.com/q2pro-x/docs-preview/ru/Q2PRO-X_1.5_Live_Item_Timers_Guide_RU.html).
-- **Current q2prox boundary:** [`ARCHITECTURE.md:42-85`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/docs/ARCHITECTURE.md:42),
-  [`2026-08-29-q2pro-x-custom-source.md:5-36`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-dedicated-compat/docs/verification/2026-08-29-q2pro-x-custom-source.md:5).
-- **Disqualified prototype:** [`doszone_chat_bridge.cs:95-110,184-230,362-367,425-464`](/home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/doszone_chat_bridge.cs:95),
-  [Руководство по настройке.txt](</home/ssolovey/Projects/Q2/DosZone/q2prox-dz/docs/examples/doszone_chat_listener/Руководство по настройке.txt:15>).
+- **Current q2prox boundary:** [`ARCHITECTURE.md:42-85`](../ARCHITECTURE.md),
+  [`2026-08-29-q2pro-x-custom-source.md:5-36`](../verification/2026-08-29-q2pro-x-custom-source.md).
+- **Disqualified prototype:** `doszone_chat_bridge.cs:95-110,184-230,362-367,425-464` (локальный материал `examples/doszone_chat_listener/doszone_chat_bridge.cs`, не публикуется),
+  Руководство по настройке.txt (локальный материал `examples/doszone_chat_listener/Руководство по настройке.txt`, не публикуется).
 
 ## Addendum: standard game-chat route (2026-09-06)
 
@@ -426,7 +426,7 @@ Enter отправляет и возвращает игру, Esc отменяе�
 ### Что реально настраивается в exact install
 
 Exact install root для следующих menu/config ссылок:
-`/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/`.
+`~/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/`.
 
 - `q2pro-x.menu2:1178-1185` открывает `g_controls`, а
   `q2pro-x.menu2:1203-1231` — `g_keys`; строка
@@ -497,14 +497,14 @@ chat, не native lobby send.
 
 | Artifact | Evidence | Result |
 | --- | --- | --- |
-| `/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe` | `exiftool`, `file`, `sha256sum`; [`MANIFEST.txt:1-14`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:1) | Product/File version `1.5 by ly, 2026-08-25`; PE32+ x86-64 GUI; SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d` |
-| `/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/gamex86_64.dll` | same commands; [`MANIFEST.txt:8-10`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:8) | Product/File version `1.5 by ly, 2026-08-25`; PE32+ x86-64 DLL; SHA-256 `64015c99f3121fe61a62bee65ca772192af406c94dd7f4babb82a27b1238d57c` |
-| `baseq2/q2pro-x/utils/q2pro-x-bridge32.exe` | same commands; [`MANIFEST.txt:10`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:10) | PE32 i386 helper; SHA-256 `1d408338c54d8a33d6268e3a0dc331d8e8c3ffa31bb097fc31f11d176b4f0f22` |
-| Build identity | [`MANIFEST.txt:5-7`](/home/ssolovey/Games/Quake2-PlayGround-2026/MANIFEST.txt:5) | runtime source commit `28b0f5338d138dbf3cb70c789fad85787a9af63a`, tag `build/q2prox-1.5/20260825-101843-28b0f5338d13` |
+| `~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe` | `exiftool`, `file`, `sha256sum`; `MANIFEST.txt:1-14` (локальный файл `MANIFEST.txt:1`, не публикуется) | Product/File version `1.5 by ly, 2026-08-25`; PE32+ x86-64 GUI; SHA-256 `831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d` |
+| `~/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/gamex86_64.dll` | same commands; `MANIFEST.txt:8-10` (локальный файл `MANIFEST.txt:8`, не публикуется) | Product/File version `1.5 by ly, 2026-08-25`; PE32+ x86-64 DLL; SHA-256 `64015c99f3121fe61a62bee65ca772192af406c94dd7f4babb82a27b1238d57c` |
+| `baseq2/q2pro-x/utils/q2pro-x-bridge32.exe` | same commands; `MANIFEST.txt:10` (локальный файл `MANIFEST.txt:10`, не публикуется) | PE32 i386 helper; SHA-256 `1d408338c54d8a33d6268e3a0dc331d8e8c3ffa31bb097fc31f11d176b4f0f22` |
+| Build identity | `MANIFEST.txt:5-7` (локальный файл `MANIFEST.txt:5`, не публикуется) | runtime source commit `28b0f5338d138dbf3cb70c789fad85787a9af63a`, tag `build/q2prox-1.5/20260825-101843-28b0f5338d13` |
 
 The package contains runtime binaries, configs, menus, `.modhelp` and DOCX;
 it does not contain the Q2PRO-X client source or a build recipe. The comment in
-[`q2pro-x.menu2:1-24`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.menu2:1)
+`q2pro-x.menu2:1-24` (локальный файл `baseq2/q2pro-x/q2pro-x.menu2:1`, не публикуется)
 mentions `src/client/ui/script.c`, but that path is not distributed source.
 PE inspection is also a useful hard boundary: `Q2PRO-X.exe` and
 `q2pro-x-bridge32.exe` have no export table; `gamex86_64.dll` exports only
@@ -514,7 +514,7 @@ loader ABI, not a client plugin/IPC ABI.
 Свежий bounded GET официальной страницы [q2pro-x.com](https://q2pro-x.com/) от 2026-09-06 вернул HTTP 200 (`Date: Sun, 06 Sep 2026 12:35:49 GMT`). В HTML у кнопки «Исходники» обнаружены атрибуты `data-qpx-release-title="Исходники Q2PRO-X"` и `data-qpx-release-message="Исходники Q2PRO-X на данный момент ещё не опубликованы, но такая возможность вскоре появится. Проверьте страницу позже."`. Это подтверждает только текущий статус публичной публикации исходников на официальном сайте, а не универсальную невозможность расширения или отсутствие будущего owner-approved source/build/extension ABI.
 
 The internal-symbol observations below are reproducible without starting the
-client with `strings -a -n 4 /home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe`;
+client with `strings -a -n 4 ~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe`;
 they are binary evidence only, not a promise that the strings are callable
 symbols.
 
@@ -522,15 +522,15 @@ symbols.
 
 The exact guided menu is a declarative DSL. Its own header says that rows must
 be defined in the file or be code-built menus, and explicitly says not to add
-`inject ... endinject` blocks ([`q2pro-x.menu2:1-24`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.menu2:1)). A focused read of the shipped rows found these facilities:
+`inject ... endinject` blocks (`q2pro-x.menu2:1-24` (локальный файл `baseq2/q2pro-x/q2pro-x.menu2:1`, не публикуется)). A focused read of the shipped rows found these facilities:
 
 | Candidate | Narrow falsifiable hypothesis | Exact evidence | Typed non-command data? | Client-owned callback? |
 | --- | --- | --- | --- | --- |
 | Menu `field` | A field-change hook would let a helper observe a typed value without a command. | `q2pro-x.menu2:944-945,1032,5879`; the `field` target is a cvar. | **Yes, as local cvar text.** | **No.** Commit is cvar/menu state; no external observer or event payload. |
-| `messagemode` row/bind | Enter could expose the prompt buffer to a room writer while preserving native UX. | `q2pro-x.menu2:1229`; [`q2pro-x.bindings.cfg:13,26`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.bindings.cfg:13). | **Yes, in the stock prompt.** | **No documented callback.** It remains normal Quake game chat. |
-| `q2pro.modhelp` `prompt` | An inline prompt could target a non-command sink instead of dispatching console text. | [`q2pro.modhelp:1-20`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro.modhelp:1) defines inline input, then `exec`/`prompt`; rows `:61,67,73` use it. | **Yes, but as an argument to a configured console command.** | **No.** The described result is command execution on click/Enter. |
+| `messagemode` row/bind | Enter could expose the prompt buffer to a room writer while preserving native UX. | `q2pro-x.menu2:1229`; `q2pro-x.bindings.cfg:13,26` (локальный файл `baseq2/q2pro-x/q2pro-x.bindings.cfg:13`, не публикуется). | **Yes, in the stock prompt.** | **No documented callback.** It remains normal Quake game chat. |
+| `q2pro.modhelp` `prompt` | An inline prompt could target a non-command sink instead of dispatching console text. | `q2pro.modhelp:1-20` (локальный файл `baseq2/q2pro-x/q2pro.modhelp:1`, не публикуется) defines inline input, then `exec`/`prompt`; rows `:61,67,73` use it. | **Yes, but as an argument to a configured console command.** | **No.** The described result is command execution on click/Enter. |
 | `q2prox_scripts` | A new bind row could call an external callback or carry a message payload. | `q2pro-x.menu2:6393-6411` contains fixed binds (`followip`, `aadump`, `aashot`, `ready`, `vote`) and `macrolist`. | **No new payload channel.** | **No.** It binds existing commands/macros. |
-| `draw` / `scr_chathud` | A literal-text draw/append object could render a Dos.Zone line without server chat. | Exact cvars [`q2pro-x.cfg:676-685`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:676); upstream manual `draw` contract remains cvar/macro-based. | **No literal external text contract.** | **No.** Render-only presentation of existing client/server state. |
+| `draw` / `scr_chathud` | A literal-text draw/append object could render a Dos.Zone line without server chat. | Exact cvars `q2pro-x.cfg:676-685` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:676`, не публикуется); upstream manual `draw` contract remains cvar/macro-based. | **No literal external text contract.** | **No.** Render-only presentation of existing client/server state. |
 
 The strongest falsifiable interpretation is therefore: menu text editing is
 real, but every documented destination is a cvar or a console command. None of
@@ -581,7 +581,7 @@ room ... Triggers on `CL_Connected` ... Leaves room automatically on
 disconnect.” This is binary text describing private voice behavior; it does
 not independently prove a callable client event or supported external
 callback. The Custom server-browser source
-(`cl_serverbrowser_custom_source`, [`q2pro-x.cfg:369-386`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:369)) is pre-connect catalog input only; it cannot satisfy the required direct connected-client endpoint+epoch event.
+(`cl_serverbrowser_custom_source`, `q2pro-x.cfg:369-386` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:369`, не публикуется)) is pre-connect catalog input only; it cannot satisfy the required direct connected-client endpoint+epoch event.
 
 **Narrow hypothesis:** if the owner supplies Q2PRO-X source, the existing
 `CL_Connected`/disconnect state plus connection generation could be the
@@ -603,7 +603,7 @@ not chat transport. The shipped Network Play guide §11 says:
 
 The exact profile has `cl_translate_custom_url ""`, provider `q2prox`, URL
 `https://q2pro-x.com/api/translate`, and timeout `3000` ms
-([`q2pro-x.cfg:441-449`](/home/ssolovey/Games/Quake2-PlayGround-2026/baseq2/q2pro-x/q2pro-x.cfg:441)). This records the configured provider URL and timeout, while the shipped guide documents the prompt-replacement workflow. Request execution, worker/thread ownership, cancellation and safety were not runtime-tested in this pass. It does **not** establish a generic HTTP client API: the inspected materials do not show a caller-supplied callback, and `/en` is documented as a translation workflow that still requires manual Enter. Whether a compatible custom endpoint could support a room-scoped feed or write is an untested hypothesis, not demonstrated evidence.
+(`q2pro-x.cfg:441-449` (локальный файл `baseq2/q2pro-x/q2pro-x.cfg:441`, не публикуется)). This records the configured provider URL and timeout, while the shipped guide documents the prompt-replacement workflow. Request execution, worker/thread ownership, cancellation and safety were not runtime-tested in this pass. It does **not** establish a generic HTTP client API: the inspected materials do not show a caller-supplied callback, and `/en` is documented as a translation workflow that still requires manual Enter. Whether a compatible custom endpoint could support a room-scoped feed or write is an untested hypothesis, not demonstrated evidence.
 
 Live item timers provide a second internal example: the exact menu says online
 authorization is asynchronous and never delays connection

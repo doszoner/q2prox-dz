@@ -13,7 +13,7 @@ the shared multiroom gateway. The expected proof is:
 The verified exact executable remains:
 
 ```text
-/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
 SHA-256: 831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d
 Q2PRO-X 1.5 by ly, 2026-08-25
 ```

@@ -66,7 +66,7 @@ READY_COUNT 3
 ## Свидетельства и граница результата
 
 Сохранённые снимки и сокращённый журнал:
-`/home/ssolovey/Projects/Q2/DosZone/q2prox-dz-local-evidence/2026-09-05-empty-custom/`.
+`/path/to/DosZone/q2prox-dz-local-evidence/2026-09-05-empty-custom/`.
 Файлы: `q2dz-fixed-browser.png` (три строки Custom),
 `q2dz-live-join.png` (загруженная карта),
 `q2dz-final-custom-complete.png` (конечный список), `live-summary.log`.

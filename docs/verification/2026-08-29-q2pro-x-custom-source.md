@@ -5,7 +5,7 @@
 Проверен установленный клиент:
 
 ```text
-/home/ssolovey/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
+~/Games/Quake2-PlayGround-2026/Q2PRO-X.exe
 Q2PRO-X 1.5 by ly, 2026-08-25
 SHA-256 831f42dc96e3399a8a8737943d6fde752e11f5e5f48ffc5957537c4e66cbf71d
 ```

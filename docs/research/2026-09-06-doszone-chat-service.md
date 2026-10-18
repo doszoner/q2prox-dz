@@ -37,7 +37,7 @@ Browser UI send/read подтверждены, но собственная пр�
 
 ## Supplemental: sibling-кандидаты direct browser iframe
 
-Прочитаны исходники `/home/ssolovey/Projects/Q2/q2server/archive/experiments/doszone_interaction_check/direct_chat_check.js` и `/home/ssolovey/Projects/Q2/q2server/archive/experiments/doszone_interaction_check/chat_check.js`.
+Прочитаны исходники `~/Projects/Q2/q2server/archive/experiments/doszone_interaction_check/direct_chat_check.js` и `~/Projects/Q2/q2server/archive/experiments/doszone_interaction_check/chat_check.js`.
 `direct_chat_check.js` создаёт страницу Chromium с `quake2.html`, кликает canvas,
 нажимает `T`, вводит текст и `Enter`; `chat_check.js` проходит lobby UI, Join
 и тот же ввод в iframe. Это прямой browser iframe path, не standalone native

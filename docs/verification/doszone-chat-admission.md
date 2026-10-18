@@ -59,17 +59,17 @@ heartbeat, `mySecret`, чужие peer IDs/cookies и не сочинять URL,
 [Целевая архитектура](../design/2026-09-06-doszone-chat.md) разрешает узкий
 read-only `GET /q2dz/rooms` рядом с неизменным `/servers`. Rev2 уже разрешает
 этот внутренний Task 4. Реализация затрагивает 9 code/ADR files. Фактический
-Linux CTest дал **5/5 PASS за 21,8 с** ([лог](</home/ssolovey/Projects/Q2/DosZone/noncommit/q2dz-chat-mapping-20260906.L9KWY9/linux-ctest.log>)).
+Linux CTest дал **5/5 PASS за 21,8 с** (лог (локальный материал `q2dz-chat-mapping-20260906.L9KWY9/linux-ctest.log`, не публикуется)).
 Windows MSVC собрался; первый CTest был отклонён из-за неполного source zip без
 tests/contracts/hub-protocol-cases.json. Исправленный архив
 `coordinator-source-queue-fixed.zip` SHA-256
 `e2657192ef5352d4a46c1d09d737d0c60cccff3d4ed6e7d019d2449d384ffd71` дал build
-и полный matrix **PASS** ([matrix log](</home/ssolovey/Projects/Q2/DosZone/noncommit/q2dz-chat-mapping-20260906.L9KWY9/windows-matrix-pass.log>)); Windows
+и полный matrix **PASS** (matrix log (локальный материал `q2dz-chat-mapping-20260906.L9KWY9/windows-matrix-pass.log`, не публикуется)); Windows
 26200.9168 / MSVC 19.44.35228. Предыдущая диагностика queue-протокола сохранена
-([log](</home/ssolovey/Projects/Q2/DosZone/noncommit/q2dz-chat-mapping-20260906.L9KWY9/windows-matrix-diagnostic.log>)); финальный core test **2/2 PASS**, SHA-256
+(log (локальный материал `q2dz-chat-mapping-20260906.L9KWY9/windows-matrix-diagnostic.log`, не публикуется)); финальный core test **2/2 PASS**, SHA-256
 `4c3a78fee648ca26ec2e4d6055436bd1bd56a0b4a86786ec5d17c4471ff5ca19` и
 coordinator hash `D3B6A59540805C095F7AE6DCC0739F0D1782D9A8FFD3C5966F2F034EAC59B1ED`
-сверены до/после ([core log](</home/ssolovey/Projects/Q2/DosZone/noncommit/q2dz-chat-mapping-20260906.L9KWY9/windows-core-final.log>)); process cleanup **PASS**.
+сверены до/после (core log (локальный материал `q2dz-chat-mapping-20260906.L9KWY9/windows-core-final.log`, не публикуется)); process cleanup **PASS**.
 В Windows очередь была рассчитана на 32 строки (31 обычное событие + резерв).
 Массовый READY вызывал переполнение: синтетический `Q2DZ/1FATAL` попадал в HUB/2
 и приводил к сбросу списка. Лимит 258 = 256 READY + heartbeat + fatal; байтовый
