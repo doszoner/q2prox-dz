@@ -588,6 +588,40 @@ if ($cases.Count -eq 1 -and $cases[0] -is [array]) { $cases = @($cases[0]) }
 $scenarioNames = [System.Collections.Generic.List[string]]::new()
 $refreshFailures = [System.Collections.Generic.List[string]]::new()
 foreach ($case in $cases) {
+  if ($case.kind -eq 'ice-selection') {
+    $counter = @{ Probes = 0 }
+    $measurementCase = $case
+    $selection = New-Q2DzIceSelection -Override $case.override -Measure {
+      param($Domains)
+      $counter.Probes++
+      $samples = @{}
+      foreach ($property in $measurementCase.measurements.PSObject.Properties) { $samples[$property.Name] = @($property.Value) }
+      return $samples
+    }
+    $before = $case.payload | ConvertTo-Json -Depth 10 -Compress
+    $events = [Collections.Generic.List[string]]::new()
+    $oldEvent = ${function:Write-Q2DzCatalogEvent}
+    try {
+      function Write-Q2DzCatalogEvent { param([string]$Event) $events.Add($Event) }
+      $thrown = $false
+      try { $actual = @(Get-Q2DzDedicatedIceServers @($case.payload) -Selection $selection) } catch { $thrown = $true }
+      Assert-Equal ([bool]$case.valid) (-not $thrown) "shared selection $($case.name)"
+      if ($case.valid) {
+        Assert-Equal ($case.expected.iceServers | ConvertTo-Json -Depth 10 -Compress) ($actual | ConvertTo-Json -Depth 10 -Compress) "selected ICE $($case.name)"
+        Assert-Equal ($case.expected.domains -join ',') ($selection.Domains -join ',') "selected domains $($case.name)"
+        Assert-Equal $case.expected.probes $counter.Probes "probe count $($case.name)"
+        Assert-Equal ($case.expected.events -join ',') ($events -join ',') "safe events $($case.name)"
+        if ($case.PSObject.Properties.Name -contains 'nextPayload') {
+          $next = @(Get-Q2DzDedicatedIceServers @($case.nextPayload) -Selection $selection)
+          Assert-Equal ($case.nextExpected.iceServers | ConvertTo-Json -Depth 10 -Compress) ($next | ConvertTo-Json -Depth 10 -Compress) "next selected ICE $($case.name)"
+          Assert-Equal ($case.nextExpected.domains -join ',') ($selection.Domains -join ',') "next selected domains $($case.name)"
+          Assert-Equal $case.nextExpected.probes $counter.Probes "next selection probe count $($case.name)"
+        }
+      } else { Assert-Equal 0 $selection.Domains.Count "failed snapshot does not commit cache $($case.name)" }
+      Assert-Equal $before ($case.payload | ConvertTo-Json -Depth 10 -Compress) "selection does not mutate response $($case.name)"
+    } finally { ${function:Write-Q2DzCatalogEvent} = $oldEvent }
+    continue
+  }
   if ($case.kind -eq 'refresh-scenario') {
     # Collected, not thrown: one bad case must not hide the verdicts of the rest.
     try { Invoke-RefreshScenario $case }
@@ -605,7 +639,7 @@ foreach ($case in $cases) {
   if ($case.kind -eq 'dedicated-ice') {
     $thrown = $false
     $actual = @()
-    try { $actual = @(Get-Q2DzDedicatedIceServers @($case.payload)) } catch { $thrown = $true }
+    try { $actual = @(Get-Q2DzDedicatedIceServers @($case.payload) -Selection (New-Q2DzIceSelection -Measure { param($Domains) @{} })) } catch { $thrown = $true }
     Assert-Equal ([bool]$case.valid) (-not $thrown) "shared case $($case.name)"
     if ($case.valid) {
       Assert-Equal ($case.expected.iceServers | ConvertTo-Json -Depth 8 -Compress) `
@@ -1002,3 +1036,117 @@ $legacyTargetType = 'Hub' + [char]83 + 'lot'
 Assert-True (-not $launcherText.Contains($legacyTargetType)) 'launcher has no legacy room model'
 
 Write-Output ('catalog contract tests: PASS ({0} shared cases, dynamic target planner)' -f $cases.Count)
+
+# Session-owned selection is shared by initial and refresh, never by credentials.
+$selectionCase = @($cases | Where-Object { $_.name -ceq 'ice-selection-median' })[0]
+$cacheCounter = @{ Probes = 0 }
+$cacheSelection = New-Q2DzIceSelection -Override '' -Measure {
+  param($Domains)
+  $cacheCounter.Probes++
+  return @{ 'a.example.invalid' = @(.01); 'b.example.invalid' = @(.02); 'c.example.invalid' = @(.03) }
+}
+$cacheRows = @($selectionCase.payload | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$oldSnapshot = @(Get-Q2DzDedicatedIceServers $cacheRows -Selection $cacheSelection)
+$freshRows = @($selectionCase.payload | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$freshRows[0].iceservers[0].credential = 'fresh-fixture'
+[array]::Reverse($freshRows)
+$freshSnapshot = @(Get-Q2DzDedicatedIceServers $freshRows -Selection $cacheSelection)
+Assert-Equal 'fresh-fixture' $freshSnapshot[0].credential 'cache uses fresh credentials'
+Assert-Equal 'fixture-only' $oldSnapshot[0].credential 'old snapshot remains separate'
+Assert-Equal 1 $cacheCounter.Probes 'reorder and credentials do not probe again'
+$remainingRows = @($freshRows | Where-Object { $_.domain -cne 'a.example.invalid' })
+Get-Q2DzDedicatedIceServers $remainingRows -Selection $cacheSelection | Out-Null
+Assert-Equal 2 $cacheCounter.Probes 'missing selected domain triggers selection'
+Assert-Equal 'b.example.invalid,c.example.invalid' ($cacheSelection.Domains -join ',') 'missing-domain replacement selection'
+
+# Exercise the production parent/worker boundary with a deliberately stuck resolver.
+# The worker source stays local to this test; no public DNS or remote endpoint.
+$probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('q2dz-rtc-test-' + [Guid]::NewGuid().ToString('N'))
+$catalogPathBeforeProbe = $Q2DZ_CATALOG_SCRIPT
+try {
+  [void](New-Item -ItemType Directory -Path $probeRoot)
+  $pidPath = Join-Path $probeRoot 'worker.pid'
+  $fakeDomain = @'
+function Invoke-Q2DzRtcMeasureDomain {
+  param([string]$Domain, [int]$Index, $Queue, [double]$Deadline)
+  if ($Index -eq 0) {
+    [IO.File]::WriteAllText('__PID_PATH__', [string]$PID)
+    $finished = [double][Diagnostics.Stopwatch]::GetTimestamp() / [Diagnostics.Stopwatch]::Frequency
+    $Queue.Enqueue((ConvertTo-Json -InputObject @($Index, .01, $finished) -Compress))
+  } else { Start-Sleep -Seconds 60 }
+}
+'@
+  $fakeDomain = $fakeDomain.Replace('__PID_PATH__', $pidPath.Replace("'", "''"))
+  $source = [IO.File]::ReadAllText($Q2DZ_CATALOG_SCRIPT)
+  $dispatch = 'if ($RtcMeasure) { Invoke-Q2DzRtcMeasureWorker; exit }'
+  Assert-Equal 1 ([regex]::Matches($source, [regex]::Escape($dispatch)).Count) 'single worker dispatch seam'
+  $source = $source.Replace($dispatch, $fakeDomain + "`n" + $dispatch)
+  $Q2DZ_CATALOG_SCRIPT = Join-Path $probeRoot 'catalog.ps1'
+  [IO.File]::WriteAllText($Q2DZ_CATALOG_SCRIPT, $source)
+  for ($run = 0; $run -lt 2; $run++) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $samples = Measure-Q2DzRtcDomains @('a.example.invalid','b.example.invalid')
+    Assert-True ($clock.Elapsed.TotalSeconds -lt 5.0) 'stuck DNS cannot hold the caller indefinitely'
+    Assert-Equal 1 $samples['a.example.invalid'].Count 'completed sample survives stuck DNS cutoff'
+    Assert-Equal 0 $samples['b.example.invalid'].Count 'stuck DNS has no samples'
+    $workerPid = [int][IO.File]::ReadAllText($pidPath)
+    Assert-True ($null -eq (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) 'owned resolver worker was killed and reaped'
+  }
+  $noReader = "param([switch]`$RtcMeasure)`n[IO.File]::WriteAllText('" + $pidPath.Replace("'", "''") + "', [string]`$PID)`nStart-Sleep -Seconds 60"
+  $Q2DZ_CATALOG_SCRIPT = Join-Path $probeRoot 'no-reader.ps1'
+  [IO.File]::WriteAllText($Q2DZ_CATALOG_SCRIPT, $noReader)
+  $largeDomains = @(for ($i = 0; $i -lt 12000; $i++) { 'a{0}.example.invalid' -f $i })
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  $samples = Measure-Q2DzRtcDomains $largeDomains
+  Assert-True ($clock.Elapsed.TotalSeconds -lt 5.0) 'full stdin pipe shares the measurement deadline'
+  Assert-Equal 0 $samples[$largeDomains[0]].Count 'nonreading worker returns no samples'
+  $workerPid = [int][IO.File]::ReadAllText($pidPath)
+  Assert-True ($null -eq (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) 'nonreading worker was killed and reaped'
+} finally {
+  $Q2DZ_CATALOG_SCRIPT = $catalogPathBeforeProbe
+  if (Test-Path -LiteralPath $probeRoot) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
+}
+Write-Output 'nearest RTC selection/cache/deadline tests: PASS (current PowerShell runtime only)'
+
+$liveRows = @($selectionCase.payload | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$liveRoom = New-TestRoom
+$liveCounter = @{ Probes = 0 }
+$liveSelection = New-Q2DzIceSelection -Override '' -Measure {
+  param($Domains)
+  $liveCounter.Probes++
+  return @{ 'a.example.invalid' = @(.01); 'b.example.invalid' = @(.02); 'c.example.invalid' = @(.03) }
+}
+$liveFetch = {
+  param($Endpoint)
+  switch ($Endpoint) {
+    $Q2DZ_ROOM_ENDPOINT { return [pscustomobject]@{ rooms = @($liveRoom) } }
+    $Q2DZ_LOOKUP_ENDPOINT { return New-TestLookup @($liveRoom) }
+    $Q2DZ_RTC_ENDPOINT { return $liveRows }
+  }
+}
+$initialSelectionPlan = Get-Q2DzLiveTargets -Targets (New-Q2DzTargetMap) -Q2Path 'fixture.exe' `
+  -ContentCheckPath 'fixture-check.exe' -FetchJson $liveFetch -RunContentCheck { $true } -IceSelection $liveSelection
+$liveRows = @($liveRows | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$liveRows[0].iceservers[0].credential = 'fresh-fixture'
+[array]::Reverse($liveRows)
+$refreshedSelectionPlan = Get-Q2DzLiveTargets -Targets $initialSelectionPlan.Targets -Q2Path 'fixture.exe' `
+  -ContentCheckPath 'fixture-check.exe' -FetchJson $liveFetch -RunContentCheck { $true } -IceSelection $liveSelection
+Assert-Equal 1 $liveCounter.Probes 'initial and refresh share domain cache'
+Assert-Equal 0 $refreshedSelectionPlan.Drops.Count 'selected credential rotation causes no DROP'
+Assert-Equal ($initialSelectionPlan.Targets.Keys -join ',') ($refreshedSelectionPlan.Targets.Keys -join ',') 'selected credential rotation preserves target identity'
+Assert-Equal 'fresh-fixture' $refreshedSelectionPlan.IceServers[0].credential 'selected credential rotation refreshes ICE'
+$sink = New-RefreshHeartbeatSink
+Write-Q2DzHeartbeat -Process ([pscustomobject]@{ HasExited = $false }) -Writer $sink -Plan $refreshedSelectionPlan -Generation 2 | Out-Null
+Assert-True ($sink.Text.ToString().Contains('Q2DZ/ROOMS/2 ICE generation=2')) 'rotation publishes fresh generation'
+Assert-True ($sink.Text.ToString().Contains('Q2DZ/ROOMS/2 PUT room=' + $liveRoom.room)) 'ordinary heartbeat PUT remains'
+Assert-True (-not $sink.Text.ToString().Contains('Q2DZ/ROOMS/2 DROP')) 'ordinary heartbeat has no DROP for credential rotation'
+
+$growingSelection = New-Q2DzIceSelection -Override '' -Measure {
+  param($Domains)
+  @{ 'a.example.invalid' = @(.9); 'b.example.invalid' = @(.01); 'c.example.invalid' = @(.02) }
+}
+Get-Q2DzDedicatedIceServers @($selectionCase.payload[0]) -Selection $growingSelection | Out-Null
+Get-Q2DzDedicatedIceServers @($selectionCase.payload) -Selection $growingSelection | Out-Null
+Assert-Equal 2 $growingSelection.Domains.Count 'single-row cache gains a backup when catalog grows'
+Assert-Equal 'a.example.invalid,b.example.invalid' ($growingSelection.Domains -join ',') 'catalog growth preserves cached primary even when slower'
+Write-Output 'nearest RTC refresh/heartbeat integration tests: PASS (component only)'

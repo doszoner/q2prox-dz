@@ -1,4 +1,7 @@
+param([switch]$RtcMeasure)
+
 $null = Add-Type -AssemblyName System.Net.Http
+$Q2DZ_CATALOG_SCRIPT = $PSCommandPath
 
 $Q2DZ_ROOM_ENDPOINT = 'https://cloud.dos.zone/room/get'
 $Q2DZ_LOOKUP_ENDPOINT = 'https://net.dos.zone/lookup'
@@ -328,9 +331,13 @@ function Test-Q2DzRtcPayload {
   if ($null -eq $Value -or $Value -isnot [array]) { return $false }
   $rows = @($Value)
   $rowCount = 0
+  $domains = @{}
   foreach ($row in $rows) {
     $rowCount++
     if (-not (Test-Q2DzRtcRow $row)) { return $false }
+    $domain = $row.domain.ToLowerInvariant()
+    if ($domains.ContainsKey($domain)) { return $false }
+    $domains[$domain] = $true
   }
   if ($rowCount -lt 1) { return $false }
   return $true
@@ -459,19 +466,211 @@ function Test-Q2DzRoomConfigChanged {
   return $previousJson -cne $currentJson
 }
 
+function Get-Q2DzRtcClock {
+  return [double][Diagnostics.Stopwatch]::GetTimestamp() / [Diagnostics.Stopwatch]::Frequency
+}
+
+function Invoke-Q2DzRtcMeasureDomain {
+  param([string]$Domain, [int]$Index, $Queue, [double]$Deadline)
+  $frequency = [double][Diagnostics.Stopwatch]::Frequency
+  try {
+    if ([Diagnostics.Stopwatch]::GetTimestamp() / $frequency -ge $Deadline) { return }
+    $addresses = [Net.Dns]::GetHostAddresses($Domain)
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+      $started = [Diagnostics.Stopwatch]::GetTimestamp() / $frequency
+      $attemptEnd = [Math]::Min($Deadline, $started + 1.0)
+      foreach ($address in $addresses) {
+        $remaining = $attemptEnd - [Diagnostics.Stopwatch]::GetTimestamp() / $frequency
+        if ($remaining -le 0) { break }
+        $client = $null
+        $pending = $null
+        try {
+          $client = [Net.Sockets.TcpClient]::new($address.AddressFamily)
+          $pending = $client.BeginConnect($address, 3478, $null, $null)
+          if (-not $pending.AsyncWaitHandle.WaitOne([int][Math]::Ceiling($remaining * 1000))) { continue }
+          $client.EndConnect($pending)
+          $finished = [Diagnostics.Stopwatch]::GetTimestamp() / $frequency
+          if ($finished -lt $Deadline) {
+            $Queue.Enqueue((ConvertTo-Json -InputObject @($Index, ($finished - $started), $finished) -Compress))
+          }
+          break
+        } catch {} finally {
+          if ($null -ne $client) { $client.Close() }
+          if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+        }
+      }
+      if ([Diagnostics.Stopwatch]::GetTimestamp() / $frequency -ge $Deadline) { break }
+    }
+  } catch {}
+}
+
+function Invoke-Q2DzRtcMeasureWorker {
+  $request = [Console]::In.ReadLine() | ConvertFrom-Json
+  $domains = @($request.domains)
+  foreach ($domain in $domains) { if (-not (Test-Q2DzHostname $domain)) { return } }
+  $deadline = (Get-Q2DzRtcClock) + 3.0
+  $queue = [Collections.Concurrent.ConcurrentQueue[string]]::new()
+  $active = [Collections.Generic.List[object]]::new()
+  $index = 0
+  while (($index -lt $domains.Count -or $active.Count -gt 0) -and (Get-Q2DzRtcClock) -lt $deadline) {
+    while ($index -lt $domains.Count -and $active.Count -lt 4 -and (Get-Q2DzRtcClock) -lt $deadline) {
+      $worker = [PowerShell]::Create()
+      [void]$worker.AddScript(${function:Invoke-Q2DzRtcMeasureDomain}.ToString()).AddArgument(
+        $domains[$index]).AddArgument($index).AddArgument($queue).AddArgument($deadline)
+      $active.Add([pscustomobject]@{ Worker = $worker; Pending = $worker.BeginInvoke() })
+      $index++
+    }
+    $line = ''
+    while ($queue.TryDequeue([ref]$line)) { [Console]::Out.WriteLine($line) }
+    [Console]::Out.Flush()
+    for ($i = $active.Count - 1; $i -ge 0; $i--) {
+      if ($active[$i].Pending.IsCompleted) {
+        try { $active[$i].Worker.EndInvoke($active[$i].Pending) | Out-Null } catch {}
+        $active[$i].Worker.Dispose()
+        $active.RemoveAt($i)
+      }
+    }
+    Start-Sleep -Milliseconds 5
+  }
+  $line = ''
+  while ($queue.TryDequeue([ref]$line)) { [Console]::Out.WriteLine($line) }
+  [Console]::Out.Flush()
+  # The parent kills this process; stopping a runspace cannot cancel system DNS.
+}
+
+function Measure-Q2DzRtcDomains {
+  param([string[]]$Domains)
+  $started = Get-Q2DzRtcClock
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $startInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $Q2DZ_CATALOG_SCRIPT + '" -RtcMeasure'
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardInput = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  $output = ''
+  $reader = $null
+  $startedProcess = $false
+  try {
+    $startedProcess = $process.Start()
+    if (-not $startedProcess) { throw 'RTC measurement worker could not start' }
+    $reader = $process.StandardOutput.ReadToEndAsync()
+    $errors = $process.StandardError.ReadToEndAsync()
+    # A full pipe must share the deadline, including a worker that never reads.
+    $inputTask = $process.StandardInput.WriteLineAsync((ConvertTo-Json -InputObject @{ domains = $Domains } -Compress))
+    $remaining = [Math]::Max(0, [Math]::Ceiling((3.0 - ((Get-Q2DzRtcClock) - $started)) * 1000))
+    if (-not $process.WaitForExit([int]$remaining)) { $process.Kill() }
+    if (-not $process.WaitForExit(1000)) { throw 'RTC measurement worker did not exit' }
+    if (-not $reader.Wait(1000)) { throw 'RTC measurement output did not close' }
+    $output = $reader.Result
+  } finally {
+    if ($startedProcess -and -not $process.HasExited) {
+      $process.Kill()
+      [void]$process.WaitForExit(1000)
+    }
+    $process.Dispose()
+  }
+  $samples = @{}
+  foreach ($domain in $Domains) { $samples[$domain] = [Collections.Generic.List[double]]::new() }
+  foreach ($line in ($output -split "`n")) {
+    try {
+      $sample = @($line | ConvertFrom-Json)
+      if ($sample.Count -ne 3 -or -not (Test-Q2DzInteger $sample[0] 0 ($Domains.Count - 1))) { continue }
+      $latency = $sample[1]
+      $finished = $sample[2]
+      if ($latency -isnot [ValueType] -or $latency -is [bool] -or $finished -isnot [ValueType] -or
+          $finished -is [bool] -or [double]::IsNaN([double]$latency) -or $latency -lt 0 -or
+          $latency -gt 1 -or $finished -ge ($started + 3.0)) { continue }
+      $values = $samples[$Domains[[int]$sample[0]]]
+      if ($values.Count -lt 3) { $values.Add([double]$latency) }
+    } catch {}
+  }
+  return $samples
+}
+
+function New-Q2DzIceSelection {
+  param([scriptblock]$Measure = { param($Domains) Measure-Q2DzRtcDomains $Domains },
+        [string]$Override = $env:Q2DZ_RTC_SERVER)
+  return [pscustomobject]@{ Domains = @(); Measure = $Measure; Override = $Override }
+}
+
+function Select-Q2DzRtcRows {
+  param($RtcPayload, $Selection)
+  $rows = @($RtcPayload)
+  $byDomain = @{}
+  foreach ($row in $rows) { $byDomain[$row.domain.ToLowerInvariant()] = $row }
+  $cached = @($Selection.Domains)
+  $override = $Selection.Override
+  $foundOverride = (Test-Q2DzHostname $override) -and $byDomain.ContainsKey($override.ToLowerInvariant())
+  if ($cached.Count -eq [Math]::Min(2, $rows.Count) -and
+      @($cached | Where-Object { -not $byDomain.ContainsKey($_) }).Count -eq 0 -and
+      (-not $foundOverride -or $cached[0] -ceq $override.ToLowerInvariant())) {
+    foreach ($domain in $cached) { $byDomain[$domain] }
+    return
+  }
+  if ($override) {
+    if (-not (Test-Q2DzHostname $override)) { Write-Q2DzCatalogEvent 'ICE_OVERRIDE result=invalid' }
+    elseif (-not $byDomain.ContainsKey($override.ToLowerInvariant())) { Write-Q2DzCatalogEvent 'ICE_OVERRIDE result=missing' }
+    else {
+      $byDomain[$override.ToLowerInvariant()]
+      $rows | Where-Object { $_.domain.ToLowerInvariant() -cne $override.ToLowerInvariant() } | Select-Object -First 1
+      return
+    }
+  }
+  $domains = @($rows | ForEach-Object { $_.domain.ToLowerInvariant() })
+  $primary = $null
+  if ($cached.Count -eq 1 -and $byDomain.ContainsKey($cached[0])) {
+    $primary = $cached[0]
+    $rows = @($rows | Where-Object { $_.domain.ToLowerInvariant() -cne $primary })
+    $domains = @($domains | Where-Object { $_ -cne $primary })
+  }
+  $samples = @{}
+  if ($rows.Count -gt 1) {
+    try { $samples = & $Selection.Measure $domains } catch { $samples = @{} }
+  }
+  $ranked = for ($index = 0; $index -lt $rows.Count; $index++) {
+    $values = @(if ($null -ne $samples -and $samples.ContainsKey($domains[$index])) { $samples[$domains[$index]] | Sort-Object })
+    $median = 0.0
+    if ($values.Count -gt 0) {
+      $middle = [int][Math]::Floor($values.Count / 2)
+      $median = [double]$values[$middle]
+      if ($values.Count % 2 -eq 0) { $median = ($median + [double]$values[$middle - 1]) / 2 }
+    }
+    [pscustomobject]@{ Unavailable = ($values.Count -eq 0); Median = $median; Index = $index; Row = $rows[$index] }
+  }
+  $count = 2
+  if ($null -ne $primary) { $byDomain[$primary]; $count = 1 }
+  $ranked | Sort-Object Unavailable,Median,Index | Select-Object -First $count | ForEach-Object { $_.Row }
+}
+
 function Get-Q2DzDedicatedIceServers {
-  param([Parameter(Mandatory = $true)]$RtcPayload)
+  param([Parameter(Mandatory = $true)]$RtcPayload, $Selection = $null)
   if (-not (Test-Q2DzRtcPayload $RtcPayload)) { throw 'RTC configuration has an invalid schema' }
+  if ($null -eq $Selection) { $Selection = New-Q2DzIceSelection }
+  $selected = @(Select-Q2DzRtcRows $RtcPayload $Selection)
   $result = @()
   $seen = @()
-  foreach ($row in @($RtcPayload)) {
+  $rowIndex = 0
+  foreach ($row in $selected) {
     foreach ($server in @($row.iceservers)) {
+      if ($rowIndex -gt 0) {
+        $urls = @($server.urls | Where-Object { $_ -match '^(?i)turns?:' })
+        if ($urls.Count -eq 0) { continue }
+        $copy = [ordered]@{}
+        foreach ($property in $server.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+        if ($server.urls -is [array]) { $copy['urls'] = [object[]]$urls } else { $copy['urls'] = $urls[0] }
+        $server = [pscustomobject]$copy
+      }
       $key = ConvertTo-Q2DzCanonicalJsonValue $server | ConvertTo-Json -Depth 8 -Compress
       if ($seen -cnotcontains $key) {
         $seen += $key
         $result += $server
       }
     }
+    $rowIndex++
   }
   if ($result.Count -lt 1 -or $result.Count -gt $Q2DZ_MAX_ICE_SERVERS) {
     throw 'global RTC configuration exceeds the supported limit'
@@ -489,8 +688,11 @@ function Get-Q2DzDedicatedIceServers {
     if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
     $serialized = $null
   }
+  $Selection.Domains = @($selected | ForEach-Object { $_.domain.ToLowerInvariant() })
   return @($result)
 }
+
+if ($RtcMeasure) { Invoke-Q2DzRtcMeasureWorker; exit }
 
 function Get-Q2DzReadyRooms {
   param([Parameter(Mandatory = $true)]$Value)

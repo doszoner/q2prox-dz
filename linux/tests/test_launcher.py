@@ -22,6 +22,7 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC
 launch = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(launch)
+MEASURE_RTC_DOMAINS = launch._measure_rtc_domains
 CONTRACT_CASES = json.loads(
     (ROOT.parent / "tests" / "contracts" / "doszone-api-cases.json").read_text(encoding="utf-8")
 )
@@ -263,6 +264,144 @@ def decoded_lines(process):
 
 
 class LauncherTests(unittest.TestCase):
+    def setUp(self):
+        network = mock.patch.object(launch, "_measure_rtc_domains", return_value={})
+        network.start()
+        self.addCleanup(network.stop)
+
+    def _execute_ice_selection_case(self, case):
+        measure = mock.Mock(return_value=case["measurements"])
+        selection = launch.IceSelection(measure=measure, override=case["override"])
+        with mock.patch.object(launch, "catalog_event") as events:
+            if not case["valid"]:
+                with self.assertRaises(launch.LaunchError):
+                    launch._ice_snapshot(case["payload"], selection)
+                self.assertEqual(selection.domains, ())
+                return
+            actual = launch._ice_snapshot(case["payload"], selection)
+        self.assertEqual(actual, case["expected"]["iceServers"])
+        self.assertEqual(list(selection.domains), case["expected"]["domains"])
+        self.assertEqual(measure.call_count, case["expected"]["probes"])
+        self.assertEqual([call.args[0] for call in events.call_args_list], case["expected"]["events"])
+        if "nextPayload" in case:
+            updated = launch._ice_snapshot(case["nextPayload"], selection)
+            self.assertEqual(updated, case["nextExpected"]["iceServers"])
+            self.assertEqual(list(selection.domains), case["nextExpected"]["domains"])
+            self.assertEqual(measure.call_count, case["nextExpected"]["probes"])
+
+    def test_selection_cache_fresh_credentials_reordering_and_disappearance(self):
+        case = next(case for case in CONTRACT_CASES if case["name"] == "ice-selection-median")
+        rows = json.loads(json.dumps(case["payload"]))
+        measure = mock.Mock(return_value=case["measurements"])
+        selection = launch.IceSelection(measure=measure, override="")
+        original = json.loads(json.dumps(rows))
+        first = launch._ice_snapshot(rows, selection)
+        self.assertEqual(rows, original, "backup filtering must not mutate the RTC response")
+        updated = json.loads(json.dumps(rows))
+        updated[0]["iceservers"][0]["credential"] = "fresh-fixture"
+        fresh = launch._ice_snapshot(updated[::-1], selection)
+        self.assertEqual(fresh[0]["credential"], "fresh-fixture")
+        self.assertEqual(measure.call_count, 1)
+        self.assertNotEqual(first, fresh)
+        launch._ice_snapshot(rows[1:], selection)
+        self.assertEqual(measure.call_count, 2)
+        self.assertEqual(selection.domains, ("b.example.invalid", "c.example.invalid"))
+        with self.assertRaises(launch.LaunchError):
+            launch._ice_snapshot([dict(rows[1], domain="bad domain")], selection)
+        self.assertEqual(selection.domains, ("b.example.invalid", "c.example.invalid"))
+
+    def test_measurement_attempts_share_one_second_and_keep_partial_success(self):
+        clock = [0.0]
+        samples = []
+        budgets = []
+        def connect(_addresses, timeout):
+            budgets.append(timeout)
+            clock[0] += timeout
+            return 0.1 if len(budgets) == 1 else None
+        resolver = mock.Mock(return_value=["fixture-address"])
+        launch._measure_rtc_domain("a.example.invalid", 2.5, samples.append,
+                                   resolver=resolver, connector=connect, clock=lambda: clock[0])
+        self.assertEqual(budgets, [1, 1, .5])
+        self.assertEqual(samples, [.1])
+        launch._measure_rtc_domain("queued.example.invalid", 2.5, samples.append,
+                                   resolver=resolver, connector=connect, clock=lambda: clock[0])
+        self.assertEqual(resolver.call_count, 1, "expired queued domains must not start DNS")
+
+    def test_refresh_selection_reuses_domains_and_keeps_heartbeat_target_identity(self):
+        case = next(case for case in CONTRACT_CASES if case["name"] == "ice-selection-median")
+        rows = json.loads(json.dumps(case["payload"]))
+        measure = mock.Mock(return_value=case["measurements"])
+        selection = launch.IceSelection(measure=measure, override="")
+        selected_room = room()
+        def fetch(endpoint):
+            return {launch.ROOM_ENDPOINT: catalog([selected_room]),
+                    launch.LOOKUP_ENDPOINT: lookup_for([selected_room]),
+                    launch.RTC_ENDPOINT: rows}[endpoint]
+        initial = launch.refresh_targets({}, "/games/Q2PRO-X.exe", fetch=fetch,
+                                         runner=lambda *a, **kw: subprocess.CompletedProcess(a, 0),
+                                         ice_selection=selection)
+        rows = json.loads(json.dumps(rows[::-1]))
+        rows[2]["iceservers"][0]["credential"] = "fresh-fixture"
+        refreshed = launch.refresh_targets(initial.targets, "/games/Q2PRO-X.exe", fetch=fetch,
+                                           ice_selection=selection)
+        self.assertEqual(measure.call_count, 1)
+        self.assertEqual(refreshed.drops, ())
+        self.assertEqual(list(refreshed.targets), list(initial.targets))
+        self.assertEqual(refreshed.ice_servers[0]["credential"], "fresh-fixture")
+        process = FakeProcess()
+        launch.write_heartbeat(process, refreshed, generation=2)
+        text = process.stdin.payload.decode()
+        self.assertIn("Q2DZ/ROOMS/2 ICE generation=2", text)
+        self.assertIn("Q2DZ/ROOMS/2 PUT room=" + selected_room["room"], text)
+        self.assertNotIn("Q2DZ/ROOMS/2 DROP", text)
+
+    def test_selection_adds_backup_when_single_row_catalog_grows(self):
+        case = next(case for case in CONTRACT_CASES if case["name"] == "ice-selection-median")
+        measure = mock.Mock(return_value={"a.example.invalid": [.9], "b.example.invalid": [.01], "c.example.invalid": [.02]})
+        selection = launch.IceSelection(measure=measure, override="")
+        launch._ice_snapshot(case["payload"][:1], selection)
+        launch._ice_snapshot(case["payload"], selection)
+        self.assertEqual(measure.call_count, 1)
+        self.assertEqual(selection.domains, ("a.example.invalid", "b.example.invalid"))
+
+    def test_stuck_dns_worker_is_killed_and_reaped_without_losing_successes(self):
+        children = []
+        source = str(ROOT / "tools" / "q2dz-launch")
+        script = (
+            "import runpy,time; ns=runpy.run_path(" + repr(source) + "); "
+            "original=ns['_measure_rtc_domain']; "
+            "resolver=lambda domain,*a,**kw: [] if domain.startswith('a.') else time.sleep(60); "
+            "ns['_rtc_measure_worker'].__globals__['_measure_rtc_domain']="
+            "lambda domain,deadline,emit: original(domain,deadline,emit,resolver=resolver,connector=lambda *a: .01); "
+            "ns['_rtc_measure_worker']()"
+        )
+        def start(_args, **options):
+            process = subprocess.Popen([launch.sys.executable, "-c", script], **options)
+            children.append(process)
+            return process
+        thread_count = threading.active_count()
+        with mock.patch.object(launch, "RTC_MEASURE_SECONDS", .4):
+            for _run in range(2):
+                started = time.monotonic()
+                samples = MEASURE_RTC_DOMAINS(["a.example.invalid", "b.example.invalid"], popen=start)
+                self.assertLess(time.monotonic() - started, 1.4)
+                self.assertEqual(samples, {"a.example.invalid": [.01, .01, .01], "b.example.invalid": []})
+                self.assertEqual(children[-1].poll(), -9)
+        self.assertEqual(threading.active_count(), thread_count)
+
+    def test_multiple_addresses_share_the_attempt_timeout(self):
+        clock = [0.0]
+        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 3478))] * 2
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        def fail(_address):
+            clock[0] += .75
+            raise OSError("fixture refusal")
+        connection.connect.side_effect = fail
+        with mock.patch.object(launch.socket, "socket", return_value=connection):
+            self.assertIsNone(launch._tcp_connect_latency(addresses, 1, clock=lambda: clock[0]))
+        self.assertEqual(connection.settimeout.call_args_list, [mock.call(1), mock.call(.25)])
+
     def test_default_hub_launch_uses_direct_multiroom_transport(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             paths = launch._installed_paths()
@@ -636,6 +775,9 @@ class LauncherTests(unittest.TestCase):
         scenario_names = set()
         for case in CONTRACT_CASES:
             with self.subTest(case=case["name"]):
+                if case["kind"] == "ice-selection":
+                    self._execute_ice_selection_case(case)
+                    continue
                 if case["kind"] == "refresh-scenario":
                     self._execute_refresh_scenario(case)
                     continue

@@ -351,7 +351,8 @@ function Get-Q2DzLiveTargets {
     [Parameter(Mandatory = $true)][string]$Q2Path,
     [Parameter(Mandatory = $true)][string]$ContentCheckPath,
     [scriptblock]$FetchJson = { param($Endpoint) Get-Q2DzJson $Endpoint },
-    [scriptblock]$RunContentCheck = $null
+    [scriptblock]$RunContentCheck = $null,
+    $IceSelection = $null
   )
   $timer = [Diagnostics.Stopwatch]::StartNew()
   $result = 'error'
@@ -401,7 +402,7 @@ function Get-Q2DzLiveTargets {
     $registeredCount = $registeredReady.Count
     $stage = 'servers'
     $rtcRows = @(& $FetchJson $Q2DZ_RTC_ENDPOINT)
-    $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows)
+    $iceServers = @(Get-Q2DzDedicatedIceServers $rtcRows -Selection $IceSelection)
     $check = if ($RunContentCheck) { $RunContentCheck } else {
       {
         param($Path, $Map, $Root)
@@ -633,16 +634,17 @@ function Start-Q2DzLauncher {
     }
 
     $targets = New-Q2DzTargetMap
+    $iceSelection = New-Q2DzIceSelection
     $initial = $null
     try {
-      $initial = Get-Q2DzLiveTargets -Targets $targets -Q2Path $q2 -ContentCheckPath $contentCheck
+      $initial = Get-Q2DzLiveTargets -Targets $targets -Q2Path $q2 -ContentCheckPath $contentCheck -IceSelection $iceSelection
       $targets = $initial.Targets
     } catch {
       $initial = $null
     }
     $refresh = {
       param($currentTargets)
-      Get-Q2DzLiveTargets -Targets $currentTargets -Q2Path $q2 -ContentCheckPath $contentCheck
+      Get-Q2DzLiveTargets -Targets $currentTargets -Q2Path $q2 -ContentCheckPath $contentCheck -IceSelection $iceSelection
     }
     $initialValue = if ($initial) { $initial } else { $targets }
     $result = Invoke-Q2DzHub -InitialTargets $initialValue -Q2Path $q2 -CoordinatorPath $coordinator -CoordinatorArguments @(
